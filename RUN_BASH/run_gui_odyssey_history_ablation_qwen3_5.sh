@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=6
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
@@ -38,7 +38,7 @@ run_one() {
   local max_history="$3"
   local keep_system="$4"
   local port="$5"
-  local work_dir="OUTPUT/ablation_gui_odyssey_${tag}_qwen3_5_0731"
+  local work_dir="OUTPUT/ablation_gui_odyssey_${tag}_qwen3_5_0805_node5"
   local log_file="run_output_${TS}_gui_odyssey_ablation_${tag}_qwen3_5.log"
 
   export GUI_ODYSSEY_USE_HISTORY_SCREENSHOTS="${use_history}"
@@ -69,6 +69,6 @@ run_one() {
     --reuse 2>&1 | tee -a "${log_file}"
 }
 
-run_one nohist_fixed 0 0 0 29620
+# run_one nohist_fixed 0 0 0 29620
 # run_one hist1_original_prompt 1 1 0 29621
-# run_one hist4_keep_system_prompt 1 4 1 29622
+run_one hist4_keep_system_prompt 1 4 1 29622

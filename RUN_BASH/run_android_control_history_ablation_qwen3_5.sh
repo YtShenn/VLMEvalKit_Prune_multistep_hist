@@ -28,7 +28,7 @@ export QWEN3VL_ROI_PRUNE_USE_CACHE="${QWEN3VL_ROI_PRUNE_USE_CACHE:-1}"
 export QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE="${QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE:-1}"
 
 export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
-export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-50}"
+export VLM_EVAL_SAMPLE_TASKS="20" #"${VLM_EVAL_SAMPLE_TASKS:-50}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct}"
@@ -43,7 +43,7 @@ run_one() {
   local max_history="$3"
   local keep_prompt="$4"
   local port="$5"
-  local work_dir="OUTPUT/ablation_android_control_${tag}_qwen3_5_0803_newprompt"
+  local work_dir="OUTPUT/ablation_android_control_${tag}_20task_node5_0805_newprompt"
   local log_file="run_output_${TS}_android_control_ablation_${tag}_qwen3_5.log"
 
   export ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS="${use_history}"

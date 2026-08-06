@@ -8,6 +8,7 @@ from PIL import Image
 
 from ..image_base import ImageBaseDataset
 from ...smp import *
+from .state_packet import build_state_packet, state_packet_debug_enabled, state_packet_enabled
 
 SKIP_MISSING_IMAGE_MSG = '__SKIP_MISSING_IMAGE__'
 
@@ -277,6 +278,8 @@ class GUIOdyssey(ImageBaseDataset):
         self.include_history_screenshots = os.environ.get('GUI_ODYSSEY_USE_HISTORY_SCREENSHOTS', '1') == '1'
         self.max_history_images = max(0, int(os.environ.get('GUI_ODYSSEY_MAX_HISTORY_IMAGES', '4')))
         self.history_keep_system_prompt = os.environ.get('GUI_ODYSSEY_HISTORY_KEEP_SYSTEM_PROMPT', '0') == '1'
+        self.use_history_state_packet = state_packet_enabled()
+        self._state_packet_records = []
         if skeleton:
             return
 
@@ -441,6 +444,91 @@ class GUIOdyssey(ImageBaseDataset):
             return 'None'
         return '\n'.join([f'{i + 1}. {a}' for i, a in enumerate(history_actions)])
 
+    def _build_history_visual_entries(self, sample_index, hist_images, history_actions):
+        if not self.use_history_state_packet:
+            entries = []
+            for i, (hist_image_path, action_text) in enumerate(zip(hist_images, history_actions)):
+                entries.append(
+                    dict(
+                        history_index=i,
+                        action_text=action_text,
+                        images=[dict(type='image', value=hist_image_path)],
+                        debug_items=[
+                            dict(
+                                kind='original',
+                                path=hist_image_path,
+                                crop_xyxy=None,
+                                estimated_tokens=None,
+                            )
+                        ],
+                    )
+                )
+            return entries
+
+        entries = []
+        for i, (hist_image_path, action_text) in enumerate(zip(hist_images, history_actions)):
+            packet_images, packet_meta = build_state_packet(
+                image_path=hist_image_path,
+                action_text=action_text,
+                sample_index=str(sample_index),
+                history_index=i,
+            )
+            packet_meta['dataset_name'] = str(self.dataset_name)
+            self._state_packet_records.append(packet_meta)
+            debug_items = []
+            for item in packet_images:
+                debug_items.append(
+                    dict(
+                        kind=item.kind,
+                        path=item.path,
+                        crop_xyxy=item.crop_xyxy,
+                        estimated_tokens=item.estimated_tokens,
+                    )
+                )
+            entries.append(
+                dict(
+                    history_index=i,
+                    action_text=action_text,
+                    images=[item.to_message_item() for item in packet_images],
+                    debug_items=debug_items,
+                    packet_meta=packet_meta,
+                )
+            )
+        return entries
+
+    def summarize_state_packet_records(self):
+        recs = list(getattr(self, '_state_packet_records', []) or [])
+        if not recs:
+            return {}
+        count = float(len(recs))
+        orig_tokens = float(sum(float(r.get('original_estimated_tokens', 0.0) or 0.0) for r in recs))
+        packet_tokens = float(sum(float(r.get('packet_estimated_tokens', 0.0) or 0.0) for r in recs))
+        thumb_tokens = float(sum(float(r.get('thumbnail_estimated_tokens', 0.0) or 0.0) for r in recs))
+        roi_tokens = float(sum(float(r.get('roi_estimated_tokens', 0.0) or 0.0) for r in recs))
+        open_s = float(sum(float(r.get('open_image_s', 0.0) or 0.0) for r in recs))
+        thumb_s = float(sum(float(r.get('thumbnail_build_s', 0.0) or 0.0) for r in recs))
+        roi_s = float(sum(float(r.get('roi_build_s', 0.0) or 0.0) for r in recs))
+        total_s = float(sum(float(r.get('state_packet_total_s', 0.0) or 0.0) for r in recs))
+        return {
+            'state_packet_enabled': bool(self.use_history_state_packet),
+            'state_packet_history_image_count': int(count),
+            'avg_state_packet_original_estimated_tokens': float(orig_tokens / count),
+            'avg_state_packet_packet_estimated_tokens': float(packet_tokens / count),
+            'avg_state_packet_thumbnail_estimated_tokens': float(thumb_tokens / count),
+            'avg_state_packet_roi_estimated_tokens': float(roi_tokens / count),
+            'state_packet_total_original_estimated_tokens': float(orig_tokens),
+            'state_packet_total_packet_estimated_tokens': float(packet_tokens),
+            'state_packet_avg_compression_ratio': float(packet_tokens / max(1.0, orig_tokens)),
+            'avg_state_packet_open_image_s': float(open_s / count),
+            'avg_state_packet_thumbnail_build_s': float(thumb_s / count),
+            'avg_state_packet_roi_build_s': float(roi_s / count),
+            'avg_state_packet_total_s': float(total_s / count),
+            'total_state_packet_open_image_s': float(open_s),
+            'total_state_packet_thumbnail_build_s': float(thumb_s),
+            'total_state_packet_roi_build_s': float(roi_s),
+            'total_state_packet_total_s': float(total_s),
+        }
+
     def _maybe_debug_print_prompt(
         self,
         line,
@@ -461,6 +549,8 @@ class GUIOdyssey(ImageBaseDataset):
         )
         print(f'[GUIOdysseyDebug] history_images={history_image_paths}', flush=True)
         print(f'[GUIOdysseyDebug] history_actions={history_actions}', flush=True)
+        if self.use_history_state_packet:
+            print(f'[GUIOdysseyDebug] history_state_packet_enabled=1', flush=True)
         if isinstance(history_debug, dict):
             print(
                 '[GUIOdysseyDebug] '
@@ -516,6 +606,11 @@ class GUIOdyssey(ImageBaseDataset):
             if hist_images:
                 his_actions = his_actions[-len(hist_images):]
         hist = self._format_history_actions(his_actions)
+        history_entries = self._build_history_visual_entries(
+            sample_index=str(line.get('index', '')),
+            hist_images=hist_images,
+            history_actions=his_actions,
+        )
 
         if not hist_images:
             user_prompt = (
@@ -548,12 +643,27 @@ class GUIOdyssey(ImageBaseDataset):
             )
             debug_parts = [self.SYSTEM_PROMPT, intro]
             msgs = [dict(type='text', value=self.SYSTEM_PROMPT), dict(type='text', value=intro)]
-            for i, (hist_image_path, action_text) in enumerate(zip(hist_images, his_actions)):
-                debug_parts.append(f'Image_{i}: [HISTORY_IMAGE] {hist_image_path}')
-                debug_parts.append(f'{i + 1}. {action_text}')
-                msgs.append(dict(type='text', value=f'Image_{i}:'))
-                msgs.append(dict(type='image', value=hist_image_path))
-                msgs.append(dict(type='text', value=f'{i + 1}. {action_text}\\n'))
+            if not self.use_history_state_packet:
+                for i, (hist_image_path, action_text) in enumerate(zip(hist_images, his_actions)):
+                    debug_parts.append(f'Image_{i}: [HISTORY_IMAGE] {hist_image_path}')
+                    debug_parts.append(f'{i + 1}. {action_text}')
+                    msgs.append(dict(type='text', value=f'Image_{i}:'))
+                    msgs.append(dict(type='image', value=hist_image_path))
+                    msgs.append(dict(type='text', value=f'{i + 1}. {action_text}\\n'))
+            else:
+                for entry in history_entries:
+                    i = int(entry['history_index'])
+                    action_text = str(entry['action_text'])
+                    debug_parts.append(f'HistoryStep_{i}: action={action_text}')
+                    for image_item, debug_item in zip(entry['images'], entry.get('debug_items', [])):
+                        label = str(debug_item.get('kind', 'history_image'))
+                        debug_parts.append(
+                            f'HistoryStep_{i} {label}: {debug_item.get("path")} crop_xyxy={debug_item.get("crop_xyxy")} '
+                            f'est_tokens={debug_item.get("estimated_tokens")}'
+                        )
+                        msgs.append(dict(type='text', value=f'HistoryStep_{i} {label}:'))
+                        msgs.append(dict(image_item))
+                    msgs.append(dict(type='text', value=f'{i + 1}. {action_text}\\n'))
             debug_parts.append(f'Current Screenshot: [CURRENT_IMAGE] {image_path}')
             debug_parts.append(outro)
             self._maybe_debug_print_prompt(
@@ -575,9 +685,21 @@ class GUIOdyssey(ImageBaseDataset):
             'The final image is the current screenshot.'
         )
         debug_parts = [intro]
-        for i, (hist_image_path, action_text) in enumerate(zip(hist_images, his_actions)):
-            debug_parts.append(f'Image_{i}: [HISTORY_IMAGE] {hist_image_path}')
-            debug_parts.append(f'Step_{i}: {action_text}.')
+        if not self.use_history_state_packet:
+            for i, (hist_image_path, action_text) in enumerate(zip(hist_images, his_actions)):
+                debug_parts.append(f'Image_{i}: [HISTORY_IMAGE] {hist_image_path}')
+                debug_parts.append(f'Step_{i}: {action_text}.')
+        else:
+            for entry in history_entries:
+                i = int(entry['history_index'])
+                action_text = str(entry['action_text'])
+                for debug_item in entry.get('debug_items', []):
+                    debug_parts.append(
+                        f'HistoryStep_{i} {debug_item.get("kind", "history_image")}: '
+                        f'{debug_item.get("path")} crop_xyxy={debug_item.get("crop_xyxy")} '
+                        f'est_tokens={debug_item.get("estimated_tokens")}'
+                    )
+                debug_parts.append(f'Step_{i}: {action_text}.')
         debug_parts.append(f'Image_{len(hist_images)}: [CURRENT_IMAGE] {image_path}')
         debug_parts.append(outro)
         self._maybe_debug_print_prompt(
@@ -589,13 +711,43 @@ class GUIOdyssey(ImageBaseDataset):
             history_debug=history_debug,
         )
         msgs = [dict(type='text', value=intro)]
-        for i, (hist_image_path, action_text) in enumerate(zip(hist_images, his_actions)):
-            msgs.append(dict(type='text', value=f'Image_{i}:'))
-            msgs.append(dict(type='image', value=hist_image_path))
-            msgs.append(dict(type='text', value=f'Step_{i}: {action_text}.\n'))
+        if not self.use_history_state_packet:
+            for i, (hist_image_path, action_text) in enumerate(zip(hist_images, his_actions)):
+                msgs.append(dict(type='text', value=f'Image_{i}:'))
+                msgs.append(dict(type='image', value=hist_image_path))
+                msgs.append(dict(type='text', value=f'Step_{i}: {action_text}.\n'))
+        else:
+            for entry in history_entries:
+                i = int(entry['history_index'])
+                action_text = str(entry['action_text'])
+                for image_item, debug_item in zip(entry['images'], entry.get('debug_items', [])):
+                    label = str(debug_item.get('kind', 'history_image'))
+                    msgs.append(dict(type='text', value=f'HistoryStep_{i} {label}:'))
+                    msgs.append(dict(image_item))
+                msgs.append(dict(type='text', value=f'Step_{i}: {action_text}.\n'))
         msgs.append(dict(type='text', value=f'Image_{len(hist_images)}:'))
         msgs.append(dict(type='image', value=image_path))
         msgs.append(dict(type='text', value=outro))
+        if state_packet_debug_enabled() and history_entries:
+            for entry in history_entries:
+                packet_meta = entry.get('packet_meta', None)
+                if not isinstance(packet_meta, dict):
+                    continue
+                print(
+                    '[GUIOdysseyStatePacketPrompt] '
+                    f"sample_index={packet_meta.get('sample_index')} "
+                    f"hist_index={packet_meta.get('history_index')} "
+                    f"orig_tokens_est={packet_meta.get('original_estimated_tokens')} "
+                    f"packet_tokens_est={packet_meta.get('packet_estimated_tokens')} "
+                    f"roi_crop_xyxy={packet_meta.get('roi_crop_xyxy')} "
+                    f"thumbnail_size=({packet_meta.get('thumbnail_width')},{packet_meta.get('thumbnail_height')}) "
+                    f"roi_size=({packet_meta.get('roi_width')},{packet_meta.get('roi_height')}) "
+                    f"open_s={float(packet_meta.get('open_image_s', 0.0)):.6f} "
+                    f"thumb_s={float(packet_meta.get('thumbnail_build_s', 0.0)):.6f} "
+                    f"roi_s={float(packet_meta.get('roi_build_s', 0.0)):.6f} "
+                    f"packet_total_s={float(packet_meta.get('state_packet_total_s', 0.0)):.6f}",
+                    flush=True,
+                )
         return msgs
 
     def evaluate(self, eval_file, **judge_kwargs):

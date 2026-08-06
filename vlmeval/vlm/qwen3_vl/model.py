@@ -6,6 +6,8 @@ import time
 import warnings
 import json
 import re
+import types
+import inspect
 
 import torch
 from PIL import Image
@@ -245,15 +247,375 @@ def _env_flag(name: str, default: str = '0') -> bool:
 
 
 def _use_qwen3vl_timing_model() -> bool:
+    # The custom Qwen3-VL implementation is needed for ROI-prune experiments,
+    # but it is not a requirement for ordinary stage timing / FLOPs profiling.
+    # Keeping timing-only runs on the upstream HF model avoids shape mismatches
+    # for multi-image history prompts while preserving the external timing hooks.
     return any(
         (
             _env_flag('QWEN3VL_ENABLE_ROI_PRUNE', '0'),
             _env_flag('QWEN3VL_USE_TIMING_MODEL', '0'),
-            _env_flag('VLM_TIMING', '0'),
-            _env_flag('VLM_STAGE_TIMING', '0'),
-            _env_flag('VLM_PRUNE_TIMING', '0'),
         )
     )
+
+
+def _sanitize_generate_inputs_for_model(model, inputs):
+    # Keep multimodal helper fields intact. Compatibility with upstream HF Qwen3-VL
+    # is handled by `_patch_upstream_qwen3vl_prepare_inputs_for_generation`.
+    return inputs
+
+
+def _patch_upstream_qwen3vl_prepare_inputs_for_generation(model) -> None:
+    if getattr(model, '_vlmeval_accepts_mm_token_type_ids', False):
+        return
+    if not isinstance(model, torch.nn.Module):
+        return
+    if model.__class__.__module__.endswith('modeling_qwen3_vl_roi_prune'):
+        model._vlmeval_accepts_mm_token_type_ids = True
+        return
+    module_name = str(getattr(model.__class__, '__module__', '') or '')
+    class_name = str(getattr(model.__class__, '__name__', '') or '')
+    if 'qwen3_vl' not in module_name.lower() and 'Qwen3VL' not in class_name:
+        return
+
+    orig_prepare = getattr(model, 'prepare_inputs_for_generation', None)
+    orig_validate = getattr(model, '_validate_model_kwargs', None)
+    if orig_prepare is None:
+        return
+
+    def patched_prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        position_ids=None,
+        use_cache=True,
+        pixel_values=None,
+        pixel_values_videos=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
+        is_first_iteration=False,
+        **kwargs,
+    ):
+        model_inputs = orig_prepare(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            use_cache=use_cache,
+            is_first_iteration=is_first_iteration,
+            **kwargs,
+        )
+        if mm_token_type_ids is not None:
+            model_inputs['mm_token_type_ids'] = mm_token_type_ids
+        return model_inputs
+
+    patched_prepare_inputs_for_generation.__signature__ = inspect.signature(patched_prepare_inputs_for_generation)
+    model.prepare_inputs_for_generation = types.MethodType(patched_prepare_inputs_for_generation, model)
+
+    if orig_validate is not None:
+        def patched_validate_model_kwargs(self, model_kwargs):
+            try:
+                return orig_validate(model_kwargs)
+            except ValueError as exc:
+                if 'mm_token_type_ids' not in str(exc):
+                    raise
+                filtered = dict(model_kwargs)
+                filtered.pop('mm_token_type_ids', None)
+                return orig_validate(filtered)
+
+        model._validate_model_kwargs = types.MethodType(patched_validate_model_kwargs, model)
+
+    model._vlmeval_accepts_mm_token_type_ids = True
+
+
+def _extract_seq_len(input_ids=None, inputs_embeds=None) -> int:
+    if input_ids is not None:
+        try:
+            return int(input_ids.shape[1])
+        except Exception:
+            pass
+    if inputs_embeds is not None:
+        try:
+            return int(inputs_embeds.shape[1])
+        except Exception:
+            pass
+    return 0
+
+
+def _extract_cache_len(past_key_values) -> int:
+    if past_key_values is None:
+        return 0
+    try:
+        return int(past_key_values.get_seq_length())
+    except Exception:
+        return 0
+
+
+def _is_prefill_step_runtime(cache_position, past_key_values, input_ids, inputs_embeds) -> bool:
+    try:
+        if cache_position is not None:
+            if torch.is_tensor(cache_position):
+                if cache_position.numel() > 0:
+                    return int(cache_position.flatten()[0].item()) == 0
+            else:
+                return int(cache_position) == 0
+    except Exception:
+        pass
+    if past_key_values is None:
+        return True
+    try:
+        if past_key_values.get_seq_length() == 0:
+            return True
+    except Exception:
+        pass
+    return _extract_seq_len(input_ids=input_ids, inputs_embeds=inputs_embeds) > 1
+
+
+def _grid_token_count(grid_thw) -> int:
+    if grid_thw is None:
+        return 0
+    try:
+        data = grid_thw.detach().cpu().tolist() if isinstance(grid_thw, torch.Tensor) else grid_thw
+        if not data:
+            return 0
+        rows = data if isinstance(data[0], (list, tuple)) else [data]
+        total = 0
+        for row in rows:
+            if row is None or len(row) < 3:
+                continue
+            total += int(row[0]) * int(row[1]) * int(row[2])
+        return int(total)
+    except Exception:
+        return 0
+
+
+def _estimate_visual_tokens(image_grid_thw=None, video_grid_thw=None) -> int:
+    return int(_grid_token_count(image_grid_thw) + _grid_token_count(video_grid_thw))
+
+
+def _estimate_llm_forward_flops(model, q_len: int, kv_len: int) -> float:
+    cfg = getattr(model, 'config', None)
+    text_cfg = getattr(cfg, 'text_config', cfg)
+    if text_cfg is None:
+        return 0.0
+    hidden = int(getattr(text_cfg, 'hidden_size', 0) or 0)
+    inter = int(getattr(text_cfg, 'intermediate_size', 0) or 0)
+    layers = int(getattr(text_cfg, 'num_hidden_layers', 0) or 0)
+    heads = int(getattr(text_cfg, 'num_attention_heads', 0) or 0)
+    kv_heads = int(getattr(text_cfg, 'num_key_value_heads', heads) or heads)
+    head_dim = int(getattr(text_cfg, 'head_dim', hidden // max(heads, 1)) or 0)
+    if min(q_len, kv_len, hidden, inter, layers, heads, kv_heads, head_dim) <= 0:
+        return 0.0
+    q_proj_out = heads * head_dim
+    kv_proj_out = kv_heads * head_dim
+    attn_linear = 2.0 * q_len * hidden * (q_proj_out + kv_proj_out + kv_proj_out + q_proj_out)
+    attn_kernel = 4.0 * heads * q_len * kv_len * head_dim
+    mlp = 2.0 * q_len * hidden * inter + 2.0 * q_len * hidden * inter + 2.0 * q_len * inter * hidden
+    return float(layers) * float(attn_linear + attn_kernel + mlp)
+
+
+def _estimate_lm_head_flops(model, q_len: int) -> float:
+    cfg = getattr(model, 'config', None)
+    text_cfg = getattr(cfg, 'text_config', cfg)
+    if text_cfg is None:
+        return 0.0
+    hidden = int(getattr(text_cfg, 'hidden_size', 0) or 0)
+    vocab = int(getattr(text_cfg, 'vocab_size', 0) or 0)
+    if min(q_len, hidden, vocab) <= 0:
+        return 0.0
+    return float(2.0 * q_len * hidden * vocab)
+
+
+def _estimate_vision_forward_flops(model, visual_tokens: int) -> float:
+    if visual_tokens <= 0:
+        return 0.0
+    cfg = getattr(model, 'config', None)
+    vision_cfg = getattr(cfg, 'vision_config', None)
+    if vision_cfg is None:
+        return 0.0
+    hidden = int(getattr(vision_cfg, 'hidden_size', 0) or 0)
+    inter = int(getattr(vision_cfg, 'intermediate_size', 0) or 0)
+    layers = int(
+        getattr(vision_cfg, 'num_hidden_layers', None)
+        or getattr(vision_cfg, 'depth', None)
+        or 0
+    )
+    heads = int(getattr(vision_cfg, 'num_heads', 0) or 0)
+    head_dim = hidden // max(heads, 1) if heads > 0 else 0
+    if min(hidden, inter, layers, heads, head_dim) <= 0:
+        return 0.0
+    attn_linear = 8.0 * visual_tokens * hidden * hidden
+    attn_kernel = 4.0 * heads * visual_tokens * visual_tokens * head_dim
+    mlp = 4.0 * visual_tokens * hidden * inter
+    return float(layers) * float(attn_linear + attn_kernel + mlp)
+
+
+def _patch_qwen3vl_runtime_tracking(model) -> None:
+    # Deprecated wrapper-based tracking path. Kept as a no-op because wrapping the
+    # official HF Qwen3-VL forward/generate chain can perturb cache-sensitive decode.
+    return
+
+
+class _RuntimeTrackingHooks:
+    def __init__(self, model, llm_module: torch.nn.Module | None, *, visual_tokens: int, prompt_seq_tokens: int, use_cuda_events: bool, sync_cuda: bool) -> None:
+        self.model = model
+        self.llm_module = llm_module
+        self.visual_tokens = int(visual_tokens or 0)
+        self.prompt_seq_tokens = int(prompt_seq_tokens or 0)
+        self.use_cuda_events = bool(use_cuda_events) and torch.cuda.is_available()
+        self.sync_cuda = bool(sync_cuda)
+        self._handles = []
+        self._stack = []
+        self.prefill_s = 0.0
+        self.decode_s = 0.0
+        self.decode_steps = 0
+        self.forward_steps = 0
+        self.prefill_seen = False
+        self.seq_tokens_before = int(prompt_seq_tokens or 0)
+        self.seq_tokens_after = int(prompt_seq_tokens or 0)
+        self.visual_tokens_before = int(visual_tokens or 0)
+        self.visual_tokens_after = int(visual_tokens or 0)
+        self.vision_flops = _estimate_vision_forward_flops(model, self.visual_tokens)
+        self.llm_flops = 0.0
+        self.lm_head_flops = 0.0
+        self._pending_prefill_events = []
+        self._pending_decode_events = []
+
+    def _pre_hook(self, _module, args, kwargs):
+        kwargs = kwargs or {}
+        input_ids = kwargs.get('input_ids', None)
+        past_key_values = kwargs.get('past_key_values', None)
+        inputs_embeds = kwargs.get('inputs_embeds', None)
+        cache_position = kwargs.get('cache_position', None)
+        if len(args) >= 1 and input_ids is None:
+            input_ids = args[0]
+        if len(args) >= 4 and past_key_values is None:
+            past_key_values = args[3]
+        if len(args) >= 5 and inputs_embeds is None:
+            inputs_embeds = args[4]
+        q_len = _extract_seq_len(input_ids=input_ids, inputs_embeds=inputs_embeds)
+        cache_len = _extract_cache_len(past_key_values)
+        is_prefill = _is_prefill_step_runtime(
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+        )
+        if self.use_cuda_events:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            self._stack.append((start, end, q_len, cache_len, is_prefill))
+        else:
+            if self.sync_cuda and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._stack.append((time.perf_counter(), None, q_len, cache_len, is_prefill))
+
+    def _post_hook(self, _module, args, kwargs, output):
+        if not self._stack:
+            return output
+        start_obj, end_obj, q_len, cache_len, is_prefill = self._stack.pop()
+        if self.use_cuda_events:
+            end_obj.record()
+            elapsed = ('cuda_event', start_obj, end_obj)
+        else:
+            if self.sync_cuda and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elapsed = float(time.perf_counter() - start_obj)
+        self.forward_steps += 1
+        kv_len = max(int(q_len), int(cache_len + q_len))
+        self.llm_flops += _estimate_llm_forward_flops(self.model, q_len=int(q_len), kv_len=int(kv_len))
+        self.lm_head_flops += _estimate_lm_head_flops(self.model, q_len=max(1, int(q_len)))
+        if is_prefill:
+            self.prefill_seen = True
+            if q_len > 0:
+                self.seq_tokens_before = int(q_len)
+                self.seq_tokens_after = int(q_len)
+            self._accumulate_prefill_elapsed(elapsed)
+        else:
+            self.decode_steps += 1
+            if q_len > 0:
+                self.seq_tokens_after = int(max(self.seq_tokens_after, self.seq_tokens_before + self.decode_steps))
+            self._accumulate_decode_elapsed(elapsed)
+        return output
+
+    def _accumulate_prefill_elapsed(self, elapsed):
+        if isinstance(elapsed, tuple):
+            self.prefill_s += 0.0
+            self._pending_prefill_events = getattr(self, '_pending_prefill_events', [])
+            self._pending_prefill_events.append((elapsed[1], elapsed[2]))
+        else:
+            self.prefill_s += float(elapsed)
+
+    def _accumulate_decode_elapsed(self, elapsed):
+        if isinstance(elapsed, tuple):
+            self.decode_s += 0.0
+            self._pending_decode_events = getattr(self, '_pending_decode_events', [])
+            self._pending_decode_events.append((elapsed[1], elapsed[2]))
+        else:
+            self.decode_s += float(elapsed)
+
+    def attach(self):
+        if self.llm_module is None:
+            return
+        self._handles.append(self.llm_module.register_forward_pre_hook(self._pre_hook, with_kwargs=True))
+        self._handles.append(self.llm_module.register_forward_hook(self._post_hook, with_kwargs=True))
+
+    def finalize(self):
+        try:
+            if self.use_cuda_events:
+                torch.cuda.synchronize()
+                for start, end in self._pending_prefill_events:
+                    self.prefill_s += float(start.elapsed_time(end)) / 1000.0
+                for start, end in self._pending_decode_events:
+                    self.decode_s += float(start.elapsed_time(end)) / 1000.0
+        finally:
+            for h in self._handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+            self._handles = []
+
+    def to_runtime_dict(self) -> dict:
+        return {
+            'prefill_s': float(self.prefill_s),
+            'decode_s': float(self.decode_s),
+            'decode_steps': int(self.decode_steps),
+            'prefill_before_prune_layer_s': float(self.prefill_s),
+            'prefill_split_to_prune_start_s': 0.0,
+            'prune_layer_to_prefill_end_s': 0.0,
+            'split_layer_to_prefill_end_without_prune_s': 0.0,
+            'prune_selection_s': 0.0,
+            'prune_op_s': 0.0,
+            'prune_layer_to_finish_s': 0.0,
+            'seq_tokens_before': int(self.seq_tokens_before),
+            'seq_tokens_after': int(self.seq_tokens_after),
+            'visual_tokens_before': int(self.visual_tokens_before),
+            'visual_tokens_after': int(self.visual_tokens_after),
+            'prompt_seq_tokens': int(self.seq_tokens_before),
+            'decode_tokens': int(self.decode_steps),
+            'timing_fallback': False,
+            'timing_source': 'runtime_hooks',
+        }
+
+    def to_flops_dict(self) -> dict:
+        e2e = float(self.vision_flops + self.llm_flops + self.lm_head_flops)
+        return {
+            'vision_flops': float(self.vision_flops),
+            'llm_flops': float(self.llm_flops),
+            'lm_head_flops': float(self.lm_head_flops),
+            'e2e_flops': float(e2e),
+            'forward_steps': int(self.forward_steps),
+        }
 
 
 def _extract_visual_grid_hw(inputs) -> tuple[int, int] | None:
@@ -403,6 +765,20 @@ def _record_generate_timing(owner, model, sample_meta: dict | None, stage_record
     if isinstance(stage_record, dict):
         merged.update(stage_record)
     merged.update(runtime)
+    flops_stats = dict(getattr(model, '_vlmeval_last_sample_flops', {}) or {})
+    if flops_stats and any(
+        float(flops_stats.get(key, 0.0) or 0.0) > 0.0
+        for key in ('vision_flops', 'llm_flops', 'lm_head_flops', 'e2e_flops')
+    ):
+        merged.update(
+            {
+                'vision_flops': float(flops_stats.get('vision_flops', 0.0) or 0.0),
+                'llm_flops': float(flops_stats.get('llm_flops', 0.0) or 0.0),
+                'lm_head_flops': float(flops_stats.get('lm_head_flops', 0.0) or 0.0),
+                'e2e_flops': float(flops_stats.get('e2e_flops', 0.0) or 0.0),
+                'flops_forward_steps': int(flops_stats.get('forward_steps', 0) or 0),
+            }
+        )
     merged['sample_index'] = str((sample_meta or {}).get('sample_index', ''))
     merged['dataset_name'] = str((sample_meta or {}).get('dataset_name', ''))
 
@@ -419,10 +795,10 @@ def _record_generate_timing(owner, model, sample_meta: dict | None, stage_record
         prune_stats = dict(prune_records[-1].get('stats', {}) or {})
 
     top4 = prune_stats.get('selected_top4_grids', [])
-    seq_before = prune_stats.get('seq_tokens_before', None)
-    seq_after = prune_stats.get('seq_tokens_after', None)
-    visual_before = prune_stats.get('visual_tokens_before', None)
-    visual_after = prune_stats.get('visual_tokens_after', None)
+    seq_before = prune_stats.get('seq_tokens_before', merged.get('seq_tokens_before', None))
+    seq_after = prune_stats.get('seq_tokens_after', merged.get('seq_tokens_after', None))
+    visual_before = prune_stats.get('visual_tokens_before', merged.get('visual_tokens_before', None))
+    visual_after = prune_stats.get('visual_tokens_after', merged.get('visual_tokens_after', None))
     prune_applied = bool(prune_stats.get('prune_applied', False))
     lookup_status = prune_stats.get('lookup_status', None)
     log_tag = '[ROIPruneSample]' if prune_applied or _env_flag('QWEN3VL_ENABLE_ROI_PRUNE', '0') else '[GenerateSample]'
@@ -463,6 +839,9 @@ def _record_generate_timing(owner, model, sample_meta: dict | None, stage_record
         f"template_static_decode_steps={template_static_decode_steps} "
         f"template_unknown_decode_steps={template_unknown_decode_steps} "
         f"template_fallback_reason={template_fallback_reason} "
+        f"vision_flops={float(merged.get('vision_flops', 0.0) or 0.0):.0f} "
+        f"llm_flops={float(merged.get('llm_flops', 0.0) or 0.0):.0f} "
+        f"e2e_flops={float(merged.get('e2e_flops', 0.0) or 0.0):.0f} "
         f"total_generate_s={float(merged.get('total_s', 0.0) or 0.0):.6f}",
         flush=True,
     )
@@ -695,7 +1074,9 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                     self.model = AutoModelForImageTextToText.from_pretrained(
                         model_path, torch_dtype='auto', device_map='auto', attn_implementation='sdpa'#'flash_attention_2'
                     )
+                    _patch_upstream_qwen3vl_prepare_inputs_for_generation(self.model)
             self.model.eval()
+            _patch_qwen3vl_runtime_tracking(self.model)
             if _env_flag('QWEN3VL_ENABLE_ROI_PRUNE', '0') and not _env_flag('QWEN3VL_ROI_PRUNE_USE_CACHE', '0'):
                 try:
                     self.model.config.use_cache = False
@@ -930,6 +1311,7 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 inputs = inputs.to(self.model.dtype)
         except Exception:
             inputs = inputs.to('cuda')
+        inputs = _sanitize_generate_inputs_for_model(self.model, inputs)
 
         if is_omni:
             try:
@@ -979,6 +1361,38 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             response = None
             prompt_seq_tokens = 0
             decode_tokens = 0
+            runtime_tracking_enabled = (
+                _env_flag('QWEN3VL_RUNTIME_TRACKING', '0')
+                and not _use_qwen3vl_timing_model()
+            )
+            runtime_tracker = None
+            if runtime_tracking_enabled:
+                try:
+                    prompt_tensor = getattr(inputs, 'input_ids', None)
+                    if prompt_tensor is None and isinstance(inputs, dict):
+                        prompt_tensor = inputs.get('input_ids', None)
+                    if prompt_tensor is not None:
+                        try:
+                            prompt_seq_tokens = int(prompt_tensor.shape[1])
+                        except Exception:
+                            prompt_seq_tokens = int(prompt_seq_tokens or 0)
+                    visual_tokens = _estimate_visual_tokens(
+                        image_grid_thw=getattr(inputs, 'image_grid_thw', None) if not isinstance(inputs, dict) else inputs.get('image_grid_thw'),
+                        video_grid_thw=getattr(inputs, 'video_grid_thw', None) if not isinstance(inputs, dict) else inputs.get('video_grid_thw'),
+                    )
+                    _, llm_m, _, _ = _pick_vision_and_llm_modules(self.model)
+                    runtime_tracker = _RuntimeTrackingHooks(
+                        self.model,
+                        llm_m,
+                        visual_tokens=visual_tokens,
+                        prompt_seq_tokens=prompt_seq_tokens,
+                        use_cuda_events=use_cuda_events,
+                        sync_cuda=sync_cuda,
+                    )
+                    runtime_tracker.attach()
+                except Exception as exc:
+                    runtime_tracker = None
+                    print(f'[RuntimeTracking] disabled_due_to_setup_error={exc}', flush=True)
             template_response, template_meta = maybe_generate_with_template_prefill(
                 dataset=dataset,
                 model=self.model,
@@ -991,47 +1405,77 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 generate_kwargs=generate_kwargs,
                 configure_context_fn=(lambda local_inputs: _configure_roi_prune_context(self.model, dataset, message, sample_meta, local_inputs)),
             )
-            if template_response is not None:
-                response = template_response
-                try:
-                    if hasattr(inputs, 'input_ids'):
-                        prompt_lengths = [int(x.shape[0]) for x in inputs.input_ids]
-                    else:
-                        prompt_tensor = inputs.get('input_ids', None)
-                        prompt_lengths = [int(x.shape[0]) for x in prompt_tensor] if prompt_tensor is not None else []
-                    prompt_seq_tokens = int(prompt_lengths[0]) if prompt_lengths else 0
-                    decode_tokens = int(template_meta.get('template_decode_tokens', 0) or 0)
-                except Exception:
-                    prompt_seq_tokens = 0
-                    decode_tokens = int(template_meta.get('template_decode_tokens', 0) or 0)
-            else:
-                generated_ids = self.model.generate(
-                    **inputs,
-                    **generate_kwargs,
-                )
-                try:
-                    if hasattr(inputs, 'input_ids'):
-                        prompt_lengths = [int(x.shape[0]) for x in inputs.input_ids]
-                    else:
-                        prompt_tensor = inputs.get('input_ids', None)
-                        prompt_lengths = [int(x.shape[0]) for x in prompt_tensor] if prompt_tensor is not None else []
-                    prompt_seq_tokens = int(prompt_lengths[0]) if prompt_lengths else 0
-                    if isinstance(generated_ids, torch.Tensor):
-                        full_lengths = [int(x.shape[0]) for x in generated_ids]
-                    else:
-                        full_lengths = [int(x.shape[0]) for x in list(generated_ids)]
-                    if prompt_lengths and full_lengths:
-                        decode_tokens = max(0, int(full_lengths[0] - prompt_lengths[0]))
-                except Exception:
-                    prompt_seq_tokens = 0
-                    decode_tokens = 0
-                generated_ids_trimmed = [
-                    output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                out = self.processor.tokenizer.batch_decode(
-                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                )
-                response = out[0]
+            try:
+                if template_response is not None:
+                    response = template_response
+                    try:
+                        if hasattr(inputs, 'input_ids'):
+                            prompt_lengths = [int(x.shape[0]) for x in inputs.input_ids]
+                        else:
+                            prompt_tensor = inputs.get('input_ids', None)
+                            prompt_lengths = [int(x.shape[0]) for x in prompt_tensor] if prompt_tensor is not None else []
+                        prompt_seq_tokens = int(prompt_lengths[0]) if prompt_lengths else 0
+                        decode_tokens = int(template_meta.get('template_decode_tokens', 0) or 0)
+                    except Exception:
+                        prompt_seq_tokens = 0
+                        decode_tokens = int(template_meta.get('template_decode_tokens', 0) or 0)
+                else:
+                    generated_ids = self.model.generate(
+                        **inputs,
+                        **generate_kwargs,
+                    )
+                    try:
+                        if hasattr(inputs, 'input_ids'):
+                            prompt_lengths = [int(x.shape[0]) for x in inputs.input_ids]
+                        else:
+                            prompt_tensor = inputs.get('input_ids', None)
+                            prompt_lengths = [int(x.shape[0]) for x in prompt_tensor] if prompt_tensor is not None else []
+                        prompt_seq_tokens = int(prompt_lengths[0]) if prompt_lengths else 0
+                        if isinstance(generated_ids, torch.Tensor):
+                            full_lengths = [int(x.shape[0]) for x in generated_ids]
+                        else:
+                            full_lengths = [int(x.shape[0]) for x in list(generated_ids)]
+                        if prompt_lengths and full_lengths:
+                            decode_tokens = max(0, int(full_lengths[0] - prompt_lengths[0]))
+                    except Exception:
+                        prompt_seq_tokens = 0
+                        decode_tokens = 0
+                    generated_ids_trimmed = [
+                        output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, generated_ids)
+                    ]
+                    out = self.processor.tokenizer.batch_decode(
+                        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                    )
+                    response = out[0]
+            finally:
+                if runtime_tracker is not None:
+                    try:
+                        runtime_tracker.seq_tokens_before = int(prompt_seq_tokens or runtime_tracker.seq_tokens_before)
+                        runtime_tracker.seq_tokens_after = int(
+                            max(runtime_tracker.seq_tokens_after, (prompt_seq_tokens or 0) + (decode_tokens or 0))
+                        )
+                        runtime_tracker.decode_steps = int(max(runtime_tracker.decode_steps, decode_tokens or 0))
+                        runtime_tracker.finalize()
+                        runtime_dict = runtime_tracker.to_runtime_dict()
+                        runtime_dict['prompt_seq_tokens'] = int(prompt_seq_tokens or runtime_dict.get('prompt_seq_tokens', 0) or 0)
+                        runtime_dict['decode_tokens'] = int(decode_tokens or runtime_dict.get('decode_tokens', 0) or 0)
+                        cfg = self.model.config.text_config
+                        setattr(cfg, '_vlmeval_generate_timing_last', runtime_dict)
+                        self.model._vlmeval_last_sample_flops = runtime_tracker.to_flops_dict()
+                        if _env_flag('QWEN3VL_RUNTIME_TRACKING_DEBUG', '0'):
+                            print(
+                                '[RuntimeTracking] '
+                                f'prefill_s={runtime_dict.get("prefill_s", 0.0):.6f} '
+                                f'decode_s={runtime_dict.get("decode_s", 0.0):.6f} '
+                                f'decode_steps={runtime_dict.get("decode_steps", 0)} '
+                                f'seq_tokens_before={runtime_dict.get("seq_tokens_before")} '
+                                f'seq_tokens_after={runtime_dict.get("seq_tokens_after")} '
+                                f'visual_tokens={runtime_dict.get("visual_tokens_before")} '
+                                f'llm_flops={self.model._vlmeval_last_sample_flops.get("llm_flops", 0.0):.0f}',
+                                flush=True,
+                            )
+                    except Exception as exc:
+                        print(f'[RuntimeTracking] finalize_error={exc}', flush=True)
             #=======================timer================================
             if stage_timing and timer is not None and total_start is not None:
                 if sync_cuda and torch.cuda.is_available() and not use_cuda_events:

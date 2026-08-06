@@ -27,6 +27,10 @@ def _flops_profile_enabled() -> bool:
     return _env_flag("QWEN3VL_PROFILE_FLOPS", "0")
 
 
+def _flops_safe_mode_enabled() -> bool:
+    return _env_flag("QWEN3VL_PROFILE_FLOPS_SAFE", "1")
+
+
 def _cuda_ready() -> bool:
     try:
         return torch.cuda.is_available()
@@ -51,6 +55,8 @@ def _log(msg: str) -> None:
 
 def _maybe_profile_flops(stage: str, fn: Callable[[], Any]) -> tuple[Any, Optional[float]]:
     if not _flops_profile_enabled():
+        return fn(), None
+    if _flops_safe_mode_enabled() and stage in {"llm_decoder", "lm_head"}:
         return fn(), None
     if not _TORCH_PROFILER_AVAILABLE:
         _log("[Efficiency INFO] FLOPs profiling requested but torch.profiler is unavailable.")
@@ -152,6 +158,13 @@ def _flush_sample_flops(model) -> None:
 def _finalize_sample_flops(model) -> None:
     if not getattr(model, "_sample_flops_active", False):
         return
+    model._vlmeval_last_sample_flops = {
+        "vision_flops": float(getattr(model, "_sample_vision_flops_sum", 0.0) or 0.0),
+        "llm_flops": float(getattr(model, "_sample_llm_flops_sum", 0.0) or 0.0),
+        "lm_head_flops": float(getattr(model, "_sample_lm_head_flops_sum", 0.0) or 0.0),
+        "e2e_flops": float(getattr(model, "_sample_e2e_flops_sum", 0.0) or 0.0),
+        "forward_steps": int(getattr(model, "_sample_flops_steps", 0) or 0),
+    }
     _flush_sample_flops(model)
     _reset_sample_flops(model)
     model._sample_flops_active = False
@@ -175,6 +188,14 @@ def enable_qwen3vl_flops_profiling(model) -> bool:
     model._sample_vision_flops_sum = 0.0
     model._sample_lm_head_flops_sum = 0.0
     model._last_lm_head_flops = None
+    model._vlmeval_last_sample_flops = {}
+    if _flops_safe_mode_enabled():
+        _log(
+            "[Efficiency INFO] Qwen3VL FLOPs safe mode enabled: disable runtime FLOPs wrappers on the "
+            "generate path to avoid cache-sensitive attention shape mismatches."
+        )
+        model._vlmeval_flops_patched = True
+        return True
 
     core = getattr(model, "model", None)
     if core is None:
@@ -205,25 +226,27 @@ def enable_qwen3vl_flops_profiling(model) -> bool:
 
         core.get_video_features = types.MethodType(patched_get_video_features, core)
 
-    if hasattr(core, "language_model") and hasattr(core.language_model, "forward"):
-        orig_lm_forward = core.language_model.forward
+    if not _flops_safe_mode_enabled():
+        if hasattr(core, "language_model") and hasattr(core.language_model, "forward"):
+            orig_lm_forward = core.language_model.forward
+            lm_module = core.language_model
 
-        def patched_lm_forward(self, *args, **kwargs):
-            out, flops = _maybe_profile_flops("llm_decoder", lambda: orig_lm_forward(*args, **kwargs))
-            self._vlmeval_last_llm_flops = float(flops) if flops is not None else None
-            return out
+            def patched_lm_forward(self, *args, **kwargs):
+                out, flops = _maybe_profile_flops("llm_decoder", lambda: orig_lm_forward(*args, **kwargs))
+                core._vlmeval_last_llm_flops = float(flops) if flops is not None else None
+                return out
 
-        core.language_model.forward = types.MethodType(patched_lm_forward, core)
+            lm_module.forward = types.MethodType(patched_lm_forward, lm_module)
 
-    if hasattr(model, "lm_head") and hasattr(model.lm_head, "forward"):
-        orig_lm_head_forward = model.lm_head.forward
+        if hasattr(model, "lm_head") and hasattr(model.lm_head, "forward"):
+            orig_lm_head_forward = model.lm_head.forward
 
-        def patched_lm_head_forward(self, *args, **kwargs):
-            out, flops = _maybe_profile_flops("lm_head", lambda: orig_lm_head_forward(*args, **kwargs))
-            model._last_lm_head_flops = float(flops) if flops is not None else None
-            return out
+            def patched_lm_head_forward(self, *args, **kwargs):
+                out, flops = _maybe_profile_flops("lm_head", lambda: orig_lm_head_forward(*args, **kwargs))
+                model._last_lm_head_flops = float(flops) if flops is not None else None
+                return out
 
-        model.lm_head.forward = types.MethodType(patched_lm_head_forward, model.lm_head)
+            model.lm_head.forward = types.MethodType(patched_lm_head_forward, model.lm_head)
 
     if hasattr(core, "forward"):
         orig_core_forward = core.forward

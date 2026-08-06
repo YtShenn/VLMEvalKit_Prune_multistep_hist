@@ -696,6 +696,42 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                     f"total_generate_avg_s={avgs['total_s']:.6f}",
                     flush=True,
                 )
+                flops_keys = ['vision_flops', 'llm_flops', 'lm_head_flops', 'e2e_flops']
+                flops_values = [0.0, 0.0, 0.0, 0.0, 0.0]
+                for rec in recs:
+                    if not isinstance(rec, dict):
+                        continue
+                    flops_values[0] += float(rec.get('vision_flops', 0.0) or 0.0)
+                    flops_values[1] += float(rec.get('llm_flops', 0.0) or 0.0)
+                    flops_values[2] += float(rec.get('lm_head_flops', 0.0) or 0.0)
+                    flops_values[3] += float(rec.get('e2e_flops', 0.0) or 0.0)
+                    flops_values[4] += float(bool(float(rec.get('e2e_flops', 0.0) or 0.0) > 0.0))
+                flops_tensor = torch.tensor(flops_values, device=device, dtype=torch.float64)
+                if world_size > 1 and dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(flops_tensor, op=dist.ReduceOp.SUM)
+                fv = flops_tensor.tolist()
+                if fv[4] > 0:
+                    summary.update(
+                        {
+                            'flops_profiled_samples': int(fv[4]),
+                            'avg_vision_flops': float(fv[0] / fv[4]),
+                            'avg_llm_flops': float(fv[1] / fv[4]),
+                            'avg_lm_head_flops': float(fv[2] / fv[4]),
+                            'avg_e2e_flops': float(fv[3] / fv[4]),
+                            'total_vision_flops': float(fv[0]),
+                            'total_llm_flops': float(fv[1]),
+                            'total_lm_head_flops': float(fv[2]),
+                            'total_e2e_flops': float(fv[3]),
+                        }
+                    )
+                    print(
+                        '[FlopsSummary] '
+                        f"samples={int(fv[4])} "
+                        f"avg_e2e_flops={fv[3] / fv[4]:.0f} "
+                        f"avg_vision_flops={fv[0] / fv[4]:.0f} "
+                        f"avg_llm_flops={fv[1] / fv[4]:.0f}",
+                        flush=True,
+                    )
     if os.getenv('VLM_PRUNE_TIMING', '0') == '1' and hasattr(model, '_vlmeval_prune_records'):
         recs = getattr(model, '_vlmeval_prune_records', None) or []
         sort_vals = [r.get('sort_s') for r in recs if isinstance(r, dict) and r.get('sort_s') is not None]
@@ -781,6 +817,13 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                 flush=True,
             )
     if rank == 0:
+        if hasattr(dataset, 'summarize_state_packet_records'):
+            try:
+                packet_summary = dict(dataset.summarize_state_packet_records() or {})
+                if packet_summary:
+                    summary.update(packet_summary)
+            except Exception as err:
+                summary['state_packet_summary_error'] = f'{type(err).__name__}: {err}'
         _write_experiment_summary(work_dir, summary)
     return model
 

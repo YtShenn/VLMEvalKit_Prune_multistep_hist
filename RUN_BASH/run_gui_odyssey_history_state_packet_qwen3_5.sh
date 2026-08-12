@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=6
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
@@ -17,6 +17,12 @@ export VLM_STAGE_TIMING_SYNC="${VLM_STAGE_TIMING_SYNC:-0}"
 export VLM_PRUNE_TIMING="${VLM_PRUNE_TIMING:-1}"
 export SEED="${SEED:-42}"
 export QWEN3VL_PROFILE_FLOPS="${QWEN3VL_PROFILE_FLOPS:-1}"
+
+export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE:-1}"
+export QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG="${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG:-1}"
+export QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS="${QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS:-16}"
+export QWEN3VL_STRUCTURED_FAST_DECODE_GUI_DIRECTION_MAX_TOKENS="${QWEN3VL_STRUCTURED_FAST_DECODE_GUI_DIRECTION_MAX_TOKENS:-8}"
+export QWEN3VL_STRUCTURED_FAST_DECODE_GUI_COORD_MAX_TOKENS="${QWEN3VL_STRUCTURED_FAST_DECODE_GUI_COORD_MAX_TOKENS:-24}"
 
 export QWEN3VL_ENABLE_ROI_PRUNE=0
 export QWEN3VL_ROI_PRUNE_USE_CACHE="${QWEN3VL_ROI_PRUNE_USE_CACHE:-1}"
@@ -47,7 +53,7 @@ DATASET="${DATASET:-GUIOdyssey_high_random_split}"
 PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
 TS="$(date +%Y%m%d_%H%M%S)"
-TAG="${TAG:-hist4_keep_system_prompt_state_packet_changeratio2}"
+TAG="${TAG:-hist4_keep_system_prompt_state_packet_structured_fast_changeratio}"
 WORK_DIR="${WORK_DIR:-OUTPUT/ablation_gui_odyssey_${TAG}_qwen3_5_node5}"
 LOG_FILE="run_output_${TS}_gui_odyssey_${TAG}.log"
 
@@ -69,6 +75,11 @@ mkdir -p "${WORK_DIR}/${DATASET}"
   echo "[Run] roi_short_side_ratio=${GUI_ODYSSEY_STATE_PACKET_ROI_SHORT_SIDE_RATIO}"
   echo "[Run] roi_min_side_px=${GUI_ODYSSEY_STATE_PACKET_ROI_MIN_SIDE_PX}"
   echo "[Run] flops_profile=${QWEN3VL_PROFILE_FLOPS}"
+  echo "[Run] structured_fast_decode=${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE}"
+  echo "[Run] structured_fast_decode_debug=${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG}"
+  echo "[Run] structured_fast_decode_action_max_tokens=${QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS}"
+  echo "[Run] structured_fast_decode_gui_direction_max_tokens=${QWEN3VL_STRUCTURED_FAST_DECODE_GUI_DIRECTION_MAX_TOKENS}"
+  echo "[Run] structured_fast_decode_gui_coord_max_tokens=${QWEN3VL_STRUCTURED_FAST_DECODE_GUI_COORD_MAX_TOKENS}"
   echo "[Run] sample_mode=${VLM_EVAL_SAMPLE_MODE}"
   echo "[Run] sample_tasks=${VLM_EVAL_SAMPLE_TASKS}"
   echo "[Run] sample_seed=${VLM_EVAL_SAMPLE_SEED}"

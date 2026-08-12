@@ -75,6 +75,63 @@ def build_model_from_config(cfg, model_name, use_vllm=False):
     return model
 
 
+
+
+def _summary_key(text):
+    out = []
+    for ch in str(text):
+        if ch.isalnum():
+            out.append(ch.lower())
+        else:
+            out.append('_')
+    key = ''.join(out).strip('_')
+    while '__' in key:
+        key = key.replace('__', '_')
+    return key or 'metric'
+
+
+def _json_safe_metric(value):
+    try:
+        import numpy as np
+        if isinstance(value, np.generic):
+            return value.item()
+    except Exception:
+        pass
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe_metric(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_metric(v) for v in value]
+    return str(value)
+
+
+def _append_eval_metrics_to_summary(pred_root, eval_results):
+    if eval_results is None or RANK != 0:
+        return
+    summary_path = osp.join(pred_root, 'summary.json')
+    try:
+        summary = load(summary_path) if osp.exists(summary_path) else {}
+        if not isinstance(summary, dict):
+            summary = {}
+    except Exception:
+        summary = {}
+
+    if isinstance(eval_results, dict):
+        metrics = _json_safe_metric(eval_results)
+    elif isinstance(eval_results, pd.DataFrame):
+        metrics = _json_safe_metric(eval_results.to_dict())
+    else:
+        metrics = _json_safe_metric(eval_results)
+    summary['eval_metrics'] = metrics
+
+    if isinstance(metrics, dict):
+        for key, value in metrics.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                summary[f'eval_{_summary_key(key)}'] = value
+    dump(summary, summary_path)
+
+
 def build_dataset_from_config(cfg, dataset_name):
     import vlmeval.dataset
     import inspect
@@ -474,6 +531,7 @@ def main():
 
                     # Perform the Evaluation
                     eval_results = dataset.evaluate(result_file, **judge_kwargs)
+                    _append_eval_metrics_to_summary(pred_root, eval_results)
                     # Display Evaluation Results in Terminal
                     if eval_results is not None:
                         assert isinstance(eval_results, dict) or isinstance(eval_results, pd.DataFrame)

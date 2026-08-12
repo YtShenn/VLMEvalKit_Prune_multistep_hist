@@ -1,0 +1,833 @@
+from __future__ import annotations
+
+import os
+import time
+from typing import Any
+
+import torch
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return int(default)
+
+
+def _empty_meta(reason: str) -> dict[str, Any]:
+    return {
+        "template_prefill_enabled": False,
+        "template_prefill_fallback_reason": reason,
+        "template_prefill_impl": "structured_fast_decode_v1",
+        "template_prefill_backend_impl": "direct_forward_kv_cache",
+        "template_prefill_requested_impl": "structured_fast_decode_v1",
+        "template_schema": None,
+        "template_static_parts": [],
+        "template_slot_stats": [],
+        "template_static_token_count": 0,
+        "template_static_decode_steps": 0,
+        "template_unknown_decode_steps": 0,
+        "template_decode_tokens": 0,
+    }
+
+
+GUI_ACTION_HEADS = (
+    "CLICK",
+    "LONG_PRESS",
+    "SCROLL",
+    "TYPE",
+    "PRESS_HOME",
+    "PRESS_BACK",
+    "PRESS_RECENT",
+    "COMPLETE",
+    "IMPOSSIBLE",
+)
+
+GUI_SCROLL_DIRECTIONS = ("UP", "DOWN", "LEFT", "RIGHT")
+GUI_TERMINAL_ACTIONS = ("PRESS_HOME", "PRESS_BACK", "PRESS_RECENT", "COMPLETE", "IMPOSSIBLE")
+GUI_COORD_ACTIONS = ("CLICK", "LONG_PRESS")
+
+
+def _dataset_family(dataset: str | None) -> str:
+    name = str(dataset or "")
+    if name.startswith("AndroidControl"):
+        return "androidcontrol"
+    if name.startswith("GUIOdyssey"):
+        return "guiodyssey"
+    return ""
+
+
+def _batch_to_dict(inputs) -> dict[str, Any]:
+    if isinstance(inputs, dict):
+        return dict(inputs)
+    try:
+        return dict(inputs)
+    except Exception:
+        return {k: getattr(inputs, k) for k in dir(inputs) if not k.startswith("_")}
+
+
+def _get_input_ids(inputs) -> torch.Tensor | None:
+    if isinstance(inputs, dict):
+        return inputs.get("input_ids", None)
+    return getattr(inputs, "input_ids", None)
+
+
+def _get_attention_mask(inputs) -> torch.Tensor | None:
+    if isinstance(inputs, dict):
+        return inputs.get("attention_mask", None)
+    return getattr(inputs, "attention_mask", None)
+
+
+def _tokenize(tokenizer, text: str, device: torch.device) -> torch.Tensor:
+    ids = tokenizer(text, add_special_tokens=False, return_tensors="pt").input_ids
+    return ids.to(device=device)
+
+
+def _decode_ids(tokenizer, ids: list[int]) -> str:
+    if not ids:
+        return ""
+    return tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+
+def _cache_seq_len(past_key_values, fallback: int) -> int:
+    if past_key_values is None:
+        return int(fallback)
+    try:
+        return int(past_key_values.get_seq_length())
+    except Exception:
+        pass
+    try:
+        return int(past_key_values[0][0].shape[-2])
+    except Exception:
+        return int(fallback)
+
+
+def _select_next_token(logits: torch.Tensor, generate_kwargs: dict[str, Any]) -> int:
+    next_logits = logits[:, -1, :]
+    do_sample = bool(generate_kwargs.get("do_sample", False))
+    if not do_sample:
+        return int(torch.argmax(next_logits, dim=-1).item())
+
+    temperature = float(generate_kwargs.get("temperature", 1.0) or 1.0)
+    if temperature > 0:
+        next_logits = next_logits / temperature
+
+    top_k = int(generate_kwargs.get("top_k", 0) or 0)
+    if top_k > 0 and top_k < next_logits.shape[-1]:
+        values, _ = torch.topk(next_logits, top_k)
+        min_values = values[:, -1, None]
+        next_logits = torch.where(next_logits < min_values, torch.full_like(next_logits, -float("inf")), next_logits)
+
+    top_p = float(generate_kwargs.get("top_p", 1.0) or 1.0)
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        remove = cumulative > top_p
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(remove, -float("inf"))
+        next_logits = torch.full_like(next_logits, -float("inf"))
+        next_logits.scatter_(1, sorted_indices, sorted_logits)
+
+    probs = torch.softmax(next_logits, dim=-1)
+    return int(torch.multinomial(probs, num_samples=1).item())
+
+
+def _model_forward(
+    model,
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    past_key_values=None,
+    position_ids: torch.Tensor | None = None,
+    cache_position: torch.Tensor | None = None,
+    extra_inputs: dict[str, Any] | None = None,
+):
+    kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "past_key_values": past_key_values,
+        "use_cache": True,
+        "return_dict": True,
+    }
+    if position_ids is not None:
+        kwargs["position_ids"] = position_ids
+    if cache_position is not None:
+        kwargs["cache_position"] = cache_position
+    if extra_inputs:
+        kwargs.update(extra_inputs)
+    return model(**kwargs)
+
+
+def _decode_position_kwargs(past_key_values, q_len: int, device: torch.device) -> dict[str, torch.Tensor]:
+    past_len = _cache_seq_len(past_key_values, 0)
+    positions = torch.arange(past_len, past_len + int(q_len), dtype=torch.long, device=device)
+    return {
+        "position_ids": positions.view(1, -1),
+        "cache_position": positions,
+    }
+
+
+def _append_static(
+    model,
+    tokenizer,
+    *,
+    text: str,
+    past_key_values,
+    attention_mask: torch.Tensor,
+    logits: torch.Tensor,
+    device: torch.device,
+) -> tuple[Any, torch.Tensor, torch.Tensor, int, float]:
+    ids = _tokenize(tokenizer, text, device)
+    token_count = int(ids.shape[1])
+    if token_count == 0:
+        return past_key_values, attention_mask, logits, 0, 0.0
+    pos_kwargs = _decode_position_kwargs(past_key_values, token_count, device)
+    new_mask = torch.ones((attention_mask.shape[0], token_count), dtype=attention_mask.dtype, device=device)
+    attention_mask = torch.cat([attention_mask, new_mask], dim=1)
+    start = time.perf_counter()
+    out = _model_forward(
+        model,
+        input_ids=ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        **pos_kwargs,
+    )
+    elapsed = time.perf_counter() - start
+    return out.past_key_values, attention_mask, out.logits, token_count, elapsed
+
+
+def _decode_until(
+    model,
+    tokenizer,
+    *,
+    logits: torch.Tensor,
+    past_key_values,
+    attention_mask: torch.Tensor,
+    device: torch.device,
+    generate_kwargs: dict[str, Any],
+    stop_chars: tuple[str, ...],
+    max_tokens: int,
+    slot_name: str,
+) -> tuple[str, str, list[int], Any, torch.Tensor, torch.Tensor, int, bool, str | None, float]:
+    ids: list[int] = []
+    rendered = ""
+    raw = ""
+    steps = 0
+    elapsed = 0.0
+    eos_ids = generate_kwargs.get("eos_token_id", None)
+    if eos_ids is None:
+        eos_ids = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(eos_ids, int):
+        eos_set = {eos_ids}
+    elif isinstance(eos_ids, (list, tuple, set)):
+        eos_set = {int(x) for x in eos_ids if x is not None}
+    else:
+        eos_set = set()
+
+    for _ in range(max_tokens):
+        token_id = _select_next_token(logits, generate_kwargs)
+        ids.append(token_id)
+        steps += 1
+        raw = _decode_ids(tokenizer, ids)
+        stop_idx = None
+        for ch in stop_chars:
+            idx = raw.find(ch)
+            if idx >= 0:
+                stop_idx = idx if stop_idx is None else min(stop_idx, idx)
+        rendered = raw if stop_idx is None else raw[:stop_idx]
+
+        token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=device)
+        pos_kwargs = _decode_position_kwargs(past_key_values, 1, device)
+        new_mask = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=device)
+        attention_mask = torch.cat([attention_mask, new_mask], dim=1)
+        start = time.perf_counter()
+        out = _model_forward(
+            model,
+            input_ids=token_tensor,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            **pos_kwargs,
+        )
+        elapsed += time.perf_counter() - start
+        past_key_values = out.past_key_values
+        logits = out.logits
+
+        if stop_idx is not None:
+            return rendered.strip(), raw, ids, past_key_values, attention_mask, logits, steps, True, None, elapsed
+        if token_id in eos_set:
+            return rendered.strip(), raw, ids, past_key_values, attention_mask, logits, steps, False, f"{slot_name}_hit_eos", elapsed
+
+    return rendered.strip(), raw, ids, past_key_values, attention_mask, logits, steps, False, f"{slot_name}_max_tokens", elapsed
+
+
+def _normalize_action(action: str) -> str:
+    text = str(action or "").strip().strip('"').strip("'").strip().lower()
+    if "tap" in text:
+        text = text.replace("tap", "click")
+    if "long press" in text:
+        text = text.replace("long press", "long_press")
+    return text
+
+
+def _suffix_after_first_stop(text: str, stop_chars: tuple[str, ...]) -> str | None:
+    raw = str(text or "")
+    best = None
+    best_ch = None
+    for ch in stop_chars:
+        idx = raw.find(ch)
+        if idx >= 0 and (best is None or idx < best):
+            best = idx
+            best_ch = ch
+    if best is None or best_ch is None:
+        return None
+    return raw[best + len(best_ch):]
+
+
+def _tail_after_cached_suffix(suffix: str, default_tail: str) -> str | None:
+    suffix = str(suffix or "")
+    if suffix == "":
+        return default_tail
+    if suffix.startswith("</answer>"):
+        return ""
+    if suffix.startswith("}"):
+        return "</answer>"
+    return None
+
+
+def _normalize_gui_closed_set(text: str) -> str:
+    return str(text or "").strip().upper()
+
+
+def _match_gui_closed_set(raw: str, candidates: tuple[str, ...], allow_boundary_chars: str) -> tuple[bool, str, str, str | None]:
+    text = str(raw or "").lstrip()
+    upper = text.upper()
+    for cand in candidates:
+        cand_upper = cand.upper()
+        if upper == cand_upper:
+            return True, cand, text[: len(cand)], ""
+        if upper.startswith(cand_upper):
+            suffix = text[len(cand):]
+            if suffix and suffix[0] in allow_boundary_chars and suffix.strip(allow_boundary_chars + " \n\r\t") == "":
+                return True, cand, text[: len(cand)], suffix
+    if any(cand.upper().startswith(upper.strip().upper()) for cand in candidates):
+        return False, "", "", None
+    return False, "", "", "closed_set_no_prefix"
+
+
+def _decode_gui_closed_set(
+    model,
+    tokenizer,
+    *,
+    logits: torch.Tensor,
+    past_key_values,
+    attention_mask: torch.Tensor,
+    device: torch.device,
+    generate_kwargs: dict[str, Any],
+    candidates: tuple[str, ...],
+    allow_boundary_chars: str,
+    max_tokens: int,
+    slot_name: str,
+) -> tuple[str, str, str, list[int], Any, torch.Tensor, torch.Tensor, int, bool, str | None, float]:
+    ids: list[int] = []
+    raw = ""
+    elapsed = 0.0
+    eos_ids = generate_kwargs.get("eos_token_id", None)
+    if eos_ids is None:
+        eos_ids = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(eos_ids, int):
+        eos_set = {eos_ids}
+    elif isinstance(eos_ids, (list, tuple, set)):
+        eos_set = {int(x) for x in eos_ids if x is not None}
+    else:
+        eos_set = set()
+
+    for _ in range(max_tokens):
+        token_id = _select_next_token(logits, generate_kwargs)
+        ids.append(token_id)
+        raw = _decode_ids(tokenizer, ids)
+
+        token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=device)
+        pos_kwargs = _decode_position_kwargs(past_key_values, 1, device)
+        new_mask = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=device)
+        attention_mask = torch.cat([attention_mask, new_mask], dim=1)
+        start = time.perf_counter()
+        out = _model_forward(
+            model,
+            input_ids=token_tensor,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            **pos_kwargs,
+        )
+        elapsed += time.perf_counter() - start
+        past_key_values = out.past_key_values
+        logits = out.logits
+
+        done, canonical, rendered, suffix_or_reason = _match_gui_closed_set(raw, candidates, allow_boundary_chars)
+        if done:
+            return canonical, raw, suffix_or_reason or "", ids, past_key_values, attention_mask, logits, len(ids), True, None, elapsed
+        if suffix_or_reason == "closed_set_no_prefix":
+            return "", raw, "", ids, past_key_values, attention_mask, logits, len(ids), False, f"{slot_name}_no_prefix", elapsed
+        if token_id in eos_set:
+            return "", raw, "", ids, past_key_values, attention_mask, logits, len(ids), False, f"{slot_name}_hit_eos", elapsed
+
+    return "", raw, "", ids, past_key_values, attention_mask, logits, len(ids), False, f"{slot_name}_max_tokens", elapsed
+
+
+def _gui_static_tail_from_suffix(suffix: str, expected: str) -> str | None:
+    suffix = str(suffix or "")
+    if suffix == "":
+        return expected
+    if expected.startswith(suffix):
+        return expected[len(suffix):]
+    return None
+
+
+def _valid_gui_coord_pair(text: str) -> bool:
+    parts = [p.strip() for p in str(text or "").split(",")]
+    if len(parts) != 2:
+        return False
+    try:
+        float(parts[0])
+        float(parts[1])
+    except Exception:
+        return False
+    return True
+
+
+
+def _common_inputs_or_fallback(processor, inputs):
+    tokenizer = processor.tokenizer
+    input_ids = _get_input_ids(inputs)
+    attention_mask = _get_attention_mask(inputs)
+    if input_ids is None:
+        return tokenizer, None, None, None, None, _empty_meta("missing_input_ids")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+    if int(input_ids.shape[0]) != 1:
+        return tokenizer, input_ids, attention_mask, input_ids.device, None, _empty_meta("batch_size_not_one")
+    inputs_dict = _batch_to_dict(inputs)
+    extra_inputs = {
+        k: v
+        for k, v in inputs_dict.items()
+        if k not in ("input_ids", "attention_mask", "position_ids", "cache_position", "past_key_values")
+    }
+    return tokenizer, input_ids, attention_mask, input_ids.device, extra_inputs, None
+
+
+def _android_structured_fast_decode(
+    *,
+    dataset: str | None,
+    model,
+    processor,
+    inputs,
+    generate_kwargs: dict[str, Any],
+    sample_meta: dict | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    tokenizer, input_ids, attention_mask, device, extra_inputs, fallback_meta = _common_inputs_or_fallback(processor, inputs)
+    if fallback_meta is not None:
+        return None, fallback_meta
+
+    static_parts = [
+        '<answer>{"action_type": "',
+        ', "bbox_2d": [',
+        '}</answer>',
+        "}</answer>",
+    ]
+    template_plan = '<answer>{"action_type": "{ACTION_TYPE}", "bbox_2d": [{BBOX_2D}]}</answer>'
+    meta = _empty_meta("not_attempted")
+    meta.update(
+        {
+            "template_schema": "android_action_first_json",
+            "template_static_parts": static_parts,
+            "template_plan": template_plan,
+            "template_prefill_enabled": False,
+            "template_prefill_fallback_reason": None,
+        }
+    )
+
+    action_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS", 16)
+    bbox_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_BBOX_MAX_TOKENS", 64)
+    debug = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0")
+    sample_index = str((sample_meta or {}).get("sample_index", ""))
+
+    static_token_count = 0
+    static_steps = 0
+    dynamic_steps = 0
+    static_s = 0.0
+    dynamic_s = 0.0
+    slot_stats: list[dict[str, Any]] = []
+
+    try:
+        with torch.no_grad():
+            prefill_start = time.perf_counter()
+            out = _model_forward(
+                model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                extra_inputs=extra_inputs,
+            )
+            prefill_s = time.perf_counter() - prefill_start
+            past = out.past_key_values
+            logits = out.logits
+
+            past, attention_mask, logits, n_tok, elapsed = _append_static(
+                model,
+                tokenizer,
+                text=static_parts[0],
+                past_key_values=past,
+                attention_mask=attention_mask,
+                logits=logits,
+                device=device,
+            )
+            static_token_count += n_tok
+            static_steps += int(n_tok > 0)
+            static_s += elapsed
+
+            action, raw_action, action_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
+                model,
+                tokenizer,
+                logits=logits,
+                past_key_values=past,
+                attention_mask=attention_mask,
+                device=device,
+                generate_kwargs=generate_kwargs,
+                stop_chars=('"',),
+                max_tokens=action_max_tokens,
+                slot_name="action",
+            )
+            dynamic_steps += steps
+            dynamic_s += elapsed
+            action_norm = _normalize_action(action)
+            slot_stats.append(
+                {
+                    "slot": "action_type",
+                    "decode_tokens": steps,
+                    "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                    "done": ok,
+                    "fallback": not ok,
+                    "reason": reason,
+                    "raw_text": raw_action,
+                    "rendered_text": action,
+                }
+            )
+            action_suffix = _suffix_after_first_stop(raw_action, ('"',))
+            if not ok or not action or action_suffix is None:
+                meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": reason or "empty_action"})
+                return None, meta
+
+            needs_bbox = action_norm in ("click", "long_press")
+            if needs_bbox:
+                if action_suffix.startswith(","):
+                    suffix_after_comma = action_suffix[1:]
+                    if suffix_after_comma.strip():
+                        bbox_prefix = suffix_after_comma
+                    else:
+                        bbox_prefix = " \"bbox_2d\": ["
+                elif action_suffix == "":
+                    bbox_prefix = static_parts[1]
+                else:
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"action_suffix_unexpected:{action_suffix!r}"})
+                    return None, meta
+                past, attention_mask, logits, n_tok, elapsed = _append_static(
+                    model,
+                    tokenizer,
+                    text=bbox_prefix,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    logits=logits,
+                    device=device,
+                )
+                static_token_count += n_tok
+                static_steps += int(n_tok > 0)
+                static_s += elapsed
+
+                bbox, raw_bbox, bbox_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
+                    model,
+                    tokenizer,
+                    logits=logits,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    device=device,
+                    generate_kwargs=generate_kwargs,
+                    stop_chars=("]",),
+                    max_tokens=bbox_max_tokens,
+                    slot_name="bbox",
+                )
+                dynamic_steps += steps
+                dynamic_s += elapsed
+                slot_stats.append(
+                    {
+                        "slot": "bbox_2d",
+                        "decode_tokens": steps,
+                        "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                        "done": ok,
+                        "fallback": not ok,
+                        "reason": reason,
+                        "raw_text": raw_bbox,
+                        "rendered_text": bbox,
+                    }
+                )
+                bbox_suffix = _suffix_after_first_stop(raw_bbox, ("]",))
+                if not ok or not bbox or bbox_suffix is None:
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": reason or "empty_bbox"})
+                    return None, meta
+                tail = _tail_after_cached_suffix(bbox_suffix, static_parts[3])
+                if tail is None:
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"bbox_suffix_unexpected:{bbox_suffix!r}"})
+                    return None, meta
+                final_text = f'<answer>{{"action_type": "{action}", "bbox_2d": [{bbox}]}}</answer>'
+            else:
+                bbox = ""
+                raw_bbox = ""
+                tail = _tail_after_cached_suffix(action_suffix, static_parts[2])
+                if tail is None:
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"action_suffix_unexpected:{action_suffix!r}"})
+                    return None, meta
+                final_text = f'<answer>{{"action_type": "{action}"}}</answer>'
+
+            past, attention_mask, logits, n_tok, elapsed = _append_static(
+                model,
+                tokenizer,
+                text=tail,
+                past_key_values=past,
+                attention_mask=attention_mask,
+                logits=logits,
+                device=device,
+            )
+            static_token_count += n_tok
+            static_steps += int(n_tok > 0)
+            static_s += elapsed
+    except Exception as exc:
+        meta["template_prefill_fallback_reason"] = f"structured_fast_decode_exception:{type(exc).__name__}:{exc}"
+        return None, meta
+
+    meta.update(
+        {
+            "template_prefill_enabled": True,
+            "template_prefill_fallback_reason": None,
+            "template_slot_stats": slot_stats,
+            "template_static_token_count": int(static_token_count),
+            "template_static_decode_steps": int(static_steps),
+            "template_unknown_decode_steps": int(dynamic_steps),
+            "template_decode_tokens": int(dynamic_steps),
+            "template_final_text": final_text,
+            "template_generated_text": "".join(str(s.get("raw_text", "")) for s in slot_stats),
+            "structured_fast_decode_static_forward_steps": int(static_steps),
+            "structured_fast_decode_dynamic_forward_steps": int(dynamic_steps),
+            "structured_fast_decode_static_s": float(static_s),
+            "structured_fast_decode_dynamic_s": float(dynamic_s),
+            "structured_fast_decode_prefill_s": float(prefill_s),
+            "structured_fast_decode_action": action,
+            "structured_fast_decode_action_normalized": action_norm,
+            "structured_fast_decode_bbox": bbox,
+        }
+    )
+    if debug:
+        print(
+            "[StructuredFastDecode] "
+            f"sample_index={sample_index} "
+            f"enabled=1 schema=android_action_first_json "
+            f"template_plan={template_plan!r} "
+            f"static_parts={static_parts!r} "
+            f"static_forward_steps={static_steps} "
+            f"static_tokens={static_token_count} "
+            f"dynamic_forward_steps={dynamic_steps} "
+            f"action={action!r} "
+            f"bbox={bbox!r} "
+            f"final={final_text!r}",
+            flush=True,
+        )
+    return final_text, meta
+
+
+
+def _gui_structured_fast_decode(
+    *,
+    dataset: str | None,
+    model,
+    processor,
+    inputs,
+    generate_kwargs: dict[str, Any],
+    sample_meta: dict | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    tokenizer, input_ids, attention_mask, device, extra_inputs, fallback_meta = _common_inputs_or_fallback(processor, inputs)
+    if fallback_meta is not None:
+        return None, fallback_meta
+
+    static_parts = [": ", ": (", ")"]
+    template_plan = "{ACTION_HEAD}{STATIC_PREFIX}{SLOT}{STATIC_SUFFIX}"
+    meta = _empty_meta("not_attempted")
+    meta.update(
+        {
+            "template_schema": "gui_command",
+            "template_static_parts": static_parts,
+            "template_plan": template_plan,
+            "template_prefill_enabled": False,
+            "template_prefill_fallback_reason": None,
+        }
+    )
+
+    action_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS", 16)
+    gui_direction_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_GUI_DIRECTION_MAX_TOKENS", 8)
+    gui_coord_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_GUI_COORD_MAX_TOKENS", 24)
+    debug = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0")
+    sample_index = str((sample_meta or {}).get("sample_index", ""))
+
+    static_token_count = 0
+    static_steps = 0
+    dynamic_steps = 0
+    static_s = 0.0
+    dynamic_s = 0.0
+    slot_stats: list[dict[str, Any]] = []
+    coord_pair = ""
+    direction = ""
+
+    try:
+        with torch.no_grad():
+            prefill_start = time.perf_counter()
+            out = _model_forward(
+                model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                extra_inputs=extra_inputs,
+            )
+            prefill_s = time.perf_counter() - prefill_start
+            past = out.past_key_values
+            logits = out.logits
+
+            action_head, raw_head, head_suffix, _, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_gui_closed_set(
+                model,
+                tokenizer,
+                logits=logits,
+                past_key_values=past,
+                attention_mask=attention_mask,
+                device=device,
+                generate_kwargs=generate_kwargs,
+                candidates=GUI_ACTION_HEADS,
+                allow_boundary_chars=": ()\n\r\t",
+                max_tokens=action_max_tokens,
+                slot_name="gui_action_head",
+            )
+            dynamic_steps += steps
+            dynamic_s += elapsed
+            slot_stats.append(
+                {
+                    "slot": "action_head",
+                    "decode_tokens": steps,
+                    "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                    "done": ok,
+                    "fallback": not ok,
+                    "reason": reason,
+                    "raw_text": raw_head,
+                    "rendered_text": action_head,
+                }
+            )
+            if not ok or not action_head:
+                meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": reason or "gui_empty_action_head"})
+                return None, meta
+            if action_head == "TYPE":
+                meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": "gui_type_free_text_fallback"})
+                return None, meta
+            if action_head in GUI_COORD_ACTIONS:
+                meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": "gui_coord_action_safe_fallback"})
+                return None, meta
+            if action_head == "SCROLL":
+                meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": "gui_scroll_safe_fallback"})
+                return None, meta
+            if action_head in GUI_TERMINAL_ACTIONS:
+                if head_suffix.strip():
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_terminal_suffix_unexpected:{head_suffix!r}"})
+                    return None, meta
+                final_text = action_head
+                template_schema = "gui_terminal_command"
+            else:
+                meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"unsupported_gui_action:{action_head}"})
+                return None, meta
+    except Exception as exc:
+        meta["template_prefill_fallback_reason"] = f"structured_fast_decode_exception:{type(exc).__name__}:{exc}"
+        return None, meta
+
+    meta.update(
+        {
+            "template_prefill_enabled": True,
+            "template_prefill_fallback_reason": None,
+            "template_schema": template_schema,
+            "template_slot_stats": slot_stats,
+            "template_static_token_count": int(static_token_count),
+            "template_static_decode_steps": int(static_steps),
+            "template_unknown_decode_steps": int(dynamic_steps),
+            "template_decode_tokens": int(dynamic_steps),
+            "template_final_text": final_text,
+            "template_generated_text": "".join(str(s.get("raw_text", "")) for s in slot_stats),
+            "structured_fast_decode_static_forward_steps": int(static_steps),
+            "structured_fast_decode_dynamic_forward_steps": int(dynamic_steps),
+            "structured_fast_decode_static_s": float(static_s),
+            "structured_fast_decode_dynamic_s": float(dynamic_s),
+            "structured_fast_decode_prefill_s": float(prefill_s),
+            "structured_fast_decode_action": action_head,
+            "structured_fast_decode_action_normalized": action_head.lower(),
+            "structured_fast_decode_bbox": coord_pair,
+            "structured_fast_decode_direction": direction,
+        }
+    )
+    if debug:
+        print(
+            "[StructuredFastDecode] "
+            f"sample_index={sample_index} "
+            f"enabled=1 schema={template_schema} "
+            f"template_plan={template_plan!r} "
+            f"static_parts={static_parts!r} "
+            f"static_forward_steps={static_steps} "
+            f"static_tokens={static_token_count} "
+            f"dynamic_forward_steps={dynamic_steps} "
+            f"action={action_head!r} "
+            f"coord_pair={coord_pair!r} "
+            f"direction={direction!r} "
+            f"final={final_text!r}",
+            flush=True,
+        )
+    return final_text, meta
+
+
+def maybe_generate_with_structured_fast_decode(
+    *,
+    dataset: str | None,
+    model,
+    processor,
+    inputs,
+    generate_kwargs: dict[str, Any],
+    sample_meta: dict | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    if not _env_flag("QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE", "0"):
+        return None, _empty_meta("disabled")
+    if generate_kwargs.get("use_cache", True) is False:
+        return None, _empty_meta("requires_use_cache")
+
+    family = _dataset_family(dataset)
+    if family == "androidcontrol":
+        return _android_structured_fast_decode(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            inputs=inputs,
+            generate_kwargs=generate_kwargs,
+            sample_meta=sample_meta,
+        )
+    if family == "guiodyssey":
+        return _gui_structured_fast_decode(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            inputs=inputs,
+            generate_kwargs=generate_kwargs,
+            sample_meta=sample_meta,
+        )
+    return None, _empty_meta(f"unsupported_dataset:{dataset}")

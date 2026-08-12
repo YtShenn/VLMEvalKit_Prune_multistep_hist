@@ -626,6 +626,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                 local_template_static_decode_steps_sum = 0.0
                 local_template_unknown_decode_steps_sum = 0.0
                 local_template_total_decode_tokens_sum = 0.0
+                local_template_fallback_reason_counts = {}
                 for rec in recs:
                     if not isinstance(rec, dict):
                         continue
@@ -634,6 +635,10 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                     local_prompt_seq_tokens_sum += float(rec.get('prompt_seq_tokens', 0.0) or 0.0)
                     enabled = float(bool(rec.get('template_prefill_enabled', False)))
                     local_template_enabled_count += enabled
+                    if not bool(enabled):
+                        reason = rec.get('template_prefill_fallback_reason', None)
+                        reason_key = str(reason if reason not in (None, '') else 'unknown')
+                        local_template_fallback_reason_counts[reason_key] = local_template_fallback_reason_counts.get(reason_key, 0) + 1
                     local_template_static_token_count_sum += float(rec.get('template_static_token_count', 0.0) or 0.0)
                     local_template_static_decode_steps_sum += float(rec.get('template_static_decode_steps', 0.0) or 0.0)
                     local_template_unknown_decode_steps_sum += float(rec.get('template_unknown_decode_steps', 0.0) or 0.0)
@@ -657,6 +662,18 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                     dist.all_reduce(extra, op=dist.ReduceOp.SUM)
                 extra_vals = extra.tolist()
                 total_template_enabled = extra_vals[3]
+                template_fallback_reason_counts = dict(local_template_fallback_reason_counts)
+                if world_size > 1 and dist.is_available() and dist.is_initialized():
+                    gathered_reason_counts = [None for _ in range(world_size)]
+                    dist.all_gather_object(gathered_reason_counts, local_template_fallback_reason_counts)
+                    template_fallback_reason_counts = {}
+                    for reason_counts in gathered_reason_counts:
+                        if not isinstance(reason_counts, dict):
+                            continue
+                        for reason, count in reason_counts.items():
+                            reason = str(reason)
+                            template_fallback_reason_counts[reason] = template_fallback_reason_counts.get(reason, 0) + int(count)
+                template_failed_count = max(0, int(total_count) - int(total_template_enabled))
                 summary.update(
                     {
                         'avg_decode_tokens': float(extra_vals[0] / total_count),
@@ -666,6 +683,13 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                         'avg_prompt_seq_tokens': float(extra_vals[2] / total_count),
                         'total_prompt_seq_tokens': float(extra_vals[2]),
                         'template_prefill_enabled_count': int(total_template_enabled),
+                        'template_prefill_failed_count': int(template_failed_count),
+                        'template_prefill_success_rate': float(total_template_enabled / total_count),
+                        'template_prefill_fallback_reason_counts': template_fallback_reason_counts,
+                        'structured_fast_decode_success_count': int(total_template_enabled),
+                        'structured_fast_decode_failed_count': int(template_failed_count),
+                        'structured_fast_decode_success_rate': float(total_template_enabled / total_count),
+                        'structured_fast_decode_fallback_reason_counts': template_fallback_reason_counts,
                         'avg_template_static_token_count': float(extra_vals[4] / total_count),
                         'total_template_static_token_count': float(extra_vals[4]),
                         'avg_template_static_decode_steps': float(extra_vals[5] / total_count),
@@ -720,25 +744,37 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                     dist.all_reduce(flops_tensor, op=dist.ReduceOp.SUM)
                 fv = flops_tensor.tolist()
                 if fv[4] > 0:
+                    avg_vision_flops = float(fv[0] / fv[4])
+                    avg_llm_flops = float(fv[1] / fv[4])
+                    avg_lm_head_flops = float(fv[2] / fv[4])
+                    avg_e2e_flops = float(fv[3] / fv[4])
                     summary.update(
                         {
                             'flops_profiled_samples': int(fv[4]),
-                            'avg_vision_flops': float(fv[0] / fv[4]),
-                            'avg_llm_flops': float(fv[1] / fv[4]),
-                            'avg_lm_head_flops': float(fv[2] / fv[4]),
-                            'avg_e2e_flops': float(fv[3] / fv[4]),
+                            'avg_vision_flops': avg_vision_flops,
+                            'avg_llm_flops': avg_llm_flops,
+                            'avg_lm_head_flops': avg_lm_head_flops,
+                            'avg_e2e_flops': avg_e2e_flops,
                             'total_vision_flops': float(fv[0]),
                             'total_llm_flops': float(fv[1]),
                             'total_lm_head_flops': float(fv[2]),
                             'total_e2e_flops': float(fv[3]),
+                            'avg_vision_flops_sci': f'{avg_vision_flops:.6e}',
+                            'avg_llm_flops_sci': f'{avg_llm_flops:.6e}',
+                            'avg_lm_head_flops_sci': f'{avg_lm_head_flops:.6e}',
+                            'avg_e2e_flops_sci': f'{avg_e2e_flops:.6e}',
+                            'total_vision_flops_sci': f'{float(fv[0]):.6e}',
+                            'total_llm_flops_sci': f'{float(fv[1]):.6e}',
+                            'total_lm_head_flops_sci': f'{float(fv[2]):.6e}',
+                            'total_e2e_flops_sci': f'{float(fv[3]):.6e}',
                         }
                     )
                     print(
                         '[FlopsSummary] '
                         f"samples={int(fv[4])} "
-                        f"avg_e2e_flops={fv[3] / fv[4]:.0f} "
-                        f"avg_vision_flops={fv[0] / fv[4]:.0f} "
-                        f"avg_llm_flops={fv[1] / fv[4]:.0f}",
+                        f"avg_e2e_flops={avg_e2e_flops:.6e} "
+                        f"avg_vision_flops={avg_vision_flops:.6e} "
+                        f"avg_llm_flops={avg_llm_flops:.6e}",
                         flush=True,
                     )
     if os.getenv('VLM_PRUNE_TIMING', '0') == '1' and hasattr(model, '_vlmeval_prune_records'):

@@ -112,3 +112,108 @@ constrained decoding 时，我们把路栏起来，只让它在“合法动作/�
 - `constrained decode` 下 `navigate_back`
 
 分别每一步 token 是怎么选的。
+
+
+
+
+# 8月12日新的正确的代码
+
+你的怀疑是对的：**如果只是把“模型本来一定会生成的固定 token”并行喂进去，理论上不应该显著提高任务能力。**
+
+但我们现在这个实现并不完全等价于 baseline，它其实引入了一个很强的 **constrained decoding / output prior**，所以准确率变好是可能的。
+
+主要原因有几个：
+
+1. **输出顺序变了：action-first**
+
+原始 prompt 写的是：
+
+```text
+{"bbox_2d": [...], "action_type": ACTION_TYPE}
+```
+
+但我新实现走的是：
+
+```text
+{"action_type": "...", "bbox_2d": [...]}
+```
+
+这不是纯加速了。它改变了自回归决策顺序。
+
+baseline 是先生成 bbox，再生成 action。  
+structured 是先生成 action，再根据 action 决定要不要 bbox。
+
+对 AndroidControl 来说，这很可能更合理，因为：
+- `wait` / `navigate_back` / `swipe` 本来不需要 bbox
+- 先确定动作类型，再决定是否预测坐标，更符合任务结构
+- 先 bbox 再 action 时，前面坐标生成错了会污染后面的 action token
+
+所以 Type 和 SR 提升，很可能有一部分来自 **action-first 结构化约束**，不是来自并行 decode 本身。
+
+2. **固定 JSON 被 teacher-forcing 了**
+
+baseline 需要模型自己生成：
+
+```text
+<answer>
+{
+"bbox_2d"
+:
+...
+}
+</answer>
+```
+
+这些格式 token 如果有任何偏移，比如 key 名错、引号错、标签错、额外解释、提前结束，都会影响 parser 或后续生成。
+
+structured decode 等于强制告诉模型：
+
+```text
+现在你就在这个 JSON 结构里，只需要填 action 和 bbox
+```
+
+这会减少格式错误和解码漂移。它不是提升视觉理解，而是减少输出协议错误。
+
+3. **减少固定模板 token 的贪心误差传播**
+
+即使固定 token 很简单，baseline 也是一步步生成。某一步如果生成了不同空格、不同 key 顺序、额外 token，后续上下文就变了。
+
+structured path 直接把模板作为已知上下文喂进去，后续 slot 的预测上下文更干净：
+
+```text
+<answer>{"action_type": "click", "bbox_2d": [
+```
+
+这对 bbox 数字生成会更稳定。
+
+4. **官方 eval 对格式很敏感**
+
+AndroidControl 的指标不是只看语义，还要 parse 出：
+
+```text
+action_type
+bbox_2d
+```
+
+structured 输出天然更容易被 parse 对。SR 提升十几个点，可能有一部分来自“模型本来意思对，但 baseline 格式/顺序/解析失败或类型错”的样本被救回来了。
+
+所以结论是：
+
+**现在这个 structured decode 不是纯粹的无损加速实验，它同时是一个结构化约束解码实验。**
+
+如果要验证“纯加速是否无损”，需要做 ablation：
+
+1. 做一个 **bbox-first structured decode**，严格匹配原 prompt 的 key 顺序：
+   ```text
+   {"bbox_2d": [...], "action_type": "..."}
+   ```
+
+2. 或者把 baseline prompt 也改成 action-first，然后不用 structured decode 跑一次。
+
+3. 对比 per-sample detail，看提升来自：
+   - Type 纠正
+   - bbox 纠正
+   - parser 成功率提升
+   - 非 click 动作不再强行带 bbox
+
+我现在倾向的判断是：SR 提升主要不是“序列并行”带来的，而是 **action-first + JSON 模板约束** 带来的。加速本身减少 wall time；结构化约束改变了解码分布，因此可能提高或降低 accuracy。

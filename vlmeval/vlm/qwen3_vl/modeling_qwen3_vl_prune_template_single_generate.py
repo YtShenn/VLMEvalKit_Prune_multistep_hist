@@ -15,6 +15,26 @@ def _env_impl() -> str:
     return os.getenv("QWEN3VL_TEMPLATE_PREFILL_IMPL", "single_generate").strip().lower()
 
 
+def _continue_on_failure_enabled() -> bool:
+    return os.getenv("QWEN3VL_TEMPLATE_PREFILL_CONTINUE_ON_FAILURE", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class _OrderedAndroidBBoxSlotParser(legacy.AndroidBBoxSlotParser):
+    def parse(self, raw_text: str) -> legacy.SlotParseResult:
+        parsed = super().parse(raw_text)
+        if not parsed.done:
+            return parsed
+        try:
+            values = [float(x) for x in str(parsed.canonical).split(",")]
+        except Exception:
+            return parsed
+        if len(values) != 4:
+            return parsed
+        if values[2] < values[0] or values[3] < values[1]:
+            return legacy.SlotParseResult(done=False)
+        return parsed
+
+
 @dataclass
 class _StaticSegment:
     text: str
@@ -134,7 +154,7 @@ class _TemplateConstraintState:
             if slot.name == "action_type":
                 if slot.canonical in ("click", "long_press"):
                     self._append_static_segment('", "bbox_2d": [')
-                    self._append_slot_segment("bbox_2d", legacy.AndroidBBoxSlotParser(), 32)
+                    self._append_slot_segment("bbox_2d", _OrderedAndroidBBoxSlotParser(), 32)
                     self._append_static_segment("]}</answer>")
                 else:
                     self._append_static_segment('}</answer>' if False else '"}</answer>')
@@ -300,6 +320,8 @@ class _TemplateLogitsProcessor(LogitsProcessor):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         self.state.process(input_ids)
         if self.state.failed:
+            if _continue_on_failure_enabled():
+                return scores
             masked = torch.full_like(scores, float("-inf"))
             eos_id = next(iter(self.eos_token_ids), None)
             if eos_id is not None and 0 <= eos_id < masked.shape[-1]:
@@ -321,6 +343,8 @@ class _TemplateStoppingCriteria(StoppingCriteria):
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         self.state.process(input_ids)
+        if self.state.failed and _continue_on_failure_enabled():
+            return False
         return bool(self.state.finished)
 
 
@@ -384,6 +408,30 @@ def _run_single_generate(
     outputs = model.generate(**local_inputs, **run_kwargs)
     state.process(local_inputs.input_ids.new_tensor(outputs))
     if state.failed:
+        if _continue_on_failure_enabled():
+            try:
+                prompt_len = int(legacy._decode_prompt_token_len(local_inputs))
+                generated_ids = outputs[0, prompt_len:] if isinstance(outputs, torch.Tensor) else list(outputs)[0][prompt_len:]
+                continuation = processor.tokenizer.decode(
+                    generated_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+                final_text = f"{state.initial_text}{continuation}"
+            except Exception:
+                final_text = f"{state.initial_text}{state.generated_text}"
+            return final_text, {
+                "template_prefill_enabled": False,
+                "template_prefill_fallback_reason": state.failed_reason or "single_generate_released_to_normal_decode",
+                "template_slot_stats": list(state.slot_stats),
+                "template_static_parts": list(state.static_parts),
+                "template_prefill_impl": "single_generate_constrained_continue_on_failure",
+                "template_generated_text": state.generated_text,
+                "template_final_text": final_text,
+                "template_decode_tokens": int(max(0, len(generated_ids) if "generated_ids" in locals() else state.processed_generated_tokens)),
+                "template_static_decode_steps": int(state.static_decode_steps),
+                "template_unknown_decode_steps": int(sum(int(item["decode_tokens"]) for item in state.slot_stats)),
+            }
         return None, {
             "template_prefill_enabled": False,
             "template_prefill_fallback_reason": state.failed_reason or "single_generate_failed",
@@ -605,6 +653,69 @@ def _maybe_generate_single(
     return None, {"template_prefill_enabled": False, "template_prefill_fallback_reason": f"unsupported_dataset:{dataset}"}
 
 
+def _maybe_generate_single_legacy_android(
+    *,
+    dataset,
+    model,
+    processor,
+    base_text: str,
+    images,
+    videos,
+    video_metadatas,
+    video_kwargs,
+    generate_kwargs: dict,
+    configure_context_fn: Optional[Callable] = None,
+):
+    if not legacy._env_flag("QWEN3VL_ENABLE_TEMPLATE_PREFILL", "0"):
+        return None, {"template_prefill_enabled": False, "template_prefill_fallback_reason": "disabled"}
+    if not legacy._dataset_enabled(dataset):
+        return None, {"template_prefill_enabled": False, "template_prefill_fallback_reason": "dataset_not_enabled"}
+    family = legacy._dataset_family(dataset)
+    if legacy._env_flag("QWEN3VL_TEMPLATE_PREFILL_LEGACY_USE_CACHE", "1"):
+        legacy._debug_print(dataset, f"enabled family={family} impl=single_generate_legacy_cache_chunk")
+        return stateful.maybe_generate_with_template_prefill(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            base_text=base_text,
+            images=images,
+            videos=videos,
+            video_metadatas=video_metadatas,
+            video_kwargs=video_kwargs,
+            generate_kwargs=generate_kwargs,
+            configure_context_fn=configure_context_fn,
+        )
+
+    legacy._debug_print(dataset, f"enabled family={family} impl=single_generate_legacy_constrained")
+    if family == "androidcontrol":
+        return _android_single_generate(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            base_text=base_text,
+            images=images,
+            videos=videos,
+            video_metadatas=video_metadatas,
+            video_kwargs=video_kwargs,
+            generate_kwargs=generate_kwargs,
+            configure_context_fn=configure_context_fn,
+        )
+    if family == "guiodyssey":
+        return _gui_single_generate(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            base_text=base_text,
+            images=images,
+            videos=videos,
+            video_metadatas=video_metadatas,
+            video_kwargs=video_kwargs,
+            generate_kwargs=generate_kwargs,
+            configure_context_fn=configure_context_fn,
+        )
+    return None, {"template_prefill_enabled": False, "template_prefill_fallback_reason": f"unsupported_dataset:{dataset}"}
+
+
 def maybe_generate_with_template_prefill(
     *,
     dataset,
@@ -645,6 +756,63 @@ def maybe_generate_with_template_prefill(
             generate_kwargs=generate_kwargs,
             configure_context_fn=configure_context_fn,
         )
+    if impl in {"single_generate_legacy", "single_generate_old", "single_generate_constrained_old"}:
+        try:
+            response, meta = _maybe_generate_single_legacy_android(
+                dataset=dataset,
+                model=model,
+                processor=processor,
+                base_text=base_text,
+                images=images,
+                videos=videos,
+                video_metadatas=video_metadatas,
+                video_kwargs=video_kwargs,
+                generate_kwargs=generate_kwargs,
+                configure_context_fn=configure_context_fn,
+            )
+            if isinstance(meta, dict):
+                meta = dict(meta)
+                meta.setdefault("template_prefill_requested_impl", impl)
+                meta.setdefault("template_prefill_backend_impl", meta.get("template_prefill_impl"))
+                if response is not None:
+                    meta.setdefault("template_prefill_impl", "single_generate_legacy_constrained")
+                meta["template_prefill_backend_impl"] = meta.get("template_prefill_impl")
+            if response is None:
+                legacy._debug_print(dataset, f"single_generate_legacy fallback reason={meta.get('template_prefill_fallback_reason')}")
+            else:
+                legacy._debug_print(
+                    dataset,
+                    "success "
+                    f"schema={meta.get('template_schema')} "
+                    f"impl={meta.get('template_prefill_impl')} "
+                    f"static_tokens={meta.get('template_static_token_count', 0)} "
+                    f"decode_tokens={meta.get('template_decode_tokens', 0)} "
+                    f"final={response!r}",
+                )
+            return response, meta
+        except Exception as exc:
+            legacy._debug_print(dataset, f"single_generate_legacy_exception={type(exc).__name__}:{exc}")
+            if os.getenv("QWEN3VL_TEMPLATE_PREFILL_SINGLE_GENERATE_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}:
+                response, meta = legacy.maybe_generate_with_template_prefill(
+                    dataset=dataset,
+                    model=model,
+                    processor=processor,
+                    base_text=base_text,
+                    images=images,
+                    videos=videos,
+                    video_metadatas=video_metadatas,
+                    video_kwargs=video_kwargs,
+                    generate_kwargs=generate_kwargs,
+                    configure_context_fn=configure_context_fn,
+                )
+                if isinstance(meta, dict):
+                    meta = dict(meta)
+                    meta.setdefault("template_prefill_requested_impl", impl)
+                    meta.setdefault("template_prefill_impl", "legacy_after_single_generate_legacy_exception")
+                    meta.setdefault("template_prefill_backend_impl", meta.get("template_prefill_impl"))
+                    meta.setdefault("template_prefill_single_generate_legacy_exception", f"{type(exc).__name__}:{exc}")
+                return response, meta
+            raise
     try:
         response, meta = _maybe_generate_single(
             dataset=dataset,

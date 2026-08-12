@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
 export CUDA_VISIBLE_DEVICES=6
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
@@ -25,13 +29,14 @@ export SEED="${SEED:-42}"
 export QWEN3VL_PROFILE_FLOPS="${QWEN3VL_PROFILE_FLOPS:-1}"
 export QWEN3VL_RUNTIME_TRACKING="${QWEN3VL_RUNTIME_TRACKING:-1}"
 
-export QWEN3VL_ENABLE_TEMPLATE_PREFILL="${QWEN3VL_ENABLE_TEMPLATE_PREFILL:-0}"
-export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="1"
-export QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG="${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG:-1}"
-export QWEN3VL_TEMPLATE_PREFILL_IMPL="${QWEN3VL_TEMPLATE_PREFILL_IMPL:-stateful}" #single_generate
-export QWEN3VL_TEMPLATE_PREFILL_DATASETS="${QWEN3VL_TEMPLATE_PREFILL_DATASETS:-androidcontrol}"
-export QWEN3VL_TEMPLATE_PREFILL_DEBUG="${QWEN3VL_TEMPLATE_PREFILL_DEBUG:-1}"
-export QWEN3VL_TEMPLATE_PREFILL_ANDROID_MODE="${QWEN3VL_TEMPLATE_PREFILL_ANDROID_MODE:-action_first_json}" #bbox_first_json
+# This entry is intentionally pinned to the corrected legacy-compatible cache
+# path. It should not inherit stale shell overrides from previous ablations.
+export QWEN3VL_ENABLE_TEMPLATE_PREFILL="1"
+export QWEN3VL_TEMPLATE_PREFILL_IMPL="single_generate_legacy"
+export QWEN3VL_TEMPLATE_PREFILL_LEGACY_USE_CACHE="1"
+export QWEN3VL_TEMPLATE_PREFILL_DATASETS="androidcontrol"
+export QWEN3VL_TEMPLATE_PREFILL_DEBUG="1"
+export QWEN3VL_TEMPLATE_PREFILL_ANDROID_MODE="action_first_json"
 
 export QWEN3VL_ENABLE_ROI_PRUNE=0
 export QWEN3VL_ROI_PRUNE_USE_CACHE="${QWEN3VL_ROI_PRUNE_USE_CACHE:-1}"
@@ -45,28 +50,25 @@ export ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS="${ANDROID_CONTROL_USE_HISTORY_SC
 export ANDROID_CONTROL_MAX_HISTORY_IMAGES="${ANDROID_CONTROL_MAX_HISTORY_IMAGES:-4}"
 export ANDROID_CONTROL_HISTORY_KEEP_SYSTEM_PROMPT="${ANDROID_CONTROL_HISTORY_KEEP_SYSTEM_PROMPT:-1}"
 
-export ANDROID_CONTROL_STATE_PACKET_ENABLE="1" #${ANDROID_CONTROL_STATE_PACKET_ENABLE:-1}"
+export ANDROID_CONTROL_STATE_PACKET_ENABLE="${ANDROID_CONTROL_STATE_PACKET_ENABLE:-1}"
 export ANDROID_CONTROL_STATE_PACKET_DEBUG="${ANDROID_CONTROL_STATE_PACKET_DEBUG:-1}"
 export ANDROID_CONTROL_STATE_PACKET_CACHE_DIR="${ANDROID_CONTROL_STATE_PACKET_CACHE_DIR:-/tmp/android_control_state_packet_cache}"
 export ANDROID_CONTROL_STATE_PACKET_PATCH_SIZE="${ANDROID_CONTROL_STATE_PACKET_PATCH_SIZE:-16}"
 export ANDROID_CONTROL_STATE_PACKET_MERGE_SIZE="${ANDROID_CONTROL_STATE_PACKET_MERGE_SIZE:-2}"
-# AndroidControl keeps the current screenshot as a full image, so we bias the
-# history packet a bit more aggressively toward speed than GUI Odyssey does.
-export ANDROID_CONTROL_STATE_PACKET_THUMB_LONG_EDGE="${ANDROID_CONTROL_STATE_PACKET_THUMB_LONG_EDGE:-192}"  #256
-export ANDROID_CONTROL_STATE_PACKET_ROI_LONG_EDGE="${ANDROID_CONTROL_STATE_PACKET_ROI_LONG_EDGE:-224}"  #256
-export ANDROID_CONTROL_STATE_PACKET_ROI_SHORT_SIDE_RATIO="${ANDROID_CONTROL_STATE_PACKET_ROI_SHORT_SIDE_RATIO:-0.22}"   #0.28
-export ANDROID_CONTROL_STATE_PACKET_ROI_MIN_SIDE_PX="${ANDROID_CONTROL_STATE_PACKET_ROI_MIN_SIDE_PX:-160}"  #224
+export ANDROID_CONTROL_STATE_PACKET_THUMB_LONG_EDGE="${ANDROID_CONTROL_STATE_PACKET_THUMB_LONG_EDGE:-192}"
+export ANDROID_CONTROL_STATE_PACKET_ROI_LONG_EDGE="${ANDROID_CONTROL_STATE_PACKET_ROI_LONG_EDGE:-224}"
+export ANDROID_CONTROL_STATE_PACKET_ROI_SHORT_SIDE_RATIO="${ANDROID_CONTROL_STATE_PACKET_ROI_SHORT_SIDE_RATIO:-0.22}"
+export ANDROID_CONTROL_STATE_PACKET_ROI_MIN_SIDE_PX="${ANDROID_CONTROL_STATE_PACKET_ROI_MIN_SIDE_PX:-160}"
 
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct}"
 DATASET_LIST=(
-    # "AndroidControl_Curated_High_Point"
     "AndroidControl_Curated_High_Task_Improved"
 )
 PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
 TS="$(date +%Y%m%d_%H%M%S)"
-TAG="${TAG:-hist4_keep_system_prompt_state_packet_structured_fast_official_xiabanhou_test}"
-WORK_DIR="${WORK_DIR:-OUTPUT/ablation_android_control_${TAG}_node5_0812(only_HTI)_ratio2}"
+TAG="${TAG:-hist4_keep_system_prompt_state_packet_legacy_cache_template_prefill_official}"
+WORK_DIR="${WORK_DIR:-OUTPUT/ablation_android_control_${TAG}_node3_0812(only_HTI)}"
 LOG_FILE="run_output_${TS}_android_control_${TAG}.log"
 
 run_one() {
@@ -81,6 +83,7 @@ run_one() {
     echo "[Run] model=${MODEL}"
     echo "[Run] dataset=${dataset_name}"
     echo "[Run] work_dir=${WORK_DIR}"
+    echo "[Run] repo_root=${REPO_ROOT}"
     echo "[Run] eval_mode=${ANDROID_CONTROL_CURATED_EVAL_MODE}"
     echo "[Run] use_history=${ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS}"
     echo "[Run] max_history=${ANDROID_CONTROL_MAX_HISTORY_IMAGES}"
@@ -92,10 +95,11 @@ run_one() {
     echo "[Run] roi_short_side_ratio=${ANDROID_CONTROL_STATE_PACKET_ROI_SHORT_SIDE_RATIO}"
     echo "[Run] roi_min_side_px=${ANDROID_CONTROL_STATE_PACKET_ROI_MIN_SIDE_PX}"
     echo "[Run] flops_profile=${QWEN3VL_PROFILE_FLOPS}"
+    echo "[Run] runtime_tracking=${QWEN3VL_RUNTIME_TRACKING}"
     echo "[Run] template_prefill=${QWEN3VL_ENABLE_TEMPLATE_PREFILL}"
-    echo "[Run] structured_fast_decode=${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE}"
-    echo "[Run] structured_fast_decode_debug=${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG}"
     echo "[Run] template_prefill_impl=${QWEN3VL_TEMPLATE_PREFILL_IMPL}"
+    echo "[Run] template_prefill_expected_backend=stateful_slot_cache"
+    echo "[Run] template_prefill_legacy_use_cache=${QWEN3VL_TEMPLATE_PREFILL_LEGACY_USE_CACHE}"
     echo "[Run] template_prefill_datasets=${QWEN3VL_TEMPLATE_PREFILL_DATASETS}"
     echo "[Run] template_prefill_android_mode=${QWEN3VL_TEMPLATE_PREFILL_ANDROID_MODE}"
     echo "[Run] sample_mode=${VLM_EVAL_SAMPLE_MODE}"
@@ -116,7 +120,7 @@ run_one() {
     "${reuse_args[@]}" 2>&1 | tee -a "${LOG_FILE}"
 }
 
-port_base=29664
+port_base=29684
 idx=0
 for dataset_name in "${DATASET_LIST[@]}"; do
   run_one "${dataset_name}" "$((port_base + idx))"

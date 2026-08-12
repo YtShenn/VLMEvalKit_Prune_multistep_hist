@@ -69,50 +69,59 @@ def default_label(path: str) -> str:
     return parent or Path(path).name
 
 
+def build_speedup_pairs(labels: list[str]) -> list[tuple[int, int, str]]:
+    pairs = []
+    for current_idx in range(1, len(labels)):
+        for baseline_idx in range(current_idx):
+            pair_label = f"speedup({labels[current_idx]}/{labels[baseline_idx]})"
+            pairs.append((baseline_idx, current_idx, pair_label))
+    return pairs
+
+
 def build_markdown_table(
-    left_label: str,
-    right_label: str,
-    left_data: dict[str, Any],
-    right_data: dict[str, Any],
+    labels: list[str],
+    summaries: list[dict[str, Any]],
     fields: list[str],
 ) -> str:
-    ratio_label = f"{left_label}/{right_label}"
+    speedup_pairs = build_speedup_pairs(labels)
+    header_cells = ["field", *labels, *[pair_label for _, _, pair_label in speedup_pairs]]
+    align_cells = ["---", *(["---:"] * (len(header_cells) - 1))]
     lines = [
-        f"| field | {left_label} | {right_label} | speedup({ratio_label}) |",
-        "|---|---:|---:|---:|",
+        "| " + " | ".join(header_cells) + " |",
+        "| " + " | ".join(align_cells) + " |",
     ]
     for field in fields:
-        left_value = left_data.get(field)
-        right_value = right_data.get(field)
-        lines.append(
-            "| {field} | {left} | {right} | {speedup} |".format(
-                field=field,
-                left=format_value(left_value),
-                right=format_value(right_value),
-                speedup=compute_speedup(left_value, right_value),
+        raw_values = [summary.get(field) for summary in summaries]
+        row_cells = [field, *[format_value(value) for value in raw_values]]
+        for baseline_idx, current_idx, _ in speedup_pairs:
+            row_cells.append(
+                compute_speedup(
+                    baseline=raw_values[baseline_idx],
+                    current=raw_values[current_idx],
+                )
             )
-        )
+        lines.append("| " + " | ".join(row_cells) + " |")
     return "\n".join(lines)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare selected fields from two summary.json files and output a "
-            "Markdown table. The speedup column is computed as file1/file2."
+            "Compare selected fields from multiple summary.json files and output "
+            "a Markdown table. Speedup columns are generated for each later file "
+            "vs each earlier file, using earlier/later as the numeric formula."
         )
     )
-    parser.add_argument("summary_a", help="Baseline summary.json path")
-    parser.add_argument("summary_b", help="Compared summary.json path")
     parser.add_argument(
-        "--label-a",
-        default=None,
-        help="Optional display label for summary_a",
+        "summary_paths",
+        nargs="+",
+        help="One or more summary.json paths to compare",
     )
     parser.add_argument(
-        "--label-b",
+        "--labels",
+        nargs="+",
         default=None,
-        help="Optional display label for summary_b",
+        help="Optional display labels matching the order of summary_paths",
     )
     parser.add_argument(
         "--fields",
@@ -133,16 +142,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    summary_a = load_json(args.summary_a)
-    summary_b = load_json(args.summary_b)
-    label_a = args.label_a or default_label(args.summary_a)
-    label_b = args.label_b or default_label(args.summary_b)
+    if len(args.summary_paths) < 2:
+        raise ValueError("Please provide at least two summary.json paths.")
+
+    summaries = [load_json(path) for path in args.summary_paths]
+
+    if args.labels is not None:
+        if len(args.labels) != len(args.summary_paths):
+            raise ValueError("--labels count must match the number of summary paths.")
+        labels = args.labels
+    else:
+        labels = [default_label(path) for path in args.summary_paths]
 
     table = build_markdown_table(
-        left_label=label_a,
-        right_label=label_b,
-        left_data=summary_a,
-        right_data=summary_b,
+        labels=labels,
+        summaries=summaries,
         fields=args.fields,
     )
 
@@ -156,13 +170,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 '''
-用法：
 python utils/compare_summary_json.py \
-'OUTPUT/ablation_android_control_hist4_keep_system_prompt_baseline_official_eval_node5_0810\\(only_HTI\\)/AndroidControl_Curated_High_Task_Improved/Qwen3-VL-4B-Instruct/T20260810_G4e70879f/summary.json' \
-'OUTPUT/ablation_android_control_hist4_keep_system_prompt_state_packet_official_eval_node5_0810\\(only_HTI\\)/AndroidControl_Curated_High_Task_Improved/Qwen3-VL-4B-Instruct/T20260810_G4e70879f/summary.json' \
---label-a baseline \
---label-b state-packet \
---output compare_table_android_ratio1.md
+  "OUTPUT/ablation_android_control_hist4_keep_system_prompt_baseline_official_xiabanqian_node5_0812(only_HTI)_ratio2/AndroidControl_Curated_High_Task_Improved/Qwen3-VL-4B-Instruct/T20260812_G1e13089b/summary.json" \
+  "OUTPUT/ablation_android_control_hist4_keep_system_prompt_state_packet_official_xiabanqian_node5_0812(only_HTI)_ratio2/AndroidControl_Curated_High_Task_Improved/Qwen3-VL-4B-Instruct/T20260812_G1e13089b/summary.json" \
+  "OUTPUT/ablation_android_control_hist4_keep_system_prompt_state_packet_structured_fast_official_xiabanqian_node5_0812(only_HTI)_ratio2/AndroidControl_Curated_High_Task_Improved/Qwen3-VL-4B-Instruct/T20260812_G1e13089b/summary.json" \
+  --labels baseline state_packet state_packet_structured_decode \
+  --output compare_table_structure_decode.md
 '''

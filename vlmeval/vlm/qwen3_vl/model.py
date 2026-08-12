@@ -14,7 +14,7 @@ from PIL import Image
 import ast
 from ..base import BaseModel
 from .prompt import Qwen3VLPromptMixin
-from .modeling_qwen3_vl_prune_template_single_generate import maybe_generate_with_template_prefill
+from .structured_fast_decode import maybe_generate_with_structured_fast_decode
 from ...smp import get_gpu_memory, listinstr
 from ..qwen3_vl_flops import enable_qwen3vl_flops_profiling
 
@@ -847,6 +847,9 @@ def _record_generate_timing(owner, model, sample_meta: dict | None, stage_record
     log_tag = '[ROIPruneSample]' if prune_applied or _env_flag('QWEN3VL_ENABLE_ROI_PRUNE', '0') else '[GenerateSample]'
     template_enabled = bool(merged.get('template_prefill_enabled', False))
     template_schema = merged.get('template_schema', None)
+    template_impl = merged.get('template_prefill_impl', None)
+    template_backend_impl = merged.get('template_prefill_backend_impl', None)
+    template_requested_impl = merged.get('template_prefill_requested_impl', None)
     template_static_tokens = int(merged.get('template_static_token_count', 0) or 0)
     template_decode_tokens = int(merged.get('template_decode_tokens', 0) or 0)
     template_static_decode_steps = int(merged.get('template_static_decode_steps', 0) or 0)
@@ -877,14 +880,17 @@ def _record_generate_timing(owner, model, sample_meta: dict | None, stage_record
         f"visual_tokens_after={visual_after} "
         f"template_prefill_enabled={int(template_enabled)} "
         f"template_schema={template_schema} "
+        f"template_prefill_impl={template_impl} "
+        f"template_prefill_backend_impl={template_backend_impl} "
+        f"template_prefill_requested_impl={template_requested_impl} "
         f"template_static_tokens={template_static_tokens} "
         f"template_decode_tokens={template_decode_tokens} "
         f"template_static_decode_steps={template_static_decode_steps} "
         f"template_unknown_decode_steps={template_unknown_decode_steps} "
         f"template_fallback_reason={template_fallback_reason} "
-        f"vision_flops={float(merged.get('vision_flops', 0.0) or 0.0):.0f} "
-        f"llm_flops={float(merged.get('llm_flops', 0.0) or 0.0):.0f} "
-        f"e2e_flops={float(merged.get('e2e_flops', 0.0) or 0.0):.0f} "
+        f"vision_flops={float(merged.get('vision_flops', 0.0) or 0.0):.6e} "
+        f"llm_flops={float(merged.get('llm_flops', 0.0) or 0.0):.6e} "
+        f"e2e_flops={float(merged.get('e2e_flops', 0.0) or 0.0):.6e} "
         f"total_generate_s={float(merged.get('total_s', 0.0) or 0.0):.6f}",
         flush=True,
     )
@@ -934,6 +940,9 @@ def _populate_generate_timing_fallback(
             'template_unknown_decode_steps': int(template_meta.get('template_unknown_decode_steps', 0) or 0),
             'template_decode_tokens': int(template_meta.get('template_decode_tokens', 0) or 0),
             'template_schema': template_meta.get('template_schema'),
+            'template_prefill_impl': template_meta.get('template_prefill_impl'),
+            'template_prefill_backend_impl': template_meta.get('template_prefill_backend_impl'),
+            'template_prefill_requested_impl': template_meta.get('template_prefill_requested_impl'),
         }
     )
     setattr(cfg, '_vlmeval_generate_timing_last', runtime)
@@ -963,14 +972,21 @@ def _print_template_parts_sample(sample_meta: dict | None, template_meta: dict, 
     template_static_token_count = int(template_meta.get('template_static_token_count', 0) or 0)
     template_enabled = bool(template_meta.get('template_prefill_enabled', False))
     template_schema = template_meta.get('template_schema', None)
+    template_impl = template_meta.get('template_prefill_impl', None)
+    template_backend_impl = template_meta.get('template_prefill_backend_impl', None)
+    template_requested_impl = template_meta.get('template_prefill_requested_impl', None)
     fallback_reason = template_meta.get('template_prefill_fallback_reason', None)
     static_parts = template_meta.get('template_static_parts', None) or []
+    template_plan = template_meta.get('template_plan', None)
     print(
         '[TemplatePartsSample] '
         f'sample_index={sample_index} '
         f'dataset={dataset_name} '
         f'template_enabled={int(template_enabled)} '
         f'template_schema={template_schema} '
+        f'template_impl={template_impl} '
+        f'template_backend_impl={template_backend_impl} '
+        f'template_requested_impl={template_requested_impl} '
         f'template_decode_steps={template_decode_tokens} '
         f'template_static_decode_steps={template_static_decode_steps} '
         f'template_unknown_decode_steps={template_unknown_decode_steps} '
@@ -979,6 +995,7 @@ def _print_template_parts_sample(sample_meta: dict | None, template_meta: dict, 
         flush=True,
     )
     print(f'[TemplatePartsSample] sample_index={sample_index} template_output={template_response!r}', flush=True)
+    print(f'[TemplatePartsSample] sample_index={sample_index} template_plan={template_plan!r}', flush=True)
     print(f'[TemplatePartsSample] sample_index={sample_index} static_parts={static_parts!r}', flush=True)
     slot_stats = template_meta.get('template_slot_stats', None)
     if slot_stats:
@@ -1436,17 +1453,13 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 except Exception as exc:
                     runtime_tracker = None
                     print(f'[RuntimeTracking] disabled_due_to_setup_error={exc}', flush=True)
-            template_response, template_meta = maybe_generate_with_template_prefill(
+            template_response, template_meta = maybe_generate_with_structured_fast_decode(
                 dataset=dataset,
                 model=self.model,
                 processor=self.processor,
-                base_text=text,
-                images=images,
-                videos=videos,
-                video_metadatas=video_metadatas,
-                video_kwargs=video_kwargs,
+                inputs=inputs,
                 generate_kwargs=generate_kwargs,
-                configure_context_fn=(lambda local_inputs: _configure_roi_prune_context(self.model, dataset, message, sample_meta, local_inputs)),
+                sample_meta=sample_meta,
             )
             try:
                 if template_response is not None:
@@ -1502,6 +1515,7 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                         runtime_dict = runtime_tracker.to_runtime_dict()
                         runtime_dict['prompt_seq_tokens'] = int(prompt_seq_tokens or runtime_dict.get('prompt_seq_tokens', 0) or 0)
                         runtime_dict['decode_tokens'] = int(decode_tokens or runtime_dict.get('decode_tokens', 0) or 0)
+                        runtime_dict.update(dict(template_meta or {}))
                         cfg = self.model.config.text_config
                         setattr(cfg, '_vlmeval_generate_timing_last', runtime_dict)
                         self.model._vlmeval_last_sample_flops = runtime_tracker.to_flops_dict()

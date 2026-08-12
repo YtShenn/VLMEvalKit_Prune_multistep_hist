@@ -77,10 +77,20 @@ def _continuation_token_ids(tokenizer, prefix_text: str, append_text: str) -> tu
 def _extract_cache_len(past_key_values) -> int:
     if past_key_values is None:
         return 0
+    candidates: list[int] = []
     try:
-        return int(past_key_values.get_seq_length())
+        candidates.append(int(past_key_values.get_seq_length()))
     except Exception:
-        return 0
+        pass
+    try:
+        layers = getattr(past_key_values, "layers", None) or []
+        for layer in layers:
+            keys = getattr(layer, "keys", None)
+            if keys is not None and hasattr(keys, "shape") and len(keys.shape) >= 3:
+                candidates.append(int(keys.shape[-2]))
+    except Exception:
+        pass
+    return max([0] + [x for x in candidates if x > 0])
 
 
 class _BoundaryAndroidBBoxSlotParser:
@@ -97,18 +107,18 @@ class _BoundaryAndroidBBoxSlotParser:
                 return legacy.SlotParseResult(done=False, fallback=True, reason="bbox_too_many_numbers")
             return legacy.SlotParseResult(done=False)
 
-        remainder = match.group(5)
-        if not remainder:
-            return legacy.SlotParseResult(done=False)
-        if not remainder.lstrip().startswith("]"):
-            if len(legacy.re.findall(r"-?\d+(?:\.\d+)?", text)) > 4:
-                return legacy.SlotParseResult(done=False, fallback=True, reason="bbox_extra_content")
-            return legacy.SlotParseResult(done=False)
-
         try:
             values = [float(match.group(i)) for i in range(1, 5)]
         except Exception:
             return legacy.SlotParseResult(done=False, fallback=True, reason="bbox_parse_failure")
+        if values[2] < values[0] or values[3] < values[1]:
+            return legacy.SlotParseResult(done=False)
+
+        remainder = match.group(5)
+        if remainder and not remainder.lstrip().startswith("]") and remainder.strip() not in ("", ",", ", ", " ]"):
+            if len(legacy.re.findall(r"-?\d+(?:\.\d+)?", text)) > 4:
+                return legacy.SlotParseResult(done=False, fallback=True, reason="bbox_extra_content")
+            return legacy.SlotParseResult(done=False)
 
         rendered = ", ".join(legacy._format_number(v) for v in values)
         return legacy.SlotParseResult(done=True, rendered=rendered, canonical=rendered)
@@ -272,7 +282,13 @@ class StatefulTemplateDecodeSession:
             raise RuntimeError("initial template prefill produced no cache/logits")
         self.current_text = str(text)
         cache_len = _extract_cache_len(past)
-        self.total_tokens = int(cache_len if cache_len > 0 else prompt_token_len)
+        self.total_tokens = int(max(cache_len, prompt_token_len))
+        if self.attention_mask is None or int(self.attention_mask.shape[-1]) != int(self.total_tokens):
+            self.attention_mask = torch.ones(
+                (1, int(self.total_tokens)),
+                dtype=self.attention_dtype,
+                device=self.attention_device,
+            )
         self.past_key_values = past
         self.last_logits = logits
         return prompt_token_len
@@ -306,23 +322,42 @@ class StatefulTemplateDecodeSession:
             raise RuntimeError("session is not initialized")
         device = self.attention_device
         new_input_ids = torch.tensor([list(token_ids)], dtype=torch.long, device=device)
-        if self.attention_mask is None:
+        cache_len = _extract_cache_len(self.past_key_values)
+        self.total_tokens = int(max(self.total_tokens, cache_len))
+        if self.attention_mask is None or int(self.attention_mask.shape[-1]) != int(self.total_tokens):
             self.attention_mask = torch.ones((1, int(self.total_tokens)), dtype=self.attention_dtype, device=device)
         append_mask = torch.ones((1, int(new_input_ids.shape[1])), dtype=self.attention_dtype, device=device)
         self.attention_mask = torch.cat([self.attention_mask.to(device=device), append_mask], dim=-1)
-        prepare_fn = getattr(self.model, "prepare_inputs_for_generation", None)
-        if prepare_fn is None:
-            raise RuntimeError("model has no prepare_inputs_for_generation for stateful continuation")
-        prepared = prepare_fn(
-            new_input_ids,
+        cache_position = torch.arange(
+            int(self.total_tokens),
+            int(self.total_tokens) + int(new_input_ids.shape[1]),
+            dtype=torch.long,
+            device=device,
+        )
+        prepared = dict(
+            input_ids=new_input_ids,
             past_key_values=self.past_key_values,
             attention_mask=self.attention_mask,
             use_cache=True,
-            is_first_iteration=False,
-            **self.prepare_static_kwargs,
+            cache_position=cache_position,
+            logits_to_keep=1,
+            return_dict=True,
         )
-        prepared["return_dict"] = True
-        outputs = self._model_forward(**prepared)
+        try:
+            outputs = self._model_forward(**prepared)
+        except Exception as exc:
+            cache_len = _extract_cache_len(self.past_key_values)
+            raise RuntimeError(
+                "stateful_continuation_forward_failed:"
+                f"{type(exc).__name__}:{exc}; "
+                f"new_input_ids_shape={tuple(new_input_ids.shape)} "
+                f"attention_mask_shape={tuple(self.attention_mask.shape) if self.attention_mask is not None else None} "
+                f"cache_len={cache_len} "
+                f"total_tokens={self.total_tokens} "
+                f"cache_position_shape={tuple(cache_position.shape)} "
+                f"cache_position_first={int(cache_position[0].item()) if cache_position.numel() else None} "
+                f"cache_position_last={int(cache_position[-1].item()) if cache_position.numel() else None}"
+            ) from exc
         past = getattr(outputs, "past_key_values", None)
         logits = getattr(outputs, "logits", None)
         if past is None or logits is None:
@@ -478,7 +513,7 @@ def _android_template_prefill_stateful(
         allow_boundary_chars='"',
         open_prefixes=legacy.ANDROID_OPEN_ACTION_PREFIXES,
     )
-    parsed_action, raw_action_text, action_decode_tokens, prompt_tokens = session.generate_slot(
+    parsed_action, raw_action_text, action_decode_tokens, prompt_tokens = session.generate_slot_in_place(
         parser=action_parser,
         max_new_tokens=20,
     )
@@ -512,7 +547,7 @@ def _android_template_prefill_stateful(
         static_parts.append(static_mid)
         static_token_total += len(processor.tokenizer.encode(static_mid, add_special_tokens=False))
         bbox_parser = _BoundaryAndroidBBoxSlotParser()
-        parsed_bbox, raw_bbox_text, bbox_decode_tokens, bbox_prompt_tokens = session.generate_slot(
+        parsed_bbox, raw_bbox_text, bbox_decode_tokens, bbox_prompt_tokens = session.generate_slot_in_place(
             parser=bbox_parser,
             max_new_tokens=40,
         )
@@ -543,7 +578,6 @@ def _android_template_prefill_stateful(
         bbox_value = ""
         suffix = '"}</answer>'
 
-    session.append_known_text(suffix)
     built += suffix
     static_parts.append(suffix)
     static_token_total += len(processor.tokenizer.encode(suffix, add_special_tokens=False))
@@ -755,7 +789,6 @@ def _gui_template_prefill_stateful(
             }
         built += parsed_coords.rendered
         suffix = ")"
-        session.append_known_text(suffix)
         built += suffix
         static_parts.append(suffix)
         static_token_total += len(processor.tokenizer.encode(suffix, add_special_tokens=False))

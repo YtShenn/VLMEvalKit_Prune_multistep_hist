@@ -41,6 +41,49 @@ def _read_first_image_size_from_message(message: list[dict]) -> tuple[int, int] 
     return None
 
 
+def _read_image_size_from_item(item: dict) -> tuple[int, int] | None:
+    if not isinstance(item, dict) or item.get('type') != 'image':
+        return None
+    p = str(item.get('value', ''))
+    if p.startswith('file://'):
+        p = p[len('file://'):]
+    if not p:
+        return None
+    try:
+        with Image.open(p) as img:
+            return img.size
+    except Exception:
+        return None
+
+
+def _read_current_image_size_from_message(message: list[dict]) -> tuple[int, int] | None:
+    """AndroidControl predicts coordinates on the final current screenshot, not history images."""
+    saw_current_label = False
+    last_image_size = None
+    for s in message:
+        if not isinstance(s, dict):
+            continue
+        if s.get('type') == 'text':
+            text_raw = str(s.get('value', '') or '').strip()
+            text = text_raw.lower()
+            if (
+                text.startswith('current screenshot:')
+                or text.startswith('current image:')
+                or '[current_image]' in text
+            ):
+                saw_current_label = True
+            continue
+        if s.get('type') != 'image':
+            continue
+        img_size = _read_image_size_from_item(s)
+        if img_size is None:
+            continue
+        if saw_current_label:
+            return img_size
+        last_image_size = img_size
+    return last_image_size
+
+
 def _denorm_android_coord_values(vals, img_wh: tuple[int, int], base: float):
     if not isinstance(vals, list) or len(vals) not in (2, 4):
         return vals
@@ -59,7 +102,7 @@ def _denorm_android_coord_values(vals, img_wh: tuple[int, int], base: float):
 
 
 def _postprocess_androidcontrol_response(response: str, message: list[dict], base: float) -> str:
-    img_wh = _read_first_image_size_from_message(message)
+    img_wh = _read_current_image_size_from_message(message)
     if img_wh is None:
         return response
 
@@ -681,7 +724,7 @@ def _configure_roi_prune_context(model, dataset: str | None, message: list[dict]
     cfg._vlmeval_current_sample_index = str((sample_meta or {}).get('sample_index', ''))
     cfg._vlmeval_current_image_path = str((sample_meta or {}).get('image_path', ''))
     cfg._vlmeval_current_image_paths = list((sample_meta or {}).get('image_paths', []) or [])
-    img_wh = _read_first_image_size_from_message(message)
+    img_wh = _read_current_image_size_from_message(message)
     cfg._vlmeval_current_image_size_wh = list(img_wh) if img_wh is not None else None
     visual_hw = _extract_visual_grid_hw(inputs)
     cfg._vlmeval_current_visual_grid_hw = list(visual_hw) if visual_hw is not None else None

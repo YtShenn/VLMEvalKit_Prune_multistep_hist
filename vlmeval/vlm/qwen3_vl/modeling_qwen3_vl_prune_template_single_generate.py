@@ -575,7 +575,9 @@ def _maybe_generate_single(
     family = legacy._dataset_family(dataset)
     legacy._debug_print(dataset, f"enabled family={family} impl=single_generate_constrained")
     if family == "androidcontrol":
-        return _android_single_generate(
+        from . import modeling_qwen3_vl_prune_template_single_generate_android as android_single
+
+        return android_single.maybe_generate_with_template_prefill(
             dataset=dataset,
             model=model,
             processor=processor,

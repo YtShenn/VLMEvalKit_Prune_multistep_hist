@@ -98,9 +98,15 @@ def _sort_androidcontrol_sequential(data):
 def _task_key_for_sampling(dataset_name, row):
     dataset_name = str(dataset_name or '')
     if 'AndroidControl_Curated' in dataset_name:
-        traj = _androidcontrol_trajectory_key(row)
-        if traj:
-            return f"trajectory:{traj}"
+        # `High_Task_Improved` uses per-trajectory folders like
+        # `android_control_images/<task>/step_<n>.png`, so keeping trajectory-based
+        # grouping preserves the original task definition there. `High_Point` uses
+        # flat image names under one directory, so it must fall back to explicit
+        # task-level fields first.
+        if 'High_Task_Improved' in dataset_name:
+            traj = _androidcontrol_trajectory_key(row)
+            if traj:
+                return f"trajectory:{traj}"
         for key in ('task_filename', 'task_id', 'episode', 'revised_task', 'instruction'):
             value = row.get(key, None)
             if value is None:
@@ -108,6 +114,9 @@ def _task_key_for_sampling(dataset_name, row):
             text = str(value).strip()
             if text:
                 return f'{key}:{text}'
+        traj = _androidcontrol_trajectory_key(row)
+        if traj:
+            return f"trajectory:{traj}"
         return f"index:{row.get('index', '')}"
 
     if 'GUIOdyssey' in dataset_name:

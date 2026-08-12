@@ -74,6 +74,54 @@ def _continuation_token_ids(tokenizer, prefix_text: str, append_text: str) -> tu
     return [], False
 
 
+def _extract_cache_len(past_key_values) -> int:
+    if past_key_values is None:
+        return 0
+    try:
+        return int(past_key_values.get_seq_length())
+    except Exception:
+        return 0
+
+
+class _BoundaryAndroidBBoxSlotParser:
+    def parse(self, raw_text: str) -> legacy.SlotParseResult:
+        text = str(raw_text or "")
+        match = legacy.re.match(
+            r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)(.*)$",
+            text,
+            legacy.re.DOTALL,
+        )
+        if not match:
+            nums = legacy.re.findall(r"-?\d+(?:\.\d+)?", text)
+            if len(nums) > 4:
+                return legacy.SlotParseResult(done=False, fallback=True, reason="bbox_too_many_numbers")
+            return legacy.SlotParseResult(done=False)
+
+        remainder = match.group(5)
+        if not remainder:
+            return legacy.SlotParseResult(done=False)
+        if not remainder.lstrip().startswith("]"):
+            if len(legacy.re.findall(r"-?\d+(?:\.\d+)?", text)) > 4:
+                return legacy.SlotParseResult(done=False, fallback=True, reason="bbox_extra_content")
+            return legacy.SlotParseResult(done=False)
+
+        try:
+            values = [float(match.group(i)) for i in range(1, 5)]
+        except Exception:
+            return legacy.SlotParseResult(done=False, fallback=True, reason="bbox_parse_failure")
+
+        rendered = ", ".join(legacy._format_number(v) for v in values)
+        return legacy.SlotParseResult(done=True, rendered=rendered, canonical=rendered)
+
+
+def _build_android_final_text(mode: str, action: str, bbox: str = "") -> str:
+    if action in ("click", "long_press"):
+        if str(mode or "") == "action_first_json":
+            return f'<answer>{{"action_type": "{action}", "bbox_2d": [{bbox}]}}</answer>'
+        return f'<answer>{{"bbox_2d": [{bbox}], "action_type": "{action}"}}</answer>'
+    return f'<answer>{{"action_type": "{action}"}}</answer>'
+
+
 def _sampling_next_token(logits: torch.Tensor, generate_kwargs: dict) -> int:
     do_sample = bool(generate_kwargs.get("do_sample", False))
     temperature = generate_kwargs.get("temperature", None)
@@ -100,12 +148,44 @@ def _sampling_next_token(logits: torch.Tensor, generate_kwargs: dict) -> int:
     return int(sample.item())
 
 
+def _sampling_next_token_from_allowed(logits: torch.Tensor, allowed_ids: set[int], generate_kwargs: dict) -> int:
+    if not allowed_ids:
+        return _sampling_next_token(logits, generate_kwargs)
+    allowed = sorted(int(x) for x in allowed_ids if int(x) >= 0)
+    if not allowed:
+        return _sampling_next_token(logits, generate_kwargs)
+
+    allowed_tensor = torch.tensor(allowed, device=logits.device, dtype=torch.long)
+    allowed_logits = torch.index_select(logits, dim=-1, index=allowed_tensor)
+    chosen_local = _sampling_next_token(allowed_logits, generate_kwargs)
+    chosen_local = max(0, min(int(chosen_local), len(allowed) - 1))
+    return int(allowed[chosen_local])
+
+
+def _closed_set_allowed_next_token_ids(tokenizer, sampled_ids: Sequence[int], parser) -> set[int]:
+    if not isinstance(parser, legacy.ClosedSetSlotParser):
+        return set()
+    prefix = [int(x) for x in sampled_ids]
+    allowed: set[int] = set()
+    for candidate in getattr(parser, "candidates", []) or []:
+        try:
+            cand_ids = list(tokenizer.encode(str(candidate), add_special_tokens=False))
+        except Exception:
+            continue
+        if len(cand_ids) <= len(prefix):
+            continue
+        if cand_ids[: len(prefix)] == prefix:
+            allowed.add(int(cand_ids[len(prefix)]))
+    return allowed
+
+
 @dataclass
 class _SessionSnapshot:
     current_text: str
     total_tokens: int
     attention_dtype: torch.dtype
     attention_device: torch.device
+    attention_mask: Optional[torch.Tensor]
     past_key_values: object
     last_logits: Optional[torch.Tensor]
 
@@ -137,6 +217,8 @@ class StatefulTemplateDecodeSession:
         self.total_tokens = 0
         self.attention_dtype = torch.long
         self.attention_device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        self.attention_mask: Optional[torch.Tensor] = None
+        self.prepare_static_kwargs: dict = {}
         self.past_key_values = None
         self.last_logits = None
         self.eos_token_ids = _eos_token_ids(model, processor.tokenizer)
@@ -164,6 +246,22 @@ class StatefulTemplateDecodeSession:
         if attention_mask is not None:
             self.attention_dtype = attention_mask.dtype
             self.attention_device = attention_mask.device
+            self.attention_mask = attention_mask.detach().clone()
+        else:
+            self.attention_mask = None
+        self.prepare_static_kwargs = {}
+        for key in (
+            "pixel_values",
+            "pixel_values_videos",
+            "image_grid_thw",
+            "video_grid_thw",
+            "mm_token_type_ids",
+        ):
+            value = getattr(local_inputs, key, None)
+            if value is None and hasattr(local_inputs, "get"):
+                value = local_inputs.get(key, None)
+            if value is not None:
+                self.prepare_static_kwargs[key] = value
         model_inputs = dict(local_inputs)
         model_inputs["use_cache"] = True
         model_inputs["return_dict"] = True
@@ -173,7 +271,8 @@ class StatefulTemplateDecodeSession:
         if past is None or logits is None:
             raise RuntimeError("initial template prefill produced no cache/logits")
         self.current_text = str(text)
-        self.total_tokens = int(prompt_token_len)
+        cache_len = _extract_cache_len(past)
+        self.total_tokens = int(cache_len if cache_len > 0 else prompt_token_len)
         self.past_key_values = past
         self.last_logits = logits
         return prompt_token_len
@@ -186,6 +285,7 @@ class StatefulTemplateDecodeSession:
             total_tokens=int(self.total_tokens),
             attention_dtype=self.attention_dtype,
             attention_device=self.attention_device,
+            attention_mask=self.attention_mask.detach().clone() if self.attention_mask is not None else None,
             past_key_values=_clone_past_key_values(self.past_key_values),
             last_logits=_clone_logits(self.last_logits),
         )
@@ -195,6 +295,7 @@ class StatefulTemplateDecodeSession:
         self.total_tokens = int(snapshot.total_tokens)
         self.attention_dtype = snapshot.attention_dtype
         self.attention_device = snapshot.attention_device
+        self.attention_mask = snapshot.attention_mask
         self.past_key_values = snapshot.past_key_values
         self.last_logits = snapshot.last_logits
 
@@ -205,22 +306,30 @@ class StatefulTemplateDecodeSession:
             raise RuntimeError("session is not initialized")
         device = self.attention_device
         new_input_ids = torch.tensor([list(token_ids)], dtype=torch.long, device=device)
-        total_len = int(self.total_tokens) + int(new_input_ids.shape[1])
-        attention_mask = torch.ones((1, total_len), dtype=self.attention_dtype, device=device)
-        outputs = self._model_forward(
-            input_ids=new_input_ids,
-            attention_mask=attention_mask,
+        if self.attention_mask is None:
+            self.attention_mask = torch.ones((1, int(self.total_tokens)), dtype=self.attention_dtype, device=device)
+        append_mask = torch.ones((1, int(new_input_ids.shape[1])), dtype=self.attention_dtype, device=device)
+        self.attention_mask = torch.cat([self.attention_mask.to(device=device), append_mask], dim=-1)
+        prepare_fn = getattr(self.model, "prepare_inputs_for_generation", None)
+        if prepare_fn is None:
+            raise RuntimeError("model has no prepare_inputs_for_generation for stateful continuation")
+        prepared = prepare_fn(
+            new_input_ids,
             past_key_values=self.past_key_values,
+            attention_mask=self.attention_mask,
             use_cache=True,
-            return_dict=True,
+            is_first_iteration=False,
+            **self.prepare_static_kwargs,
         )
+        prepared["return_dict"] = True
+        outputs = self._model_forward(**prepared)
         past = getattr(outputs, "past_key_values", None)
         logits = getattr(outputs, "logits", None)
         if past is None or logits is None:
             raise RuntimeError("token append produced no cache/logits")
         self.past_key_values = past
         self.last_logits = logits
-        self.total_tokens = total_len
+        self.total_tokens = int(self.attention_mask.shape[-1])
 
     def append_known_text(self, append_text: str) -> None:
         append_text = str(append_text or "")
@@ -243,7 +352,10 @@ class StatefulTemplateDecodeSession:
         for _ in range(int(max_new_tokens)):
             if self.last_logits is None:
                 raise RuntimeError("missing slot logits")
-            next_token_id = _sampling_next_token(self.last_logits[:, -1, :], self.generate_kwargs)
+            allowed_ids = _closed_set_allowed_next_token_ids(self.processor.tokenizer, sampled_ids, parser)
+            next_token_id = _sampling_next_token_from_allowed(
+                self.last_logits[:, -1, :], allowed_ids, self.generate_kwargs
+            )
             if self.eos_token_ids and next_token_id in self.eos_token_ids:
                 parsed = legacy.SlotParseResult(done=False, fallback=True, reason="slot_eos_before_done")
                 break
@@ -297,7 +409,10 @@ class StatefulTemplateDecodeSession:
         for _ in range(int(max_new_tokens)):
             if self.last_logits is None:
                 raise RuntimeError("missing slot logits")
-            next_token_id = _sampling_next_token(self.last_logits[:, -1, :], self.generate_kwargs)
+            allowed_ids = _closed_set_allowed_next_token_ids(self.processor.tokenizer, sampled_ids, parser)
+            next_token_id = _sampling_next_token_from_allowed(
+                self.last_logits[:, -1, :], allowed_ids, self.generate_kwargs
+            )
             if self.eos_token_ids and next_token_id in self.eos_token_ids:
                 parsed = legacy.SlotParseResult(done=False, fallback=True, reason="slot_eos_before_done")
                 break
@@ -335,7 +450,7 @@ def _android_template_prefill_stateful(
     configure_context_fn: Optional[Callable],
 ):
     mode = legacy._android_mode()
-    if mode not in ("action_first_json",):
+    if mode not in ("action_first_json", "bbox_first_json"):
         return None, {"template_prefill_enabled": False, "template_prefill_fallback_reason": f"android_mode:{mode}"}
     if not bool(generate_kwargs.get("use_cache", True)):
         return None, {"template_prefill_enabled": False, "template_prefill_fallback_reason": "stateful_requires_use_cache"}
@@ -396,10 +511,10 @@ def _android_template_prefill_stateful(
         built += static_mid
         static_parts.append(static_mid)
         static_token_total += len(processor.tokenizer.encode(static_mid, add_special_tokens=False))
-        bbox_parser = legacy.AndroidBBoxSlotParser()
+        bbox_parser = _BoundaryAndroidBBoxSlotParser()
         parsed_bbox, raw_bbox_text, bbox_decode_tokens, bbox_prompt_tokens = session.generate_slot(
             parser=bbox_parser,
-            max_new_tokens=32,
+            max_new_tokens=40,
         )
         slot_stats.append(
             {
@@ -421,9 +536,11 @@ def _android_template_prefill_stateful(
                 "template_static_parts": static_parts,
                 "template_prefill_impl": "stateful_slot_cache",
             }
+        bbox_value = parsed_bbox.canonical
         built += parsed_bbox.rendered
         suffix = "]}</answer>"
     else:
+        bbox_value = ""
         suffix = '"}</answer>'
 
     session.append_known_text(suffix)
@@ -431,16 +548,17 @@ def _android_template_prefill_stateful(
     static_parts.append(suffix)
     static_token_total += len(processor.tokenizer.encode(suffix, add_special_tokens=False))
     total_decode_tokens = sum(int(item["decode_tokens"]) for item in slot_stats)
-    return built, {
+    final_text = _build_android_final_text(mode, action_value, bbox_value)
+    return final_text, {
         "template_prefill_enabled": True,
-        "template_schema": "android_action_first_json",
+        "template_schema": f"android_{mode}",
         "template_slot_stats": slot_stats,
         "template_static_parts": static_parts,
         "template_static_token_count": int(static_token_total),
         "template_static_decode_steps": 0,
         "template_unknown_decode_steps": int(total_decode_tokens),
         "template_decode_tokens": int(total_decode_tokens),
-        "template_final_text": built,
+        "template_final_text": final_text,
         "template_prefill_impl": "stateful_slot_cache",
     }
 
@@ -769,7 +887,7 @@ def maybe_generate_with_template_prefill(
         return response, meta
     except Exception as exc:
         legacy._debug_print(dataset, f"stateful_exception={type(exc).__name__}:{exc}")
-        if os.getenv("QWEN3VL_TEMPLATE_PREFILL_STATEFUL_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        if os.getenv("QWEN3VL_TEMPLATE_PREFILL_STATEFUL_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "on"}:
             response, meta = legacy.maybe_generate_with_template_prefill(
                 dataset=dataset,
                 model=model,
@@ -787,4 +905,9 @@ def maybe_generate_with_template_prefill(
                 meta.setdefault("template_prefill_impl", "legacy_after_stateful_exception")
                 meta.setdefault("template_prefill_stateful_exception", f"{type(exc).__name__}:{exc}")
             return response, meta
-        raise
+        return None, {
+            "template_prefill_enabled": False,
+            "template_prefill_fallback_reason": f"stateful_exception:{type(exc).__name__}:{exc}",
+            "template_prefill_impl": "stateful_slot_cache",
+            "template_prefill_stateful_exception": f"{type(exc).__name__}:{exc}",
+        }

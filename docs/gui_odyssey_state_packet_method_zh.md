@@ -53,15 +53,16 @@
 ### 3. 当前支持的动作邻域裁剪规则
 
 - `CLICK / LONG_PRESS`
+
   - 使用动作坐标作为中心
   - 从原图中裁一个方形邻域
-
 - `SCROLL`
+
   - 没有明确点击点时，使用基于方向的启发式区域
   - 上下滚动使用中间纵向区域
   - 左右滚动使用中间横向区域
-
 - 其他动作如 `TYPE / PRESS_BACK / COMPLETE`
+
   - 回退到中心区域裁剪
 
 ### 4. token 数说明
@@ -81,6 +82,16 @@
 - 对比裁剪前后 token 规模
 - 汇总到 `summary.json`
 
+### 改进思路
+
+**增加 packet 的“变化信息”而不是只保留静态内容**
+如果当前 packet 只是从单帧里抽 thumbnail/ROI，它对“上一帧到这一帧哪里变了”表达不够强。
+你可以补两类信息：
+
+* 当前 history frame 相对上一 history frame 的差异区域
+* 当前 frame 中与最后 action 相关的局部区域
+  也就是把 ROI 选择从“显著区域”升级为“变化区域 + 交互相关区域”。
+
 ## 三、代码文件与函数说明
 
 ### 1. 新增文件
@@ -95,12 +106,13 @@
 主要函数：
 
 - `state_packet_enabled()`
+
   - 读取环境变量，判断是否启用 State Packet
-
 - `state_packet_debug_enabled()`
-  - 读取环境变量，判断是否输出详细调试日志
 
+  - 读取环境变量，判断是否输出详细调试日志
 - `build_state_packet(...)`
+
   - 对单张历史图生成：
     - `thumbnail`
     - `action_roi`
@@ -134,17 +146,18 @@
 新增或扩展的关键部分：
 
 - `self.use_history_state_packet`
+
   - 是否启用 State Packet
-
 - `self._state_packet_records`
-  - 用于积累每张历史图的 packet 统计，供 summary 汇总
 
+  - 用于积累每张历史图的 packet 统计，供 summary 汇总
 - `_build_history_visual_entries(...)`
+
   - 构建历史 step 的图像输入列表
   - 开关关闭时返回原始历史图
   - 开关开启时调用 `build_state_packet(...)`
-
 - `summarize_state_packet_records()`
+
   - 对所有历史 packet 记录做聚合统计
   - 最终写入 `summary.json`
 
@@ -206,34 +219,36 @@ export GUI_ODYSSEY_STATE_PACKET_ENABLE=0
 ### 1. 核心开关
 
 - `GUI_ODYSSEY_STATE_PACKET_ENABLE`
+
   - `1`：启用 State Packet
   - `0`：关闭，回退到原历史图输入
-
 - `GUI_ODYSSEY_STATE_PACKET_DEBUG`
+
   - `1`：输出详细 State Packet 调试信息
   - `0`：关闭调试日志
 
 ### 2. State Packet 参数
 
 - `GUI_ODYSSEY_STATE_PACKET_CACHE_DIR`
+
   - 临时 packet 图像缓存目录
-
 - `GUI_ODYSSEY_STATE_PACKET_PATCH_SIZE`
+
   - token 估算使用的 patch size
-
 - `GUI_ODYSSEY_STATE_PACKET_MERGE_SIZE`
+
   - token 估算使用的 merge size
-
 - `GUI_ODYSSEY_STATE_PACKET_THUMB_LONG_EDGE`
+
   - thumbnail 的长边大小
-
 - `GUI_ODYSSEY_STATE_PACKET_ROI_LONG_EDGE`
+
   - ROI 图像缩放后的长边大小
-
 - `GUI_ODYSSEY_STATE_PACKET_ROI_SHORT_SIDE_RATIO`
-  - 基于原图短边决定 ROI 大小的比例
 
+  - 基于原图短边决定 ROI 大小的比例
 - `GUI_ODYSSEY_STATE_PACKET_ROI_MIN_SIDE_PX`
+
   - ROI 最小边长像素
 
 ## 六、调试输出说明

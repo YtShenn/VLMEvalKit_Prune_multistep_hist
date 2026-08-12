@@ -8,6 +8,11 @@ import pandas as pd
 
 from ..image_base import ImageBaseDataset
 from ...smp import dump, load, osp
+from .official_eval import (
+    evaluate_android_control_records_official,
+    use_official_android_control_eval,
+)
+from .state_packet import build_state_packet, state_packet_debug_enabled, state_packet_enabled
 
 
 PROMPT_TEMPLATE = """
@@ -280,6 +285,8 @@ class AndroidControlCurated(ImageBaseDataset):
         )
         self.sequential_order = _sequential_order_enabled()
         self.history_keep_prompt_template = _keep_prompt_template_enabled()
+        self.use_history_state_packet = state_packet_enabled()
+        self._state_packet_records = []
         self.max_history_images = max(
             0,
             _env_int("ANDROID_CONTROL_MAX_HISTORY_IMAGES", 0)
@@ -342,6 +349,9 @@ class AndroidControlCurated(ImageBaseDataset):
         except Exception:
             return -1
 
+    def _has_step_trajectory_path(self, image_path: str) -> bool:
+        return self._parse_step_index(image_path) >= 0
+
     def _trajectory_key_from_path(self, image_path: str) -> str:
         normalized = str(image_path or "").replace("\\", "/").rstrip("/")
         if "/" not in normalized:
@@ -358,6 +368,23 @@ class AndroidControlCurated(ImageBaseDataset):
                 running.append(step_inst)
         return prev_texts
 
+    def _build_previous_action_packets(self, group: pd.DataFrame) -> List[List[dict]]:
+        prev_packets = []
+        running = []
+        for _, row in group.iterrows():
+            prev_packets.append([dict(x) for x in running])
+            gt_bbox = row.get("gt_max_bbox", None)
+            if gt_bbox is None:
+                gt_bbox = row.get("gt_min_bbox", None)
+            packet = {
+                "gt_action": row.get("gt_action", ""),
+                "gt_coordinate": row.get("gt_coordinate", None),
+                "gt_bbox": gt_bbox,
+                "step_instruction": row.get("step_instruction", ""),
+            }
+            running.append(packet)
+        return prev_packets
+
     def _prepare_sequential_metadata(self, data: pd.DataFrame) -> pd.DataFrame:
         data = data.copy()
         data["_orig_order"] = list(range(len(data)))
@@ -369,21 +396,27 @@ class AndroidControlCurated(ImageBaseDataset):
                 kind="stable",
             ).reset_index(drop=True)
 
-        prev_action_texts_all = [None] * len(data)
-        prev_image_paths_all = [None] * len(data)
+        prev_action_texts_all = [[] for _ in range(len(data))]
+        prev_image_paths_all = [[] for _ in range(len(data))]
+        prev_action_packets_all = [[] for _ in range(len(data))]
 
         for _, group in data.groupby("_trajectory_key", sort=False):
             sorted_group = group.sort_values(by=["_step_idx", "_orig_order"], kind="stable")
+            if not any(int(x) >= 0 for x in sorted_group["_step_idx"].tolist()):
+                continue
             group_indices = list(sorted_group.index)
             prev_action_texts = self._build_previous_action_texts(sorted_group)
+            prev_action_packets = self._build_previous_action_packets(sorted_group)
             running_images: List[str] = []
             for local_pos, data_idx in enumerate(group_indices):
                 prev_action_texts_all[data_idx] = list(prev_action_texts[local_pos])
                 prev_image_paths_all[data_idx] = list(running_images)
+                prev_action_packets_all[data_idx] = list(prev_action_packets[local_pos])
                 running_images.append(str(sorted_group.iloc[local_pos]["image_path"]))
 
         data["_prev_action_texts"] = prev_action_texts_all
         data["_prev_image_paths"] = prev_image_paths_all
+        data["_prev_action_packets"] = prev_action_packets_all
         return data
 
     def _infer_history_from_current_image(self, current_image_path: str, limit: int) -> List[str]:
@@ -435,6 +468,8 @@ class AndroidControlCurated(ImageBaseDataset):
                     if p != current_image_path and p not in deduped:
                         deduped.append(p)
                 return deduped[-limit:]
+        if not self._has_step_trajectory_path(current_image_path):
+            return []
         return self._infer_history_from_current_image(current_image_path, limit=limit)
 
     def _resolve_history_action_texts(self, line) -> List[str]:
@@ -443,10 +478,101 @@ class AndroidControlCurated(ImageBaseDataset):
             return [str(x).strip() for x in texts if str(x).strip()]
         return []
 
+    def _resolve_history_action_packets(self, line) -> List[dict]:
+        packets = line.get("_prev_action_packets", None)
+        if not isinstance(packets, list):
+            return []
+        return [dict(x) for x in packets if isinstance(x, dict)]
+
     def _format_history_actions(self, action_texts: List[str]) -> str:
         if not action_texts:
             return "None"
         return "".join([f"Step{i + 1}: {text};" for i, text in enumerate(action_texts)])
+
+    def _build_history_visual_entries(self, sample_index: str, history_image_paths: List[str], history_action_packets: List[dict]):
+        if not self.use_history_state_packet:
+            entries = []
+            for i, (hist_image_path, action_packet) in enumerate(zip(history_image_paths, history_action_packets)):
+                entries.append(
+                    dict(
+                        history_index=i,
+                        action_text=str(action_packet.get("step_instruction", "") or ""),
+                        images=[dict(type="image", value=hist_image_path)],
+                        debug_items=[
+                            dict(
+                                kind="original",
+                                path=hist_image_path,
+                                crop_xyxy=None,
+                                estimated_tokens=None,
+                            )
+                        ],
+                    )
+                )
+            return entries
+
+        entries = []
+        for i, (hist_image_path, action_packet) in enumerate(zip(history_image_paths, history_action_packets)):
+            packet_images, packet_meta = build_state_packet(
+                image_path=hist_image_path,
+                action_packet=action_packet,
+                sample_index=str(sample_index),
+                history_index=i,
+            )
+            packet_meta["dataset_name"] = str(self.dataset_name)
+            self._state_packet_records.append(packet_meta)
+            debug_items = []
+            for item in packet_images:
+                debug_items.append(
+                    dict(
+                        kind=item.kind,
+                        path=item.path,
+                        crop_xyxy=item.crop_xyxy,
+                        estimated_tokens=item.estimated_tokens,
+                    )
+                )
+            entries.append(
+                dict(
+                    history_index=i,
+                    action_text=str(action_packet.get("step_instruction", "") or ""),
+                    images=[item.to_message_item() for item in packet_images],
+                    debug_items=debug_items,
+                    packet_meta=packet_meta,
+                )
+            )
+        return entries
+
+    def summarize_state_packet_records(self):
+        recs = list(getattr(self, "_state_packet_records", []) or [])
+        if not recs:
+            return {}
+        count = float(len(recs))
+        orig_tokens = float(sum(float(r.get("original_estimated_tokens", 0.0) or 0.0) for r in recs))
+        packet_tokens = float(sum(float(r.get("packet_estimated_tokens", 0.0) or 0.0) for r in recs))
+        thumb_tokens = float(sum(float(r.get("thumbnail_estimated_tokens", 0.0) or 0.0) for r in recs))
+        roi_tokens = float(sum(float(r.get("roi_estimated_tokens", 0.0) or 0.0) for r in recs))
+        open_s = float(sum(float(r.get("open_image_s", 0.0) or 0.0) for r in recs))
+        thumb_s = float(sum(float(r.get("thumbnail_build_s", 0.0) or 0.0) for r in recs))
+        roi_s = float(sum(float(r.get("roi_build_s", 0.0) or 0.0) for r in recs))
+        total_s = float(sum(float(r.get("state_packet_total_s", 0.0) or 0.0) for r in recs))
+        return {
+            "state_packet_enabled": bool(self.use_history_state_packet),
+            "state_packet_history_image_count": int(count),
+            "avg_state_packet_original_estimated_tokens": float(orig_tokens / count),
+            "avg_state_packet_packet_estimated_tokens": float(packet_tokens / count),
+            "avg_state_packet_thumbnail_estimated_tokens": float(thumb_tokens / count),
+            "avg_state_packet_roi_estimated_tokens": float(roi_tokens / count),
+            "state_packet_total_original_estimated_tokens": float(orig_tokens),
+            "state_packet_total_packet_estimated_tokens": float(packet_tokens),
+            "state_packet_avg_compression_ratio": float(packet_tokens / max(1.0, orig_tokens)),
+            "avg_state_packet_open_image_s": float(open_s / count),
+            "avg_state_packet_thumbnail_build_s": float(thumb_s / count),
+            "avg_state_packet_roi_build_s": float(roi_s / count),
+            "avg_state_packet_total_s": float(total_s / count),
+            "total_state_packet_open_image_s": float(open_s),
+            "total_state_packet_thumbnail_build_s": float(thumb_s),
+            "total_state_packet_roi_build_s": float(roi_s),
+            "total_state_packet_total_s": float(total_s),
+        }
 
     def _build_reference_style_intro(self, instruction: str) -> str:
         return (
@@ -500,6 +626,8 @@ class AndroidControlCurated(ImageBaseDataset):
         )
         print(f"[AndroidControlDebug] history_images={history_image_paths}", flush=True)
         print(f"[AndroidControlDebug] history_text={history_text}", flush=True)
+        if self.use_history_state_packet:
+            print("[AndroidControlDebug] history_state_packet_enabled=1", flush=True)
         print("[AndroidControlDebug] prompt_begin", flush=True)
         print(prompt, flush=True)
         print("[AndroidControlDebug] prompt_end", flush=True)
@@ -519,6 +647,7 @@ class AndroidControlCurated(ImageBaseDataset):
         history_image_paths = self._resolve_history_screenshots(line, current_image_path)
         instruction = str(line.get("instruction", ""))
         history_action_texts = self._resolve_history_action_texts(line)
+        history_action_packets = self._resolve_history_action_packets(line)
         history = self._format_history_actions(history_action_texts)
         if not self.include_history_screenshots:
             prompt = PROMPT_TEMPLATE.format(Question=instruction, past_actions=str(line.get("history", "")))
@@ -531,17 +660,38 @@ class AndroidControlCurated(ImageBaseDataset):
             )
             return [dict(type="image", value=current_image_path), dict(type="text", value=prompt)]
         hist_actions_kept = history_action_texts[-len(history_image_paths):] if history_image_paths else []
+        hist_action_packets_kept = history_action_packets[-len(history_image_paths):] if history_image_paths else []
+        history_entries = self._build_history_visual_entries(
+            sample_index=str(line.get("index", "")),
+            history_image_paths=history_image_paths,
+            history_action_packets=hist_action_packets_kept,
+        )
         if self.history_keep_prompt_template:
             intro = self._build_keep_prompt_intro(instruction, history)
             outro = self._build_keep_prompt_outro()
             debug_parts = [SYSTEM_PROMPT, intro]
             msgs = [dict(type="text", value=SYSTEM_PROMPT), dict(type="text", value=intro)]
-            for i, (hist_image_path, action_text) in enumerate(zip(history_image_paths, hist_actions_kept)):
-                debug_parts.append(f"Image_{i}: [HISTORY_IMAGE] {hist_image_path}")
-                debug_parts.append(f"{i + 1}. {action_text}")
-                msgs.append(dict(type="text", value=f"Image_{i}:"))
-                msgs.append(dict(type="image", value=hist_image_path))
-                msgs.append(dict(type="text", value=f"{i + 1}. {action_text}\n"))
+            if not self.use_history_state_packet:
+                for i, (hist_image_path, action_text) in enumerate(zip(history_image_paths, hist_actions_kept)):
+                    debug_parts.append(f"Image_{i}: [HISTORY_IMAGE] {hist_image_path}")
+                    debug_parts.append(f"{i + 1}. {action_text}")
+                    msgs.append(dict(type="text", value=f"Image_{i}:"))
+                    msgs.append(dict(type="image", value=hist_image_path))
+                    msgs.append(dict(type="text", value=f"{i + 1}. {action_text}\n"))
+            else:
+                for entry in history_entries:
+                    i = int(entry["history_index"])
+                    action_text = str(entry["action_text"])
+                    debug_parts.append(f"HistoryStep_{i}: action={action_text}")
+                    for image_item, debug_item in zip(entry["images"], entry.get("debug_items", [])):
+                        label = str(debug_item.get("kind", "history_image"))
+                        debug_parts.append(
+                            f"HistoryStep_{i} {label}: {debug_item.get('path')} crop_xyxy={debug_item.get('crop_xyxy')} "
+                            f"est_tokens={debug_item.get('estimated_tokens')}"
+                        )
+                        msgs.append(dict(type="text", value=f"HistoryStep_{i} {label}:"))
+                        msgs.append(dict(image_item))
+                    msgs.append(dict(type="text", value=f"{i + 1}. {action_text}\n"))
             debug_parts.append(f"Current Screenshot: [CURRENT_IMAGE] {current_image_path}")
             debug_parts.append(outro)
             self._maybe_debug_print_prompt(
@@ -554,10 +704,37 @@ class AndroidControlCurated(ImageBaseDataset):
             msgs.append(dict(type="text", value="Current Screenshot:"))
             msgs.append(dict(type="image", value=current_image_path))
             msgs.append(dict(type="text", value=outro))
+            if state_packet_debug_enabled() and history_entries:
+                for entry in history_entries:
+                    packet_meta = entry.get("packet_meta", None)
+                    if not isinstance(packet_meta, dict):
+                        continue
+                    print(
+                        "[AndroidControlStatePacketPrompt] "
+                        f"sample_index={packet_meta.get('sample_index')} "
+                        f"hist_index={packet_meta.get('history_index')} "
+                        f"action_type={packet_meta.get('action_type')} "
+                        f"orig_tokens_est={packet_meta.get('original_estimated_tokens')} "
+                        f"packet_tokens_est={packet_meta.get('packet_estimated_tokens')} "
+                        f"roi_crop_xyxy={packet_meta.get('roi_crop_xyxy')} "
+                        f"thumbnail_size=({packet_meta.get('thumbnail_width')},{packet_meta.get('thumbnail_height')}) "
+                        f"roi_size=({packet_meta.get('roi_width')},{packet_meta.get('roi_height')}) "
+                        f"open_s={float(packet_meta.get('open_image_s', 0.0)):.6f} "
+                        f"thumb_s={float(packet_meta.get('thumbnail_build_s', 0.0)):.6f} "
+                        f"roi_s={float(packet_meta.get('roi_build_s', 0.0)):.6f} "
+                        f"packet_total_s={float(packet_meta.get('state_packet_total_s', 0.0)):.6f}",
+                        flush=True,
+                    )
             return msgs
         prompt = self._build_reference_style_intro(instruction)
-        for i, action in enumerate(hist_actions_kept):
-            prompt += f"Image_{i}: [historical screenshot]\nStep_{i}: {action}.\n"
+        if not self.use_history_state_packet:
+            for i, action in enumerate(hist_actions_kept):
+                prompt += f"Image_{i}: [historical screenshot]\nStep_{i}: {action}.\n"
+        else:
+            for entry in history_entries:
+                i = int(entry["history_index"])
+                action_text = str(entry["action_text"])
+                prompt += f"HistoryStep_{i}: [history packet images]\nStep_{i}: {action_text}.\n"
         prompt += f"Image_{len(hist_actions_kept)}: [current screenshot]\n"
         prompt += self._build_reference_style_outro()
         self._maybe_debug_print_prompt(
@@ -568,18 +745,56 @@ class AndroidControlCurated(ImageBaseDataset):
             prompt=prompt,
         )
         msgs = [dict(type="text", value=self._build_reference_style_intro(instruction))]
-        for i, (img_path, action) in enumerate(zip(history_image_paths, hist_actions_kept)):
-            msgs.append(dict(type="text", value=f"Image_{i}:"))
-            msgs.append(dict(type="image", value=img_path))
-            msgs.append(dict(type="text", value=f"Step_{i}: {action}.\n"))
+        if not self.use_history_state_packet:
+            for i, (img_path, action) in enumerate(zip(history_image_paths, hist_actions_kept)):
+                msgs.append(dict(type="text", value=f"Image_{i}:"))
+                msgs.append(dict(type="image", value=img_path))
+                msgs.append(dict(type="text", value=f"Step_{i}: {action}.\n"))
+        else:
+            for entry in history_entries:
+                i = int(entry["history_index"])
+                action_text = str(entry["action_text"])
+                for image_item, debug_item in zip(entry["images"], entry.get("debug_items", [])):
+                    label = str(debug_item.get("kind", "history_image"))
+                    msgs.append(dict(type="text", value=f"HistoryStep_{i} {label}:"))
+                    msgs.append(dict(image_item))
+                msgs.append(dict(type="text", value=f"Step_{i}: {action_text}.\n"))
         msgs.append(dict(type="text", value=f"Image_{len(hist_actions_kept)}:"))
         msgs.append(dict(type="image", value=current_image_path))
         msgs.append(dict(type="text", value=self._build_reference_style_outro()))
+        if state_packet_debug_enabled() and history_entries:
+            for entry in history_entries:
+                packet_meta = entry.get("packet_meta", None)
+                if not isinstance(packet_meta, dict):
+                    continue
+                print(
+                    "[AndroidControlStatePacketPrompt] "
+                    f"sample_index={packet_meta.get('sample_index')} "
+                    f"hist_index={packet_meta.get('history_index')} "
+                    f"action_type={packet_meta.get('action_type')} "
+                    f"orig_tokens_est={packet_meta.get('original_estimated_tokens')} "
+                    f"packet_tokens_est={packet_meta.get('packet_estimated_tokens')} "
+                    f"roi_crop_xyxy={packet_meta.get('roi_crop_xyxy')} "
+                    f"thumbnail_size=({packet_meta.get('thumbnail_width')},{packet_meta.get('thumbnail_height')}) "
+                    f"roi_size=({packet_meta.get('roi_width')},{packet_meta.get('roi_height')}) "
+                    f"open_s={float(packet_meta.get('open_image_s', 0.0)):.6f} "
+                    f"thumb_s={float(packet_meta.get('thumbnail_build_s', 0.0)):.6f} "
+                    f"roi_s={float(packet_meta.get('roi_build_s', 0.0)):.6f} "
+                    f"packet_total_s={float(packet_meta.get('state_packet_total_s', 0.0)):.6f}",
+                    flush=True,
+                )
         return msgs
 
     def evaluate(self, eval_file, **judge_kwargs):
         data = load(eval_file)
         records = data.to_dict("records") if isinstance(data, pd.DataFrame) else list(data)
+        if use_official_android_control_eval():
+            return evaluate_android_control_records_official(
+                records,
+                dataset_name=self.dataset_name,
+                eval_file=eval_file,
+                image_resolver=self._resolve_image_path,
+            )
         use_improved = self.dataset_name == "AndroidControl_Curated_High_Task_Improved"
 
         total = len(records)

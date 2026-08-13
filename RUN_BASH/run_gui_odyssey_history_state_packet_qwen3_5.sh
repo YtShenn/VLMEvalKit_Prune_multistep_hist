@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=1
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
@@ -18,7 +18,7 @@ export VLM_PRUNE_TIMING="${VLM_PRUNE_TIMING:-1}"
 export SEED="${SEED:-42}"
 export QWEN3VL_PROFILE_FLOPS="${QWEN3VL_PROFILE_FLOPS:-1}"
 
-export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE:-1}"
+export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE:-0}"
 export QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG="${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG:-1}"
 export QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS="${QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS:-16}"
 export QWEN3VL_STRUCTURED_FAST_DECODE_GUI_DIRECTION_MAX_TOKENS="${QWEN3VL_STRUCTURED_FAST_DECODE_GUI_DIRECTION_MAX_TOKENS:-8}"
@@ -53,8 +53,8 @@ DATASET="${DATASET:-GUIOdyssey_high_random_split}"
 PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
 TS="$(date +%Y%m%d_%H%M%S)"
-TAG="${TAG:-hist4_keep_system_prompt_state_packet_structured_fast_changeratio}"
-WORK_DIR="${WORK_DIR:-OUTPUT/ablation_gui_odyssey_${TAG}_qwen3_5_node5}"
+TAG="${TAG:-hist4_keep_system_prompt_state_packet_changeratio}"
+WORK_DIR="${WORK_DIR:-OUTPUT/ablation_gui_odyssey_${TAG}_qwen3_5_node5_0813}"
 LOG_FILE="run_output_${TS}_gui_odyssey_${TAG}.log"
 
 mkdir -p "${WORK_DIR}/${DATASET}"

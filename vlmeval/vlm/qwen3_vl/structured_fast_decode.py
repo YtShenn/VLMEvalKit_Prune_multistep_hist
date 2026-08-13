@@ -87,10 +87,23 @@ def _tokenize(tokenizer, text: str, device: torch.device) -> torch.Tensor:
     return ids.to(device=device)
 
 
+def _continuation_token_ids(tokenizer, prefix_text: str, append_text: str) -> tuple[list[int], bool]:
+    prefix_text = str(prefix_text or "")
+    append_text = str(append_text or "")
+    if not append_text:
+        return [], True
+    prefix_ids = tokenizer(prefix_text, add_special_tokens=False).input_ids
+    full_ids = tokenizer(prefix_text + append_text, add_special_tokens=False).input_ids
+    if len(full_ids) >= len(prefix_ids) and full_ids[: len(prefix_ids)] == prefix_ids:
+        return list(full_ids[len(prefix_ids):]), True
+    return list(tokenizer(append_text, add_special_tokens=False).input_ids), False
+
+
 def _decode_ids(tokenizer, ids: list[int]) -> str:
     if not ids:
         return ""
     return tokenizer.decode(ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
 
 
 def _cache_seq_len(past_key_values, fallback: int) -> int:
@@ -164,13 +177,24 @@ def _model_forward(
     return model(**kwargs)
 
 
-def _decode_position_kwargs(past_key_values, q_len: int, device: torch.device) -> dict[str, torch.Tensor]:
+def _decode_position_kwargs(model, past_key_values, q_len: int, device: torch.device) -> dict[str, torch.Tensor]:
     past_len = _cache_seq_len(past_key_values, 0)
     positions = torch.arange(past_len, past_len + int(q_len), dtype=torch.long, device=device)
-    return {
-        "position_ids": positions.view(1, -1),
-        "cache_position": positions,
-    }
+    kwargs = {"cache_position": positions}
+
+    # Qwen3-VL uses multimodal RoPE deltas after the first prefill. If we omit
+    # position_ids here, the model recomputes them from the full attention_mask
+    # and can produce a full-context position tensor for a q_len continuation.
+    # Build only the continuation segment while preserving the cached delta.
+    qwen_model = getattr(model, "model", None)
+    rope_deltas = getattr(qwen_model, "rope_deltas", None)
+    if torch.is_tensor(rope_deltas):
+        delta = rope_deltas.to(device=device, dtype=torch.long)
+        batch = int(delta.shape[0]) if delta.ndim >= 1 else 1
+        base = positions.view(1, 1, -1).expand(3, batch, -1)
+        delta = delta.view(1, batch, 1)
+        kwargs["position_ids"] = base + delta
+    return kwargs
 
 
 def _append_static(
@@ -182,12 +206,19 @@ def _append_static(
     attention_mask: torch.Tensor,
     logits: torch.Tensor,
     device: torch.device,
+    prefix_text: str | None = None,
 ) -> tuple[Any, torch.Tensor, torch.Tensor, int, float]:
-    ids = _tokenize(tokenizer, text, device)
+    if prefix_text is not None:
+        token_ids, ok = _continuation_token_ids(tokenizer, prefix_text, text)
+        if not ok:
+            raise RuntimeError("static_token_boundary_shift")
+        ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+    else:
+        ids = _tokenize(tokenizer, text, device)
     token_count = int(ids.shape[1])
     if token_count == 0:
         return past_key_values, attention_mask, logits, 0, 0.0
-    pos_kwargs = _decode_position_kwargs(past_key_values, token_count, device)
+    pos_kwargs = _decode_position_kwargs(model, past_key_values, token_count, device)
     new_mask = torch.ones((attention_mask.shape[0], token_count), dtype=attention_mask.dtype, device=device)
     attention_mask = torch.cat([attention_mask, new_mask], dim=1)
     start = time.perf_counter()
@@ -243,7 +274,7 @@ def _decode_until(
         rendered = raw if stop_idx is None else raw[:stop_idx]
 
         token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=device)
-        pos_kwargs = _decode_position_kwargs(past_key_values, 1, device)
+        pos_kwargs = _decode_position_kwargs(model, past_key_values, 1, device)
         new_mask = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=device)
         attention_mask = torch.cat([attention_mask, new_mask], dim=1)
         start = time.perf_counter()
@@ -353,7 +384,7 @@ def _decode_gui_closed_set(
         raw = _decode_ids(tokenizer, ids)
 
         token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=device)
-        pos_kwargs = _decode_position_kwargs(past_key_values, 1, device)
+        pos_kwargs = _decode_position_kwargs(model, past_key_values, 1, device)
         new_mask = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=device)
         attention_mask = torch.cat([attention_mask, new_mask], dim=1)
         start = time.perf_counter()
@@ -736,18 +767,123 @@ def _gui_structured_fast_decode(
             if action_head == "TYPE":
                 meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": "gui_type_free_text_fallback"})
                 return None, meta
-            if action_head in GUI_COORD_ACTIONS:
-                meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": "gui_coord_action_safe_fallback"})
-                return None, meta
-            if action_head == "SCROLL":
-                meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": "gui_scroll_safe_fallback"})
-                return None, meta
             if action_head in GUI_TERMINAL_ACTIONS:
                 if head_suffix.strip():
                     meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_terminal_suffix_unexpected:{head_suffix!r}"})
                     return None, meta
                 final_text = action_head
                 template_schema = "gui_terminal_command"
+            elif action_head == "SCROLL":
+                tail = _gui_static_tail_from_suffix(head_suffix, ": ")
+                if tail is None:
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_scroll_suffix_unexpected:{head_suffix!r}"})
+                    return None, meta
+                if tail:
+                    past, attention_mask, logits, n_tok, elapsed = _append_static(
+                        model,
+                        tokenizer,
+                        text=tail,
+                        past_key_values=past,
+                        attention_mask=attention_mask,
+                        logits=logits,
+                        device=device,
+                        prefix_text=action_head + head_suffix,
+                    )
+                    static_token_count += n_tok
+                    static_steps += int(n_tok > 0)
+                    static_s += elapsed
+                direction, raw_direction, direction_suffix, _, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_gui_closed_set(
+                    model,
+                    tokenizer,
+                    logits=logits,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    device=device,
+                    generate_kwargs=generate_kwargs,
+                    candidates=GUI_SCROLL_DIRECTIONS,
+                    allow_boundary_chars="\n\r\t ",
+                    max_tokens=gui_direction_max_tokens,
+                    slot_name="gui_direction",
+                )
+                dynamic_steps += steps
+                dynamic_s += elapsed
+                slot_stats.append(
+                    {
+                        "slot": "direction",
+                        "decode_tokens": steps,
+                        "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                        "done": ok,
+                        "fallback": not ok,
+                        "reason": reason,
+                        "raw_text": raw_direction,
+                        "rendered_text": direction,
+                    }
+                )
+                if not ok or not direction:
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": reason or "gui_empty_direction"})
+                    return None, meta
+                if direction_suffix.strip():
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_direction_suffix_unexpected:{direction_suffix!r}"})
+                    return None, meta
+                final_text = f"{action_head}: {direction}"
+                template_schema = "gui_scroll_command"
+            elif action_head in GUI_COORD_ACTIONS:
+                tail = _gui_static_tail_from_suffix(head_suffix, ": (")
+                if tail is None:
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_coord_suffix_unexpected:{head_suffix!r}"})
+                    return None, meta
+                if tail:
+                    past, attention_mask, logits, n_tok, elapsed = _append_static(
+                        model,
+                        tokenizer,
+                        text=tail,
+                        past_key_values=past,
+                        attention_mask=attention_mask,
+                        logits=logits,
+                        device=device,
+                        prefix_text=action_head + head_suffix,
+                    )
+                    static_token_count += n_tok
+                    static_steps += int(n_tok > 0)
+                    static_s += elapsed
+                coord_pair, raw_coord_pair, _, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
+                    model,
+                    tokenizer,
+                    logits=logits,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    device=device,
+                    generate_kwargs=generate_kwargs,
+                    stop_chars=(")",),
+                    max_tokens=gui_coord_max_tokens,
+                    slot_name="gui_coord_pair",
+                )
+                dynamic_steps += steps
+                dynamic_s += elapsed
+                slot_stats.append(
+                    {
+                        "slot": "coord_pair",
+                        "decode_tokens": steps,
+                        "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                        "done": ok,
+                        "fallback": not ok,
+                        "reason": reason,
+                        "raw_text": raw_coord_pair,
+                        "rendered_text": coord_pair,
+                    }
+                )
+                coord_suffix = _suffix_after_first_stop(raw_coord_pair, (")",))
+                if not ok or not coord_pair or coord_suffix is None:
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": reason or "gui_empty_coord_pair"})
+                    return None, meta
+                if coord_suffix.strip():
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_coord_tail_unexpected:{coord_suffix!r}"})
+                    return None, meta
+                if not _valid_gui_coord_pair(coord_pair):
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_coord_invalid:{coord_pair!r}"})
+                    return None, meta
+                final_text = f"{action_head}: ({coord_pair})"
+                template_schema = "gui_coord_command"
             else:
                 meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"unsupported_gui_action:{action_head}"})
                 return None, meta

@@ -78,7 +78,7 @@ launch_on_gpu() {
   script_name="${script_name%.sh}"
   log_file="${TARGET_LOG_DIR}/${TIMESTAMP}_${script_name}_gpu${gpu_id}.log"
 
-  echo "[Launcher] starting ${TARGET_SCRIPT} on GPU ${gpu_id}"
+  echo "[Launcher] starting ${TARGET_SCRIPT} on GPU ${gpu_id}" 
   echo "[Launcher] log -> ${log_file}"
 
   CUDA_VISIBLE_DEVICES="${gpu_id}" bash "${TARGET_SCRIPT}" 2>&1 | tee "${log_file}"

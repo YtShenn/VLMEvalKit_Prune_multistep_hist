@@ -160,6 +160,7 @@ def _model_forward(
     position_ids: torch.Tensor | None = None,
     cache_position: torch.Tensor | None = None,
     extra_inputs: dict[str, Any] | None = None,
+    logits_to_keep: int | None = None,
 ):
     kwargs = {
         "input_ids": input_ids,
@@ -172,6 +173,8 @@ def _model_forward(
         kwargs["position_ids"] = position_ids
     if cache_position is not None:
         kwargs["cache_position"] = cache_position
+    if logits_to_keep is not None:
+        kwargs["logits_to_keep"] = logits_to_keep
     if extra_inputs:
         kwargs.update(extra_inputs)
     return model(**kwargs)
@@ -197,6 +200,78 @@ def _decode_position_kwargs(model, past_key_values, q_len: int, device: torch.de
     return kwargs
 
 
+def _continuation_forward(
+    model,
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    past_key_values,
+    device: torch.device,
+):
+    pos_kwargs = _decode_position_kwargs(model, past_key_values, int(input_ids.shape[1]), device)
+    if hasattr(model, "prepare_inputs_for_generation"):
+        try:
+            prepared = model.prepare_inputs_for_generation(
+                input_ids,
+                past_key_values=past_key_values,
+                attention_mask=attention_mask,
+                use_cache=True,
+                is_first_iteration=False,
+                **pos_kwargs,
+            )
+            prepared["use_cache"] = True
+            prepared["return_dict"] = True
+            prepared["logits_to_keep"] = 1
+            return model(**prepared)
+        except Exception:
+            pass
+    return _model_forward(
+        model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        logits_to_keep=1,
+        **pos_kwargs,
+    )
+
+
+def _forward_token_ids(
+    model,
+    *,
+    token_ids: list[int],
+    past_key_values,
+    attention_mask: torch.Tensor,
+    logits: torch.Tensor,
+    device: torch.device,
+    tokenwise: bool = False,
+) -> tuple[Any, torch.Tensor, torch.Tensor, int, float]:
+    if not token_ids:
+        return past_key_values, attention_mask, logits, 0, 0.0
+    elapsed = 0.0
+    forwarded = 0
+    chunks = ([int(x)] for x in token_ids) if tokenwise else (list(int(x) for x in token_ids),)
+    for chunk in chunks:
+        ids = torch.tensor([list(chunk)], dtype=torch.long, device=device)
+        n_tok = int(ids.shape[1])
+        if n_tok == 0:
+            continue
+        new_mask = torch.ones((attention_mask.shape[0], n_tok), dtype=attention_mask.dtype, device=device)
+        attention_mask = torch.cat([attention_mask, new_mask], dim=1)
+        start = time.perf_counter()
+        out = _continuation_forward(
+            model,
+            input_ids=ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            device=device,
+        )
+        elapsed += time.perf_counter() - start
+        past_key_values = out.past_key_values
+        logits = out.logits
+        forwarded += n_tok
+    return past_key_values, attention_mask, logits, forwarded, elapsed
+
+
 def _append_static(
     model,
     tokenizer,
@@ -215,22 +290,17 @@ def _append_static(
         ids = torch.tensor([token_ids], dtype=torch.long, device=device)
     else:
         ids = _tokenize(tokenizer, text, device)
-    token_count = int(ids.shape[1])
-    if token_count == 0:
-        return past_key_values, attention_mask, logits, 0, 0.0
-    pos_kwargs = _decode_position_kwargs(model, past_key_values, token_count, device)
-    new_mask = torch.ones((attention_mask.shape[0], token_count), dtype=attention_mask.dtype, device=device)
-    attention_mask = torch.cat([attention_mask, new_mask], dim=1)
-    start = time.perf_counter()
-    out = _model_forward(
+    token_ids = [int(x) for x in ids[0].tolist()]
+    tokenwise = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_STATIC_TOKENWISE", "0")
+    return _forward_token_ids(
         model,
-        input_ids=ids,
-        attention_mask=attention_mask,
+        token_ids=token_ids,
         past_key_values=past_key_values,
-        **pos_kwargs,
+        attention_mask=attention_mask,
+        logits=logits,
+        device=device,
+        tokenwise=tokenwise,
     )
-    elapsed = time.perf_counter() - start
-    return out.past_key_values, attention_mask, out.logits, token_count, elapsed
 
 
 def _decode_until(
@@ -273,21 +343,16 @@ def _decode_until(
                 stop_idx = idx if stop_idx is None else min(stop_idx, idx)
         rendered = raw if stop_idx is None else raw[:stop_idx]
 
-        token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=device)
-        pos_kwargs = _decode_position_kwargs(model, past_key_values, 1, device)
-        new_mask = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=device)
-        attention_mask = torch.cat([attention_mask, new_mask], dim=1)
-        start = time.perf_counter()
-        out = _model_forward(
+        past_key_values, attention_mask, logits, _, step_elapsed = _forward_token_ids(
             model,
-            input_ids=token_tensor,
-            attention_mask=attention_mask,
+            token_ids=[token_id],
             past_key_values=past_key_values,
-            **pos_kwargs,
+            attention_mask=attention_mask,
+            logits=logits,
+            device=device,
+            tokenwise=False,
         )
-        elapsed += time.perf_counter() - start
-        past_key_values = out.past_key_values
-        logits = out.logits
+        elapsed += step_elapsed
 
         if stop_idx is not None:
             return rendered.strip(), raw, ids, past_key_values, attention_mask, logits, steps, True, None, elapsed
@@ -335,18 +400,27 @@ def _normalize_gui_closed_set(text: str) -> str:
     return str(text or "").strip().upper()
 
 
-def _match_gui_closed_set(raw: str, candidates: tuple[str, ...], allow_boundary_chars: str) -> tuple[bool, str, str, str | None]:
+def _match_gui_closed_set(
+    raw: str,
+    candidates: tuple[str, ...],
+    allow_boundary_chars: str,
+    *,
+    accept_exact: bool = True,
+) -> tuple[bool, str, str, str | None]:
     text = str(raw or "").lstrip()
     upper = text.upper()
+    stripped_upper = upper.strip().upper()
     for cand in candidates:
         cand_upper = cand.upper()
         if upper == cand_upper:
-            return True, cand, text[: len(cand)], ""
+            if accept_exact:
+                return True, cand, text[: len(cand)], ""
+            return False, "", "", None
         if upper.startswith(cand_upper):
             suffix = text[len(cand):]
             if suffix and suffix[0] in allow_boundary_chars and suffix.strip(allow_boundary_chars + " \n\r\t") == "":
                 return True, cand, text[: len(cand)], suffix
-    if any(cand.upper().startswith(upper.strip().upper()) for cand in candidates):
+    if any(cand.upper().startswith(stripped_upper) for cand in candidates):
         return False, "", "", None
     return False, "", "", "closed_set_no_prefix"
 
@@ -364,6 +438,7 @@ def _decode_gui_closed_set(
     allow_boundary_chars: str,
     max_tokens: int,
     slot_name: str,
+    accept_exact: bool = True,
 ) -> tuple[str, str, str, list[int], Any, torch.Tensor, torch.Tensor, int, bool, str | None, float]:
     ids: list[int] = []
     raw = ""
@@ -383,23 +458,20 @@ def _decode_gui_closed_set(
         ids.append(token_id)
         raw = _decode_ids(tokenizer, ids)
 
-        token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=device)
-        pos_kwargs = _decode_position_kwargs(model, past_key_values, 1, device)
-        new_mask = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=device)
-        attention_mask = torch.cat([attention_mask, new_mask], dim=1)
-        start = time.perf_counter()
-        out = _model_forward(
+        past_key_values, attention_mask, logits, _, step_elapsed = _forward_token_ids(
             model,
-            input_ids=token_tensor,
-            attention_mask=attention_mask,
+            token_ids=[token_id],
             past_key_values=past_key_values,
-            **pos_kwargs,
+            attention_mask=attention_mask,
+            logits=logits,
+            device=device,
+            tokenwise=False,
         )
-        elapsed += time.perf_counter() - start
-        past_key_values = out.past_key_values
-        logits = out.logits
+        elapsed += step_elapsed
 
-        done, canonical, rendered, suffix_or_reason = _match_gui_closed_set(raw, candidates, allow_boundary_chars)
+        done, canonical, rendered, suffix_or_reason = _match_gui_closed_set(
+            raw, candidates, allow_boundary_chars, accept_exact=accept_exact
+        )
         if done:
             return canonical, raw, suffix_or_reason or "", ids, past_key_values, attention_mask, logits, len(ids), True, None, elapsed
         if suffix_or_reason == "closed_set_no_prefix":
@@ -417,6 +489,15 @@ def _gui_static_tail_from_suffix(suffix: str, expected: str) -> str | None:
     if expected.startswith(suffix):
         return expected[len(suffix):]
     return None
+
+
+def _gui_rendered_prefix(raw: str, suffix: str, fallback: str) -> str:
+    text = str(raw or "").lstrip()
+    suffix = str(suffix or "")
+    if suffix and text.endswith(suffix):
+        text = text[: -len(suffix)]
+    text = text.strip()
+    return text or str(fallback or "")
 
 
 def _valid_gui_coord_pair(text: str) -> bool:
@@ -708,6 +789,7 @@ def _gui_structured_fast_decode(
     action_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS", 16)
     gui_direction_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_GUI_DIRECTION_MAX_TOKENS", 8)
     gui_coord_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_GUI_COORD_MAX_TOKENS", 24)
+    gui_require_action_separator = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_GUI_REQUIRE_ACTION_SEPARATOR", "1")
     debug = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0")
     sample_index = str((sample_meta or {}).get("sample_index", ""))
 
@@ -746,6 +828,7 @@ def _gui_structured_fast_decode(
                 allow_boundary_chars=": ()\n\r\t",
                 max_tokens=action_max_tokens,
                 slot_name="gui_action_head",
+                accept_exact=not gui_require_action_separator,
             )
             dynamic_steps += steps
             dynamic_s += elapsed
@@ -764,6 +847,7 @@ def _gui_structured_fast_decode(
             if not ok or not action_head:
                 meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": reason or "gui_empty_action_head"})
                 return None, meta
+            action_rendered = _gui_rendered_prefix(raw_head, head_suffix, action_head)
             if action_head == "TYPE":
                 meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": "gui_type_free_text_fallback"})
                 return None, meta
@@ -771,7 +855,7 @@ def _gui_structured_fast_decode(
                 if head_suffix.strip():
                     meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_terminal_suffix_unexpected:{head_suffix!r}"})
                     return None, meta
-                final_text = action_head
+                final_text = action_rendered
                 template_schema = "gui_terminal_command"
             elif action_head == "SCROLL":
                 tail = _gui_static_tail_from_suffix(head_suffix, ": ")
@@ -787,7 +871,7 @@ def _gui_structured_fast_decode(
                         attention_mask=attention_mask,
                         logits=logits,
                         device=device,
-                        prefix_text=action_head + head_suffix,
+                        prefix_text=action_rendered + head_suffix,
                     )
                     static_token_count += n_tok
                     static_steps += int(n_tok > 0)
@@ -825,7 +909,8 @@ def _gui_structured_fast_decode(
                 if direction_suffix.strip():
                     meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_direction_suffix_unexpected:{direction_suffix!r}"})
                     return None, meta
-                final_text = f"{action_head}: {direction}"
+                direction_rendered = _gui_rendered_prefix(raw_direction, direction_suffix, direction)
+                final_text = f"{action_rendered}: {direction_rendered}"
                 template_schema = "gui_scroll_command"
             elif action_head in GUI_COORD_ACTIONS:
                 tail = _gui_static_tail_from_suffix(head_suffix, ": (")
@@ -841,7 +926,7 @@ def _gui_structured_fast_decode(
                         attention_mask=attention_mask,
                         logits=logits,
                         device=device,
-                        prefix_text=action_head + head_suffix,
+                        prefix_text=action_rendered + head_suffix,
                     )
                     static_token_count += n_tok
                     static_steps += int(n_tok > 0)
@@ -882,7 +967,7 @@ def _gui_structured_fast_decode(
                 if not _valid_gui_coord_pair(coord_pair):
                     meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"gui_coord_invalid:{coord_pair!r}"})
                     return None, meta
-                final_text = f"{action_head}: ({coord_pair})"
+                final_text = f"{action_rendered}: ({coord_pair})"
                 template_schema = "gui_coord_command"
             else:
                 meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"unsupported_gui_action:{action_head}"})
@@ -910,6 +995,7 @@ def _gui_structured_fast_decode(
             "structured_fast_decode_prefill_s": float(prefill_s),
             "structured_fast_decode_action": action_head,
             "structured_fast_decode_action_normalized": action_head.lower(),
+            "structured_fast_decode_gui_require_action_separator": bool(gui_require_action_separator),
             "structured_fast_decode_bbox": coord_pair,
             "structured_fast_decode_direction": direction,
         }
@@ -924,6 +1010,7 @@ def _gui_structured_fast_decode(
             f"static_forward_steps={static_steps} "
             f"static_tokens={static_token_count} "
             f"dynamic_forward_steps={dynamic_steps} "
+            f"require_action_separator={int(gui_require_action_separator)} "
             f"action={action_head!r} "
             f"coord_pair={coord_pair!r} "
             f"direction={direction!r} "

@@ -13,6 +13,7 @@ from .official_eval import (
     use_official_android_control_eval,
 )
 from .state_packet import build_state_packet, state_packet_debug_enabled, state_packet_enabled
+from ..utils.current_delta_packet import DeltaPacketConfig, build_current_delta_packet
 
 
 PROMPT_TEMPLATE = """
@@ -67,6 +68,13 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return float(default)
+
+
 def _debug_print_enabled() -> bool:
     return _env_flag("ANDROID_CONTROL_DEBUG_HISTORY_PROMPT", "0")
 
@@ -77,6 +85,61 @@ def _sequential_order_enabled() -> bool:
 
 def _keep_prompt_template_enabled() -> bool:
     return _env_flag("ANDROID_CONTROL_HISTORY_KEEP_SYSTEM_PROMPT", "0")
+
+
+def _current_delta_packet_enabled() -> bool:
+    return _env_flag("ANDROID_CONTROL_CURRENT_DELTA_PACKET_ENABLE", "0")
+
+
+def _current_delta_debug_enabled() -> bool:
+    return _env_flag("ANDROID_CONTROL_CURRENT_DELTA_PACKET_DEBUG", "0")
+
+
+def _current_delta_cache_dir() -> str:
+    root = os.environ.get("ANDROID_CONTROL_CURRENT_DELTA_PACKET_CACHE_DIR", "").strip()
+    if root:
+        return root
+    return os.environ.get("ANDROID_CONTROL_STATE_PACKET_CACHE_DIR", "/tmp/android_control_state_packet_cache")
+
+
+def _current_delta_config() -> DeltaPacketConfig:
+    # AndroidControl owns the env var names; the shared config keeps the delta
+    # packet builder reusable by GUI Odyssey and other sequential GUI datasets.
+    return DeltaPacketConfig(
+        cache_dir=_current_delta_cache_dir(),
+        patch_size=max(1, _env_int("ANDROID_CONTROL_CURRENT_DELTA_PACKET_PATCH_SIZE", _env_int("ANDROID_CONTROL_STATE_PACKET_PATCH_SIZE", 16))),
+        merge_size=max(1, _env_int("ANDROID_CONTROL_CURRENT_DELTA_PACKET_MERGE_SIZE", _env_int("ANDROID_CONTROL_STATE_PACKET_MERGE_SIZE", 2))),
+        thumb_long_edge=max(32, _env_int("ANDROID_CONTROL_CURRENT_DELTA_PACKET_THUMB_LONG_EDGE", 192)),
+        roi_long_edge=max(32, _env_int("ANDROID_CONTROL_CURRENT_DELTA_PACKET_ROI_LONG_EDGE", 224)),
+        max_delta_rois=max(0, _env_int("ANDROID_CONTROL_CURRENT_DELTA_PACKET_MAX_ROIS", 2)),
+        min_roi_side_px=max(32, _env_int("ANDROID_CONTROL_CURRENT_DELTA_PACKET_ROI_MIN_SIDE_PX", 160)),
+        roi_pad_ratio=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_ROI_PAD_RATIO", 0.18)),
+        diff_threshold=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_DIFF_THRESHOLD", 26.0)),
+        large_change_ratio=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_LARGE_CHANGE_RATIO", 0.42)),
+        small_change_ratio=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_SMALL_CHANGE_RATIO", 0.015)),
+        min_component_area_ratio=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_MIN_COMPONENT_AREA_RATIO", 0.004)),
+        nms_iou_threshold=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_NMS_IOU", 0.45)),
+        max_roi_area_ratio=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_MAX_ROI_AREA_RATIO", 0.45)),
+        align_long_edge=max(32, _env_int("ANDROID_CONTROL_CURRENT_DELTA_PACKET_ALIGN_LONG_EDGE", 192)),
+        align_max_shift_ratio=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_ALIGN_MAX_SHIFT_RATIO", 0.35)),
+        align_step_px=max(1, _env_int("ANDROID_CONTROL_CURRENT_DELTA_PACKET_ALIGN_STEP_PX", 8)),
+        diff_mode=os.environ.get("ANDROID_CONTROL_CURRENT_DELTA_PACKET_DIFF_MODE", "illumination_invariant").strip() or "illumination_invariant",
+        local_contrast_radius=max(1, _env_int("ANDROID_CONTROL_CURRENT_DELTA_PACKET_LOCAL_CONTRAST_RADIUS", 9)),
+        edge_weight=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_EDGE_WEIGHT", 0.45)),
+        contrast_weight=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_CONTRAST_WEIGHT", 0.35)),
+        rank_weight=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_RANK_WEIGHT", 0.20)),
+        action_focus_boost=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_ACTION_FOCUS_BOOST", 1.35)),
+        action_outside_decay=max(0.0, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_ACTION_OUTSIDE_DECAY", 0.55)),
+        text_top_band_ratio=max(0.01, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_TEXT_TOP_BAND_RATIO", 0.16)),
+        text_bottom_band_ratio=max(0.01, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_TEXT_BOTTOM_BAND_RATIO", 0.42)),
+        tap_context_side_ratio=max(0.01, _env_float("ANDROID_CONTROL_CURRENT_DELTA_PACKET_TAP_CONTEXT_SIDE_RATIO", 0.42)),
+        persistent_prior_on_small_change=_env_flag("ANDROID_CONTROL_CURRENT_DELTA_PACKET_PERSISTENT_PRIOR", "1"),
+        persistent_prior_on_medium_change=_env_flag("ANDROID_CONTROL_CURRENT_DELTA_PACKET_PERSISTENT_PRIOR_ON_MEDIUM_CHANGE", "1"),
+        full_on_large_change=_env_flag("ANDROID_CONTROL_CURRENT_DELTA_PACKET_FULL_ON_LARGE_CHANGE", "1"),
+        full_on_large_roi=_env_flag("ANDROID_CONTROL_CURRENT_DELTA_PACKET_FULL_ON_LARGE_ROI", "1"),
+        visualize=_env_flag("ANDROID_CONTROL_CURRENT_DELTA_PACKET_VISUALIZE", "0"),
+        visualize_dir=os.environ.get("ANDROID_CONTROL_CURRENT_DELTA_PACKET_VIS_DIR", "").strip() or None,
+    )
 
 
 def _normalize_candidate_actions(val):
@@ -286,7 +349,9 @@ class AndroidControlCurated(ImageBaseDataset):
         self.sequential_order = _sequential_order_enabled()
         self.history_keep_prompt_template = _keep_prompt_template_enabled()
         self.use_history_state_packet = state_packet_enabled()
+        self.use_current_delta_packet = _current_delta_packet_enabled()
         self._state_packet_records = []
+        self._current_delta_packet_records = []
         self.max_history_images = max(
             0,
             _env_int("ANDROID_CONTROL_MAX_HISTORY_IMAGES", 0)
@@ -541,38 +606,176 @@ class AndroidControlCurated(ImageBaseDataset):
             )
         return entries
 
+    def _build_current_gt_packet(self, line) -> dict:
+        # Visualization-only GT payload; it is not inserted into the model
+        # prompt and only helps audit whether selected ROIs cover the target.
+        gt_bbox = line.get("gt_max_bbox", None)
+        if gt_bbox is None:
+            gt_bbox = line.get("gt_min_bbox", None)
+        return {
+            "gt_action": line.get("gt_action", ""),
+            "gt_bbox": gt_bbox,
+            "gt_coordinate": line.get("gt_coordinate", None),
+            "step_instruction": line.get("step_instruction", ""),
+            "instruction": line.get("instruction", ""),
+        }
+
+    def _build_current_visual_entries(
+        self,
+        *,
+        sample_index: str,
+        current_image_path: str,
+        history_image_paths: List[str],
+        history_action_packets: List[dict],
+        current_gt_packet: dict = None,
+    ):
+        # Current-frame packetization is isolated here so the rest of prompt
+        # construction can consume either a full screenshot or a delta packet.
+        if not self.use_current_delta_packet:
+            return [
+                dict(
+                    kind="current_full",
+                    images=[dict(type="image", value=current_image_path)],
+                    debug_items=[
+                        dict(
+                            kind="current_full",
+                            path=current_image_path,
+                            crop_xyxy=None,
+                            estimated_tokens=None,
+                        )
+                    ],
+                    packet_meta=None,
+                )
+            ]
+        reference_image_path = history_image_paths[-1] if history_image_paths else None
+        previous_action_packet = history_action_packets[-1] if history_action_packets else None
+        packet_images, packet_meta = build_current_delta_packet(
+            current_image_path=current_image_path,
+            reference_image_path=reference_image_path,
+            previous_action_packet=previous_action_packet,
+            sample_index=str(sample_index),
+            cfg=_current_delta_config(),
+            current_gt_packet=current_gt_packet,
+        )
+        packet_meta["dataset_name"] = str(self.dataset_name)
+        self._current_delta_packet_records.append(packet_meta)
+        debug_items = []
+        for item in packet_images:
+            debug_items.append(
+                dict(
+                    kind=item.kind,
+                    path=item.path,
+                    crop_xyxy=item.crop_xyxy,
+                    estimated_tokens=item.estimated_tokens,
+                )
+            )
+        if _current_delta_debug_enabled():
+            print(
+                "[AndroidControlCurrentDeltaPacket] "
+                f"sample_index={packet_meta.get('sample_index')} "
+                f"route={packet_meta.get('route')} "
+                f"reason={packet_meta.get('route_reason')} "
+                f"action_kind={packet_meta.get('action_kind')} "
+                f"diff_mode={packet_meta.get('diff_mode')} "
+                f"change_ratio={packet_meta.get('delta_change_ratio')} "
+                f"thresholds=({packet_meta.get('small_change_ratio_threshold')},{packet_meta.get('large_change_ratio_threshold')}) "
+                f"shift=({packet_meta.get('alignment_shift_dx')},{packet_meta.get('alignment_shift_dy')}) "
+                f"components={packet_meta.get('delta_component_count')} "
+                f"action_candidates={packet_meta.get('action_candidate_crop_xyxy')} "
+                f"images={packet_meta.get('current_delta_image_count')} "
+                f"orig_tokens_est={packet_meta.get('original_estimated_tokens')} "
+                f"packet_tokens_est={packet_meta.get('packet_estimated_tokens')} "
+                f"delta_rois={packet_meta.get('delta_roi_crop_xyxy')} "
+                f"gt_action={packet_meta.get('gt_action')} "
+                f"gt_bbox={packet_meta.get('gt_bbox_crop_xyxy')} "
+                f"large_rois={packet_meta.get('large_roi_crop_xyxy')} "
+                f"persistent_prior={packet_meta.get('persistent_prior_crop_xyxy')} "
+                f"vis={packet_meta.get('visualization_path')} "
+                f"total_s={float(packet_meta.get('current_delta_total_s', 0.0)):.6f}",
+                flush=True,
+            )
+        return [
+            dict(
+                kind=str(packet_meta.get("route", "current_delta")),
+                images=[item.to_message_item() for item in packet_images],
+                debug_items=debug_items,
+                packet_meta=packet_meta,
+            )
+        ]
+
     def summarize_state_packet_records(self):
         recs = list(getattr(self, "_state_packet_records", []) or [])
-        if not recs:
-            return {}
-        count = float(len(recs))
-        orig_tokens = float(sum(float(r.get("original_estimated_tokens", 0.0) or 0.0) for r in recs))
-        packet_tokens = float(sum(float(r.get("packet_estimated_tokens", 0.0) or 0.0) for r in recs))
-        thumb_tokens = float(sum(float(r.get("thumbnail_estimated_tokens", 0.0) or 0.0) for r in recs))
-        roi_tokens = float(sum(float(r.get("roi_estimated_tokens", 0.0) or 0.0) for r in recs))
-        open_s = float(sum(float(r.get("open_image_s", 0.0) or 0.0) for r in recs))
-        thumb_s = float(sum(float(r.get("thumbnail_build_s", 0.0) or 0.0) for r in recs))
-        roi_s = float(sum(float(r.get("roi_build_s", 0.0) or 0.0) for r in recs))
-        total_s = float(sum(float(r.get("state_packet_total_s", 0.0) or 0.0) for r in recs))
-        return {
-            "state_packet_enabled": bool(self.use_history_state_packet),
-            "state_packet_history_image_count": int(count),
-            "avg_state_packet_original_estimated_tokens": float(orig_tokens / count),
-            "avg_state_packet_packet_estimated_tokens": float(packet_tokens / count),
-            "avg_state_packet_thumbnail_estimated_tokens": float(thumb_tokens / count),
-            "avg_state_packet_roi_estimated_tokens": float(roi_tokens / count),
-            "state_packet_total_original_estimated_tokens": float(orig_tokens),
-            "state_packet_total_packet_estimated_tokens": float(packet_tokens),
-            "state_packet_avg_compression_ratio": float(packet_tokens / max(1.0, orig_tokens)),
-            "avg_state_packet_open_image_s": float(open_s / count),
-            "avg_state_packet_thumbnail_build_s": float(thumb_s / count),
-            "avg_state_packet_roi_build_s": float(roi_s / count),
-            "avg_state_packet_total_s": float(total_s / count),
-            "total_state_packet_open_image_s": float(open_s),
-            "total_state_packet_thumbnail_build_s": float(thumb_s),
-            "total_state_packet_roi_build_s": float(roi_s),
-            "total_state_packet_total_s": float(total_s),
-        }
+        summary = {}
+        if recs:
+            count = float(len(recs))
+            orig_tokens = float(sum(float(r.get("original_estimated_tokens", 0.0) or 0.0) for r in recs))
+            packet_tokens = float(sum(float(r.get("packet_estimated_tokens", 0.0) or 0.0) for r in recs))
+            thumb_tokens = float(sum(float(r.get("thumbnail_estimated_tokens", 0.0) or 0.0) for r in recs))
+            roi_tokens = float(sum(float(r.get("roi_estimated_tokens", 0.0) or 0.0) for r in recs))
+            open_s = float(sum(float(r.get("open_image_s", 0.0) or 0.0) for r in recs))
+            thumb_s = float(sum(float(r.get("thumbnail_build_s", 0.0) or 0.0) for r in recs))
+            roi_s = float(sum(float(r.get("roi_build_s", 0.0) or 0.0) for r in recs))
+            total_s = float(sum(float(r.get("state_packet_total_s", 0.0) or 0.0) for r in recs))
+            summary.update(
+                {
+                    "state_packet_enabled": bool(self.use_history_state_packet),
+                    "state_packet_history_image_count": int(count),
+                    "avg_state_packet_original_estimated_tokens": float(orig_tokens / count),
+                    "avg_state_packet_packet_estimated_tokens": float(packet_tokens / count),
+                    "avg_state_packet_thumbnail_estimated_tokens": float(thumb_tokens / count),
+                    "avg_state_packet_roi_estimated_tokens": float(roi_tokens / count),
+                    "state_packet_total_original_estimated_tokens": float(orig_tokens),
+                    "state_packet_total_packet_estimated_tokens": float(packet_tokens),
+                    "state_packet_avg_compression_ratio": float(packet_tokens / max(1.0, orig_tokens)),
+                    "avg_state_packet_open_image_s": float(open_s / count),
+                    "avg_state_packet_thumbnail_build_s": float(thumb_s / count),
+                    "avg_state_packet_roi_build_s": float(roi_s / count),
+                    "avg_state_packet_total_s": float(total_s / count),
+                    "total_state_packet_open_image_s": float(open_s),
+                    "total_state_packet_thumbnail_build_s": float(thumb_s),
+                    "total_state_packet_roi_build_s": float(roi_s),
+                    "total_state_packet_total_s": float(total_s),
+                }
+            )
+        current_recs = list(getattr(self, "_current_delta_packet_records", []) or [])
+        if current_recs:
+            count = float(len(current_recs))
+            orig_tokens = float(sum(float(r.get("original_estimated_tokens", 0.0) or 0.0) for r in current_recs))
+            packet_tokens = float(sum(float(r.get("packet_estimated_tokens", 0.0) or 0.0) for r in current_recs))
+            total_s = float(sum(float(r.get("current_delta_total_s", 0.0) or 0.0) for r in current_recs))
+            component_count = float(sum(float(r.get("delta_component_count", 0.0) or 0.0) for r in current_recs))
+            image_count = float(sum(float(r.get("current_delta_image_count", 0.0) or 0.0) for r in current_recs))
+            roi_count = float(sum(float(r.get("current_delta_roi_count", 0.0) or 0.0) for r in current_recs))
+            visualized = sum(1 for r in current_recs if str(r.get("visualization_path", "") or "").strip())
+            route_counts = {}
+            reason_counts = {}
+            for r in current_recs:
+                route = str(r.get("route", "unknown"))
+                route_counts[route] = route_counts.get(route, 0) + 1
+                reason = str(r.get("route_reason", "unknown"))
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            ratios = [float(r.get("delta_change_ratio", 0.0) or 0.0) for r in current_recs if r.get("delta_change_ratio", None) is not None]
+            summary.update(
+                {
+                    "current_delta_packet_enabled": bool(self.use_current_delta_packet),
+                    "current_delta_packet_sample_count": int(count),
+                    "current_delta_packet_route_counts": route_counts,
+                    "current_delta_packet_reason_counts": reason_counts,
+                    "avg_current_delta_original_estimated_tokens": float(orig_tokens / count),
+                    "avg_current_delta_packet_estimated_tokens": float(packet_tokens / count),
+                    "current_delta_total_original_estimated_tokens": float(orig_tokens),
+                    "current_delta_total_packet_estimated_tokens": float(packet_tokens),
+                    "current_delta_avg_compression_ratio": float(packet_tokens / max(1.0, orig_tokens)),
+                    "avg_current_delta_component_count": float(component_count / count),
+                    "avg_current_delta_image_count": float(image_count / count),
+                    "avg_current_delta_roi_count": float(roi_count / count),
+                    "current_delta_visualized_count": int(visualized),
+                    "avg_current_delta_total_s": float(total_s / count),
+                    "total_current_delta_total_s": float(total_s),
+                    "avg_current_delta_change_ratio": float(sum(ratios) / max(1, len(ratios))),
+                }
+            )
+        return summary
 
     def _build_reference_style_intro(self, instruction: str) -> str:
         return (
@@ -586,6 +789,7 @@ class AndroidControlCurated(ImageBaseDataset):
             "Output exactly in the following format:\n"
             "<answer>{\"bbox_2d\": [x1, y1, x2, y2], \"action_type\": ACTION_TYPE}</answer>\n"
             "The final image is the current screenshot. Predict bbox_2d on the current screenshot only. "
+            "If current region crops are provided, their crop_xyxy labels are in original current screenshot coordinates. "
             "Use absolute screen coordinates. "
             "ACTION_TYPE includes: click, long_press, swipe:up, swipe:down, swipe:left, swipe:right, "
             "input_text: some text, wait, navigate_back, navigate_home, open_app:app_name.\n"
@@ -602,8 +806,70 @@ class AndroidControlCurated(ImageBaseDataset):
         return (
             "Provide the next action only using the required JSON format. "
             "The final image is the current screenshot. "
-            "Predict bbox_2d on the current screenshot only."
+            "Predict bbox_2d on the original current screenshot only. "
+            "If current region crops are provided, their crop_xyxy labels are in original current screenshot coordinates."
         )
+
+    def _current_image_label(self, kind: str) -> str:
+        label_map = {
+            "current_full": "Current Screenshot",
+            "current_thumbnail": "Current Global Thumbnail",
+            "current_delta_roi_1": "Current Delta Region 1",
+            "current_delta_roi_2": "Current Delta Region 2",
+            "current_delta_roi_3": "Current Delta Region 3",
+            "current_delta_roi_4": "Current Delta Region 4",
+            "current_persistent_prior_roi": "Current Persistent Prior Region",
+        }
+        return label_map.get(str(kind), str(kind).replace("_", " ").title())
+
+    def _append_current_visual_entries(self, msgs: list, debug_parts: list, current_entries: list):
+        # Each crop label carries original-image crop_xyxy, so the model can
+        # reason over cropped views while still predicting full-screen coords.
+        for entry in current_entries:
+            for image_item, debug_item in zip(entry.get("images", []), entry.get("debug_items", [])):
+                kind = str(debug_item.get("kind", "current_image"))
+                label = self._current_image_label(kind)
+                debug_parts.append(
+                    f"{label}: {debug_item.get('path')} crop_xyxy={debug_item.get('crop_xyxy')} "
+                    f"est_tokens={debug_item.get('estimated_tokens')}"
+                )
+                crop_xyxy = debug_item.get("crop_xyxy")
+                if crop_xyxy is not None:
+                    msgs.append(dict(type="text", value=f"{label} crop_xyxy={list(crop_xyxy)}:"))
+                else:
+                    msgs.append(dict(type="text", value=f"{label}:"))
+                msgs.append(dict(image_item))
+
+    def _debug_print_current_delta_entries(self, current_entries: list) -> None:
+        if not _current_delta_debug_enabled():
+            return
+        for entry in current_entries:
+            packet_meta = entry.get("packet_meta", None)
+            if not isinstance(packet_meta, dict):
+                continue
+            print(
+                "[AndroidControlCurrentDeltaPacketPrompt] "
+                f"sample_index={packet_meta.get('sample_index')} "
+                f"route={packet_meta.get('route')} "
+                f"reason={packet_meta.get('route_reason')} "
+                f"action_kind={packet_meta.get('action_kind')} "
+                f"diff_mode={packet_meta.get('diff_mode')} "
+                f"orig_tokens_est={packet_meta.get('original_estimated_tokens')} "
+                f"packet_tokens_est={packet_meta.get('packet_estimated_tokens')} "
+                f"change_ratio={packet_meta.get('delta_change_ratio')} "
+                f"thresholds=({packet_meta.get('small_change_ratio_threshold')},{packet_meta.get('large_change_ratio_threshold')}) "
+                f"shift=({packet_meta.get('alignment_shift_dx')},{packet_meta.get('alignment_shift_dy')}) "
+                f"components={packet_meta.get('delta_component_count')} "
+                f"action_candidates={packet_meta.get('action_candidate_crop_xyxy')} "
+                f"images={packet_meta.get('current_delta_image_count')} "
+                f"delta_rois={packet_meta.get('delta_roi_crop_xyxy')} "
+                f"gt_action={packet_meta.get('gt_action')} "
+                f"gt_bbox={packet_meta.get('gt_bbox_crop_xyxy')} "
+                f"large_rois={packet_meta.get('large_roi_crop_xyxy')} "
+                f"persistent_prior={packet_meta.get('persistent_prior_crop_xyxy')} "
+                f"vis={packet_meta.get('visualization_path')}",
+                flush=True,
+            )
 
     def _maybe_debug_print_prompt(
         self,
@@ -666,6 +932,13 @@ class AndroidControlCurated(ImageBaseDataset):
             history_image_paths=history_image_paths,
             history_action_packets=hist_action_packets_kept,
         )
+        current_entries = self._build_current_visual_entries(
+            sample_index=str(line.get("index", "")),
+            current_image_path=current_image_path,
+            history_image_paths=history_image_paths,
+            history_action_packets=hist_action_packets_kept,
+            current_gt_packet=self._build_current_gt_packet(line),
+        )
         if self.history_keep_prompt_template:
             intro = self._build_keep_prompt_intro(instruction, history)
             outro = self._build_keep_prompt_outro()
@@ -692,7 +965,7 @@ class AndroidControlCurated(ImageBaseDataset):
                         msgs.append(dict(type="text", value=f"HistoryStep_{i} {label}:"))
                         msgs.append(dict(image_item))
                     msgs.append(dict(type="text", value=f"{i + 1}. {action_text}\n"))
-            debug_parts.append(f"Current Screenshot: [CURRENT_IMAGE] {current_image_path}")
+            self._append_current_visual_entries(msgs, debug_parts, current_entries)
             debug_parts.append(outro)
             self._maybe_debug_print_prompt(
                 line=line,
@@ -701,9 +974,8 @@ class AndroidControlCurated(ImageBaseDataset):
                 history_text=history,
                 prompt="\n".join(debug_parts),
             )
-            msgs.append(dict(type="text", value="Current Screenshot:"))
-            msgs.append(dict(type="image", value=current_image_path))
             msgs.append(dict(type="text", value=outro))
+            self._debug_print_current_delta_entries(current_entries)
             if state_packet_debug_enabled() and history_entries:
                 for entry in history_entries:
                     packet_meta = entry.get("packet_meta", None)
@@ -735,7 +1007,10 @@ class AndroidControlCurated(ImageBaseDataset):
                 i = int(entry["history_index"])
                 action_text = str(entry["action_text"])
                 prompt += f"HistoryStep_{i}: [history packet images]\nStep_{i}: {action_text}.\n"
-        prompt += f"Image_{len(hist_actions_kept)}: [current screenshot]\n"
+        if self.use_current_delta_packet:
+            prompt += f"Image_{len(hist_actions_kept)}: [current delta packet images]\n"
+        else:
+            prompt += f"Image_{len(hist_actions_kept)}: [current screenshot]\n"
         prompt += self._build_reference_style_outro()
         self._maybe_debug_print_prompt(
             line=line,
@@ -759,9 +1034,10 @@ class AndroidControlCurated(ImageBaseDataset):
                     msgs.append(dict(type="text", value=f"HistoryStep_{i} {label}:"))
                     msgs.append(dict(image_item))
                 msgs.append(dict(type="text", value=f"Step_{i}: {action_text}.\n"))
-        msgs.append(dict(type="text", value=f"Image_{len(hist_actions_kept)}:"))
-        msgs.append(dict(type="image", value=current_image_path))
+        current_debug_parts = []
+        self._append_current_visual_entries(msgs, current_debug_parts, current_entries)
         msgs.append(dict(type="text", value=self._build_reference_style_outro()))
+        self._debug_print_current_delta_entries(current_entries)
         if state_packet_debug_enabled() and history_entries:
             for entry in history_entries:
                 packet_meta = entry.get("packet_meta", None)

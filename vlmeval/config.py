@@ -1176,12 +1176,38 @@ qwen3vl_series = {
         top_p=0.8,
         top_k=20
     ),
+    "Qwen3-VL-8B-Instruct-AttnPrune": partial(
+        Qwen3VLChat,
+        model_path="/mnt/storage/users/ytshen_data/Qwen3-VL-8B-Instruct",
+        use_custom_prompt=False,
+        use_vllm=False,
+        use_attn_prune=True,
+        temperature=0.7,
+        max_new_tokens=16384,
+        repetition_penalty=1.0,
+        presence_penalty=1.5,
+        top_p=0.8,
+        top_k=20
+    ),
     "Qwen3-VL-4B-Instruct": partial(
         Qwen3VLChat,
         model_path="/mnt/storage/users/ytshen_data/Qwen3-VL-4B-Instruct",
         use_custom_prompt=False,
         use_vllm=False,
         temperature=0.7, 
+        max_new_tokens=16384,
+        repetition_penalty=1.0,
+        presence_penalty=1.5,
+        top_p=0.8,
+        top_k=20
+    ),
+    "Qwen3-VL-4B-Instruct-AttnPrune": partial(
+        Qwen3VLChat,
+        model_path="/mnt/storage/users/ytshen_data/Qwen3-VL-4B-Instruct",
+        use_custom_prompt=False,
+        use_vllm=False,
+        use_attn_prune=True,
+        temperature=0.7,
         max_new_tokens=16384,
         repetition_penalty=1.0,
         presence_penalty=1.5,

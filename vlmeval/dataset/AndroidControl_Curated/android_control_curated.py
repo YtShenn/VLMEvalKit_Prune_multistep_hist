@@ -428,10 +428,45 @@ class AndroidControlCurated(ImageBaseDataset):
         running = []
         for _, row in group.iterrows():
             prev_texts.append(list(running))
-            step_inst = str(row.get("step_instruction", "")).strip()
-            if step_inst:
-                running.append(step_inst)
+            action_text = self._format_step_action_text(row)
+            if action_text:
+                running.append(action_text)
         return prev_texts
+
+    def _format_step_action_text(self, row) -> str:
+        step_inst = row.get("step_instruction", "")
+        if self._has_action_value(step_inst):
+            return str(step_inst).strip()
+        instruction = row.get("instruction", "")
+        if self._has_action_value(instruction):
+            return str(instruction).strip()
+
+        action_type = str(row.get("gt_action", "") or "").strip()
+        if not action_type:
+            return ""
+
+        parts = [f"action_type: {action_type}"]
+        gt_bbox = row.get("gt_max_bbox", None)
+        if gt_bbox is None:
+            gt_bbox = row.get("gt_min_bbox", None)
+        if self._has_action_value(gt_bbox):
+            parts.append(f"bbox_2d: {gt_bbox}")
+        gt_point = row.get("gt_coordinate", None)
+        if self._has_action_value(gt_point):
+            parts.append(f"point: {gt_point}")
+        return ", ".join(parts)
+
+    def _has_action_value(self, value) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (list, tuple, dict, set)):
+            return len(value) > 0
+        try:
+            if pd.isna(value):
+                return False
+        except Exception:
+            pass
+        return str(value).strip().lower() not in {"", "none", "nan", "null"}
 
     def _build_previous_action_packets(self, group: pd.DataFrame) -> List[List[dict]]:
         prev_packets = []
@@ -445,7 +480,7 @@ class AndroidControlCurated(ImageBaseDataset):
                 "gt_action": row.get("gt_action", ""),
                 "gt_coordinate": row.get("gt_coordinate", None),
                 "gt_bbox": gt_bbox,
-                "step_instruction": row.get("step_instruction", ""),
+                "step_instruction": self._format_step_action_text(row),
             }
             running.append(packet)
         return prev_packets

@@ -50,7 +50,22 @@ def _build_sample_meta(dataset_name, row, struct):
         'image_path': image_path,
         'image_paths': image_paths,
     }
-    for key in ('gt_action', 'answer', 'instruction', 'question', 'history', 'task_id', 'task_filename'):
+    for key in (
+        'gt_action',
+        'gt_coordinate',
+        'gt_bbox',
+        'gt_min_bbox',
+        'gt_max_bbox',
+        'gt_input_text',
+        'candidate_actions',
+        'answer',
+        'instruction',
+        'step_instruction',
+        'question',
+        'history',
+        'task_id',
+        'task_filename',
+    ):
         if key in row and row.get(key) is not None:
             meta[key] = row.get(key)
     return meta

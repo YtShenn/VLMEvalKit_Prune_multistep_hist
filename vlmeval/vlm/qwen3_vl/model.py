@@ -101,10 +101,8 @@ def _denorm_android_coord_values(vals, img_wh: tuple[int, int], base: float):
     return [int(round(x)) for x in out]
 
 
-def _postprocess_androidcontrol_response(response: str, message: list[dict], base: float) -> str:
+def _postprocess_androidcontrol_response(response: str, message: list[dict], base: float, denorm: bool = True) -> str:
     img_wh = _read_current_image_size_from_message(message)
-    if img_wh is None:
-        return response
 
     raw = str(response)
     tags = re.findall(r"<answer>(.*?)</answer>", raw, re.DOTALL)
@@ -124,13 +122,21 @@ def _postprocess_androidcontrol_response(response: str, message: list[dict], bas
         return response
 
     changed = False
-    for key in ("bbox_2d", "bbox", "point", "coordinate"):
-        if key in payload:
-            new_vals = _denorm_android_coord_values(payload[key], img_wh, base=base)
-            if new_vals != payload[key]:
-                payload[key] = new_vals
+    action_type = str(payload.get("action_type", "") or payload.get("type", "") or "").strip()
+    action_name = _normalize_action_name(action_type)
+    if action_name not in ("click", "long_press"):
+        for key in ("bbox_2d", "bbox", "point", "coordinate"):
+            if key in payload:
+                payload.pop(key, None)
                 changed = True
-            break
+    elif denorm and img_wh is not None:
+        for key in ("bbox_2d", "bbox", "point", "coordinate"):
+            if key in payload:
+                new_vals = _denorm_android_coord_values(payload[key], img_wh, base=base)
+                if new_vals != payload[key]:
+                    payload[key] = new_vals
+                    changed = True
+                break
     if not changed:
         return response
 
@@ -299,6 +305,14 @@ def _use_qwen3vl_timing_model() -> bool:
             _env_flag('QWEN3VL_ENABLE_ROI_PRUNE', '0'),
             _env_flag('QWEN3VL_USE_TIMING_MODEL', '0'),
         )
+    )
+
+
+def _use_qwen3vl_attn_prune_model(explicit: bool = False) -> bool:
+    return bool(
+        explicit
+        or _env_flag('QWEN3VL_ENABLE_ATTN_PRUNE', '0')
+        or _env_flag('QWEN3VL_USE_ATTN_PRUNE_MODEL', '0')
     )
 
 
@@ -720,10 +734,38 @@ def _configure_roi_prune_context(model, dataset: str | None, message: list[dict]
     enabled = _env_flag('QWEN3VL_ENABLE_ROI_PRUNE', '0')
     json_path = os.getenv('QWEN3VL_ROI_PRUNE_JSON', '').strip()
 
+    message_image_paths = []
+    message_sample_index = ''
+    message_question = ''
+    for item in message or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get('type') == 'image':
+            value = item.get('value')
+            if isinstance(value, str) and value:
+                p = value[len('file://'):] if value.startswith('file://') else value
+                if os.path.exists(p):
+                    message_image_paths.append(p)
+            if not message_sample_index and item.get('sample_index') is not None:
+                message_sample_index = str(item.get('sample_index'))
+            if not message_question and item.get('question') is not None:
+                message_question = str(item.get('question'))
+        elif item.get('type') == 'text' and not message_question:
+            text_value = str(item.get('value', '') or item.get('text', '') or '').strip()
+            if text_value:
+                message_question = text_value
+
     cfg._vlmeval_current_dataset_name = str(dataset or '')
-    cfg._vlmeval_current_sample_index = str((sample_meta or {}).get('sample_index', ''))
-    cfg._vlmeval_current_image_path = str((sample_meta or {}).get('image_path', ''))
-    cfg._vlmeval_current_image_paths = list((sample_meta or {}).get('image_paths', []) or [])
+    cfg._vlmeval_current_sample_index = str((sample_meta or {}).get('sample_index', '') or message_sample_index)
+    cfg._vlmeval_current_image_path = str((sample_meta or {}).get('image_path', '') or (message_image_paths[-1] if message_image_paths else ''))
+    cfg._vlmeval_current_image_paths = list((sample_meta or {}).get('image_paths', []) or message_image_paths)
+    cfg._vlmeval_current_question = str(
+        (sample_meta or {}).get('step_instruction', '')
+        or (sample_meta or {}).get('instruction', '')
+        or (sample_meta or {}).get('question', '')
+        or message_question
+    )
+    cfg._vlmeval_current_gt_meta = dict(sample_meta or {})
     img_wh = _read_current_image_size_from_message(message)
     cfg._vlmeval_current_image_size_wh = list(img_wh) if img_wh is not None else None
     visual_hw = _extract_visual_grid_hw(inputs)
@@ -765,6 +807,45 @@ def _configure_roi_prune_context(model, dataset: str | None, message: list[dict]
         cfg._roi_prune_uniform_keep_offset = 0
 
     cfg._roi_prune_enabled = bool(enabled and json_path and _sample_allows_roi_prune(dataset, sample_meta))
+
+
+def _record_attn_prune_stats(owner, model, sample_meta: dict | None) -> None:
+    if not _use_qwen3vl_attn_prune_model(getattr(owner, 'use_attn_prune', False)):
+        return
+    cfg = model.config.text_config
+    stats = dict(getattr(cfg, '_attn_prune_last_stats', {}) or {})
+    if not stats:
+        return
+    stats['sample_index'] = str((sample_meta or {}).get('sample_index', '') or stats.get('sample_index', ''))
+    stats['dataset_name'] = str((sample_meta or {}).get('dataset_name', '') or getattr(cfg, '_vlmeval_current_dataset_name', ''))
+    if not hasattr(owner, '_vlmeval_prune_records'):
+        owner._vlmeval_prune_records = []
+    owner._vlmeval_prune_records.append(
+        {
+            'sample_index': stats.get('sample_index'),
+            'dataset_name': stats.get('dataset_name'),
+            'sort_s': float(stats.get('prune_selection_sec', 0.0) or 0.0),
+            'recycle_s': float(stats.get('prune_op_sec', 0.0) or 0.0),
+            'stats': stats,
+        }
+    )
+    if _env_flag('QWEN3VL_ATTN_PRUNE_DEBUG', '0') or _env_flag('QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE', '0'):
+        print(
+            '[AttnPruneSample] '
+            f"sample_index={stats.get('sample_index')} "
+            f"dataset={stats.get('dataset_name')} "
+            f"applied={int(bool(stats.get('prune_applied', False)))} "
+            f"prune_layers={stats.get('prune_layers', stats.get('layers'))} "
+            f"vis_layers={stats.get('vis_layers')} "
+            f"keep_ratio={float(stats.get('keep_ratio', 1.0) or 1.0):.3f} "
+            f"visual_before={stats.get('visual_tokens_before')} "
+            f"visual_after={stats.get('visual_tokens_after')} "
+            f"seq_before={stats.get('seq_tokens_before')} "
+            f"seq_after={stats.get('seq_tokens_after')} "
+            f"selection_s={float(stats.get('prune_selection_sec', 0.0) or 0.0):.6f} "
+            f"prune_op_s={float(stats.get('prune_op_sec', 0.0) or 0.0):.6f}",
+            flush=True,
+        )
 
 
 def _record_roi_prune_stats(owner, model, sample_meta: dict | None) -> None:
@@ -961,6 +1042,17 @@ def _roi_prune_generate_use_cache(model) -> bool:
     return _env_flag('QWEN3VL_ROI_PRUNE_USE_CACHE', '0')
 
 
+def _attn_prune_generate_use_cache(model) -> bool:
+    attn_prune_model_active = bool(_env_flag('QWEN3VL_ENABLE_ATTN_PRUNE', '0') or _env_flag('QWEN3VL_USE_ATTN_PRUNE_MODEL', '0'))
+    try:
+        attn_prune_model_active = attn_prune_model_active or ('attn_prune' in type(model.model).__module__)
+    except Exception:
+        pass
+    if not attn_prune_model_active:
+        return True
+    return _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0')
+
+
 def _print_template_parts_sample(sample_meta: dict | None, template_meta: dict, template_response: str | None) -> None:
     if not _env_flag('QWEN3VL_TEMPLATE_PREFILL_DEBUG', '0'):
         return
@@ -1061,6 +1153,7 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
         self.system_prompt = system_prompt
         self.verbose = verbose
         self.post_process = post_process
+        self.use_attn_prune = bool(kwargs.pop('use_attn_prune', False) or kwargs.pop('attn_prune', False))
         self.fps = kwargs.pop('fps', 2)
         self.nframe = kwargs.pop('nframe', 128)
         self.FRAME_FACTOR = 2
@@ -1124,7 +1217,13 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                     model_path, dtype='auto', device_map='auto', attn_implementation='flash_attention_2'
                 )
             else:
-                if _use_qwen3vl_timing_model():
+                if _use_qwen3vl_attn_prune_model(self.use_attn_prune):
+                    from .modeling_qwen3_vl_attn_prune import Qwen3VLForConditionalGeneration
+
+                    self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+                        model_path, torch_dtype='auto', device_map='auto', attn_implementation='sdpa'
+                    )
+                elif _use_qwen3vl_timing_model():
                     from .modeling_qwen3_vl_roi_prune import Qwen3VLForConditionalGeneration
 
                     self.model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -1138,6 +1237,15 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             self.model.eval()
             _patch_qwen3vl_runtime_tracking(self.model)
             if _env_flag('QWEN3VL_ENABLE_ROI_PRUNE', '0') and not _env_flag('QWEN3VL_ROI_PRUNE_USE_CACHE', '0'):
+                try:
+                    self.model.config.use_cache = False
+                except Exception:
+                    pass
+                try:
+                    self.model.generation_config.use_cache = False
+                except Exception:
+                    pass
+            if _use_qwen3vl_attn_prune_model(self.use_attn_prune) and not _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0'):
                 try:
                     self.model.config.use_cache = False
                 except Exception:
@@ -1362,6 +1470,17 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 return_tensors='pt',
                 **(video_kwargs or {}),
             )
+            try:
+                if hasattr(self, 'model') and hasattr(self.model, 'config'):
+                    cfg = self.model.config.text_config
+                    if images is not None and len(images) > 0:
+                        cfg._vlmeval_current_vis_image_pil = images[-1]
+                    if hasattr(inputs, 'get'):
+                        cfg._vlmeval_current_image_grid_thw = inputs.get("image_grid_thw", None)
+                    else:
+                        cfg._vlmeval_current_image_grid_thw = getattr(inputs, "image_grid_thw", None)
+            except Exception:
+                pass
         sample_meta = kwargs.get('sample_meta') if isinstance(kwargs, dict) else None
         if not is_omni and hasattr(self, 'model'):
             _configure_roi_prune_context(self.model, dataset, message, sample_meta, inputs)
@@ -1412,7 +1531,7 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             #=======================timer================================
             stage_record = None
             generate_kwargs = dict(self.generate_kwargs)
-            if not _roi_prune_generate_use_cache(self.model):
+            if not _roi_prune_generate_use_cache(self.model) or not _attn_prune_generate_use_cache(self.model):
                 generate_kwargs['use_cache'] = False
             template_meta = {
                 'template_prefill_enabled': False,
@@ -1604,6 +1723,7 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             print(f'\033[32m{response}\033[0m')
         if not is_omni and hasattr(self, 'model'):
             _record_roi_prune_stats(self, self.model, sample_meta)
+            _record_attn_prune_stats(self, self.model, sample_meta)
             _record_generate_timing(self, self.model, sample_meta, stage_record if 'stage_record' in locals() else None)
         return response
 
@@ -1708,6 +1828,11 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
         else:
             response = self.generate_inner_transformers(message, dataset=dataset, **kwargs)
 
-        if enable_android_denorm and isinstance(dataset, str) and dataset.startswith('AndroidControl'):
-            response = _postprocess_androidcontrol_response(response, message, base=denorm_base)
+        if isinstance(dataset, str) and dataset.startswith('AndroidControl'):
+            response = _postprocess_androidcontrol_response(
+                response,
+                message,
+                base=denorm_base,
+                denorm=enable_android_denorm,
+            )
         return response

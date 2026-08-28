@@ -1376,12 +1376,21 @@ def infer_data_job(
     prev_file = f'{work_dir}/{model_name}_{dataset_name}_PREV.pkl'
     if osp.exists(result_file):
         if rank == 0:
-            data = load(result_file)
-            # breakpoint()
-            results = {k: v for k, v in zip(data['index'], data['prediction'])}
-            if not ignore_failed:
-                results = {k: v for k, v in results.items() if FAIL_MSG not in str(v)}
-            dump(results, prev_file)
+            try:
+                data = load(result_file)
+            except Exception as err:
+                logger = get_logger('LOAD_PREV')
+                broken_file = f'{result_file}.broken_{timestr()}'
+                shutil.move(result_file, broken_file)
+                logger.warning(
+                    f'Failed to load existing result file {result_file}: {err}. '
+                    f'Moved it to {broken_file} and will regenerate predictions.'
+                )
+            else:
+                results = {k: v for k, v in zip(data['index'], data['prediction'])}
+                if not ignore_failed:
+                    results = {k: v for k, v in results.items() if FAIL_MSG not in str(v)}
+                dump(results, prev_file)
         if world_size > 1:
             dist.barrier()
 

@@ -40,7 +40,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Generate GUIOdyssey attention top4 candidates and save per_sample.json.'
     )
-    parser.add_argument('--base_model', type=str, default='/mnt/storage/users/ytshen_data/Qwen3-VL-4B-Instruct')
+    parser.add_argument('--base_model', type=str, default='/public/kanglj/models/Qwen3-VL-4B-Instruct')
     parser.add_argument('--adapter_path', type=str, default='none')
     parser.add_argument('--dataset', type=str, default='GUIOdyssey_high_task_split')
     parser.add_argument('--output_dir', type=str, default='OUTPUT/outputs_qwen3vl_gui_odyssey_attn_top4')

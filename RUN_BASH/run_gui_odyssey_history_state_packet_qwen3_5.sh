@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
-export GUI_ODYSSEY_ROOT="${GUI_ODYSSEY_ROOT:-/mnt/storage2/users/ytshen_data/GUIOdyssey}"
+export GUI_ODYSSEY_ROOT="${GUI_ODYSSEY_ROOT:-/public/ljkang/datasets/GUIOdyssey}"
 export GUI_ODYSSEY_DEBUG_HISTORY_PROMPT="${GUI_ODYSSEY_DEBUG_HISTORY_PROMPT:-0}"
 
 export VLM_TIMING="${VLM_TIMING:-1}"
@@ -52,8 +52,8 @@ export GUI_ODYSSEY_STATE_PACKET_ROI_MIN_SIDE_PX="${GUI_ODYSSEY_STATE_PACKET_ROI_
 
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct}"
 DATASET="${DATASET:-GUIOdyssey_high_random_split}"
-PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/qwen3_5/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/conda/envs/qwen3_5/bin/torchrun}"
 TS="$(date +%Y%m%d_%H%M%S)"
 # TAG="${TAG:-hist4_keep_system_prompt_state_packet_fast_decode_seperator_changeratio_5_task_0831}"
 TAG="${TAG:-hist4_keep_system_prompt_baseline_0831_all}"

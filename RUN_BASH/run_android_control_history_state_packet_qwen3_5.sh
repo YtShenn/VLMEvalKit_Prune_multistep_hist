@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
 export ANDROID_CONTROL_CURATED_EVAL_MODE="${ANDROID_CONTROL_CURATED_EVAL_MODE:-official}"
-export ANDROID_CONTROL_CURATED_ROOT="${ANDROID_CONTROL_CURATED_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated}"
-export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated/images}"
+if [[ -z "${ANDROID_CONTROL_CURATED_ROOT:-}" ]]; then
+  if [[ -d /public/ytshen/AndroidControl_Curated/benchmark_resource ]]; then
+    export ANDROID_CONTROL_CURATED_ROOT=/public/ytshen/AndroidControl_Curated
+  elif [[ -d /mnt/storage2/users/ytshen_data/AndroidControl_Curated/benchmark_resource ]]; then
+    export ANDROID_CONTROL_CURATED_ROOT=/mnt/storage2/users/ytshen_data/AndroidControl_Curated
+  elif [[ -d /home/ytshen/storage_net2/AndroidControl_Curated-main/src/benchmark_resource ]]; then
+    export ANDROID_CONTROL_CURATED_ROOT=/home/ytshen/storage_net2/AndroidControl_Curated-main/src
+  else
+    export ANDROID_CONTROL_CURATED_ROOT=/public/ytshen/AndroidControl_Curated
+  fi
+fi
+if [[ -z "${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-}" ]]; then
+  export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_ROOT}/images"
+fi
 export ANDROID_CONTROL_DEBUG_HISTORY_PROMPT="${ANDROID_CONTROL_DEBUG_HISTORY_PROMPT:-1}"
 export ANDROID_CONTROL_SEQUENTIAL_ORDER="${ANDROID_CONTROL_SEQUENTIAL_ORDER:-1}"
 
@@ -37,7 +49,7 @@ export QWEN3VL_ENABLE_ROI_PRUNE=0
 export QWEN3VL_ROI_PRUNE_USE_CACHE="${QWEN3VL_ROI_PRUNE_USE_CACHE:-1}"
 export QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE="${QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE:-1}"
 
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-all}"
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-10}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
@@ -62,10 +74,40 @@ DATASET_LIST=(
     # "AndroidControl_Curated_High_Point"
     "${DATASET_LIST_OVERRIDE:-AndroidControl_Curated_High_Task_Improved}"
 )
-PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if [[ -x /opt/conda/envs/qwen3_5/bin/python ]]; then
+    PYTHON_BIN=/opt/conda/envs/qwen3_5/bin/python
+  elif [[ -x /home/ytshen/anaconda3/envs/qwen3_5/bin/python ]]; then
+    PYTHON_BIN=/home/ytshen/anaconda3/envs/qwen3_5/bin/python
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    PYTHON_BIN="$(command -v python)"
+  fi
+fi
+
+if [[ -z "${TORCHRUN_BIN:-}" ]]; then
+  PYTHON_ENV_BIN_DIR="$(dirname "${PYTHON_BIN}")"
+  if [[ -x "${PYTHON_ENV_BIN_DIR}/torchrun" ]]; then
+    TORCHRUN_BIN="${PYTHON_ENV_BIN_DIR}/torchrun"
+  elif [[ -x /opt/conda/envs/qwen3_5/bin/torchrun ]]; then
+    TORCHRUN_BIN=/opt/conda/envs/qwen3_5/bin/torchrun
+  elif [[ -x /home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun ]]; then
+    TORCHRUN_BIN=/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun
+  elif command -v torchrun >/dev/null 2>&1; then
+    TORCHRUN_BIN="$(command -v torchrun)"
+  else
+    TORCHRUN_BIN=""
+  fi
+fi
+
+if [[ -n "${TORCHRUN_BIN}" ]]; then
+  TORCHRUN_CMD=("${TORCHRUN_BIN}")
+else
+  TORCHRUN_CMD=("${PYTHON_BIN}" -m torch.distributed.run)
+fi
 TS="$(date +%Y%m%d_%H%M%S)"
-TAG="${TAG:-hist4_keep_system_prompt_state_packet_structured_fast_official_xiabanhou_test}"
+TAG="${TAG:-hist4_keep_system_prompt_state_packet_structured_fast_official_all}"
 WORK_DIR="${WORK_DIR:-OUTPUT/ablation_android_control_${TAG}_node5_0812(only_HTI)_ratio2}"
 LOG_FILE="run_output_${TS}_android_control_${TAG}.log"
 
@@ -77,6 +119,7 @@ run_one() {
   {
     echo "[Run] tag=${TAG}"
     echo "[Run] python=$(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
+    echo "[Run] torchrun=${TORCHRUN_CMD[*]}"
     echo "[Run] cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
     echo "[Run] model=${MODEL}"
     echo "[Run] dataset=${dataset_name}"
@@ -109,7 +152,7 @@ run_one() {
     reuse_args+=(--reuse)
   fi
 
-  "${TORCHRUN_BIN}" --standalone --nproc_per_node=1 --master_port="${port}" run.py \
+  "${TORCHRUN_CMD[@]}" --standalone --nproc_per_node=3 --master_port="${port}" run.py \
     --data "${dataset_name}" \
     --model "${MODEL}" \
     --work-dir "${WORK_DIR}/${dataset_name}" \

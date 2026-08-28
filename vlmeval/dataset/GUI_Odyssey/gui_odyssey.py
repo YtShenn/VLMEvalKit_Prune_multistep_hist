@@ -311,7 +311,7 @@ class GUIOdyssey(ImageBaseDataset):
         env_root = os.environ.get('GUI_ODYSSEY_ROOT', '').strip()
         if env_root:
             return env_root
-        return '/mnt/storage2/users/ytshen_data/GUIOdyssey'
+        return '/public/ljkang/datasets/GUIOdyssey'
 
     def _dataset_json_path(self, dataset):
         root = self._resolve_data_root()

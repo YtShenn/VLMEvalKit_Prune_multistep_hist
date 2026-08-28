@@ -160,7 +160,7 @@ def _minimal_ext_cmd(cmd, cwd=None):
     env['LANGUAGE'] = 'C'
     env['LANG'] = 'C'
     env['LC_ALL'] = 'C'
-    out = subprocess.Popen(cmd, stdout=subprocess.PIPE, env=env, cwd=cwd).communicate()[0]
+    out = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=cwd).communicate()[0]
     return out
 
 def githash(fallback='unknown', digits=8):
@@ -177,7 +177,7 @@ def githash(fallback='unknown', digits=8):
         sha = out.strip().decode('ascii')
         if digits is not None:
             sha = sha[:digits]
-    except OSError:
+    except Exception:
         sha = fallback
     return sha
 
@@ -212,7 +212,7 @@ def load_env():
     pth = osp.join(pth, '../.env')
     pth = osp.realpath(pth)
     if not osp.exists(pth):
-        logging.error(f'Did not detect the .env file at {pth}, failed to load. ')
+        logging.warning(f'Did not detect the .env file at {pth}, skipping environment load. ')
         return
 
     from dotenv import dotenv_values

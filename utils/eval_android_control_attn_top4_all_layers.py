@@ -56,7 +56,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Generate AndroidControl attention top4 recall for all decoder layers and save summary + plot.'
     )
-    parser.add_argument('--base_model', type=str, default='/mnt/storage/users/ytshen_data/Qwen3-VL-4B-Instruct')
+    parser.add_argument('--base_model', type=str, default='/public/kanglj/models/Qwen3-VL-4B-Instruct')
     parser.add_argument('--adapter_path', type=str, default='none')
     parser.add_argument('--dataset', type=str, default='AndroidControl_Curated_High_Task_Improved')
     parser.add_argument('--output_dir', type=str, default='OUTPUT/outputs_qwen3vl_android_control_attn_top4_all_layers')

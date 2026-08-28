@@ -326,6 +326,8 @@ class GUIOdyssey(ImageBaseDataset):
         cand = osp.join(root, 'screenshots', osp.basename(p))
         if osp.exists(cand):
             return cand
+        if 'GUIOdyssey' in p or 'GUI_Odyssey' in p:
+            return cand
         return p
 
     def _parse_history_image_list(self, value, return_invalid=False):

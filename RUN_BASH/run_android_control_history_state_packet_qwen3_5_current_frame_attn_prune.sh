@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
 export ANDROID_CONTROL_CURATED_EVAL_MODE="${ANDROID_CONTROL_CURATED_EVAL_MODE:-official}"
-export ANDROID_CONTROL_CURATED_ROOT="${ANDROID_CONTROL_CURATED_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated}"
-export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated/images}"
+export ANDROID_CONTROL_CURATED_ROOT="${ANDROID_CONTROL_CURATED_ROOT:-/public/ytshen/AndroidControl_Curated}"
+export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-/public/ytshen/AndroidControl_Curated/images}"
 export ANDROID_CONTROL_DEBUG_HISTORY_PROMPT="${ANDROID_CONTROL_DEBUG_HISTORY_PROMPT:-1}"
 export ANDROID_CONTROL_SEQUENTIAL_ORDER="${ANDROID_CONTROL_SEQUENTIAL_ORDER:-1}"
 
@@ -39,33 +39,21 @@ export QWEN3VL_ROI_PRUNE_USE_CACHE="${QWEN3VL_ROI_PRUNE_USE_CACHE:-1}"
 export QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE="${QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE:-1}"
 
 export QWEN3VL_ENABLE_ATTN_PRUNE="${QWEN3VL_ENABLE_ATTN_PRUNE:-0}"
-export QWEN3VL_ATTN_PRUNE_LAYERS="${QWEN3VL_ATTN_PRUNE_LAYERS:-1}"
+export QWEN3VL_ATTN_PRUNE_LAYERS="${QWEN3VL_ATTN_PRUNE_LAYERS:-3}"
 export QWEN3VL_ATTN_PRUNE_VIS_LAYERS="${QWEN3VL_ATTN_PRUNE_VIS_LAYERS:-1,2,3,5,7,15,23}"
-export QWEN3VL_ATTN_PRUNE_KEEP_RATIO="${QWEN3VL_ATTN_PRUNE_KEEP_RATIO:-0.6}"
+export QWEN3VL_ATTN_PRUNE_KEEP_RATIO="${QWEN3VL_ATTN_PRUNE_KEEP_RATIO:-0.75}"
 export QWEN3VL_ATTN_PRUNE_USE_CACHE="${QWEN3VL_ATTN_PRUNE_USE_CACHE:-1}"
 export QWEN3VL_ATTN_PRUNE_VIS="${QWEN3VL_ATTN_PRUNE_VIS:-0}"        #attn可视化开关
 export QWEN3VL_ATTN_PRUNE_STATS="${QWEN3VL_ATTN_PRUNE_STATS:-0}"    #分布尖锐程度统计
 export QWEN3VL_ATTN_PRUNE_OUT_DIR="${QWEN3VL_ATTN_PRUNE_OUT_DIR:-OUTPUT/attn_prune_debug/android_control_history_state_packet_inst_after_siedeattn_high_prune_vispred}"
 export QWEN3VL_ATTN_PRUNE_PRED_DETAIL_JSON="${QWEN3VL_ATTN_PRUNE_PRED_DETAIL_JSON:-OUTPUT_0/ablation_android_control_hist4_keep_system_prompt_state_packet_official_xiabanqian_node5_0812(only_HTI)_ratio2/AndroidControl_Curated_High_Task_Improved/Qwen3-VL-4B-Instruct/T20260812_G1e13089b/Qwen3-VL-4B-Instruct_AndroidControl_Curated_High_Task_Improved_android_control_detail_official.json}"
-export QWEN3VL_ATTN_PRUNE_DEBUG="${QWEN3VL_ATTN_PRUNE_DEBUG:-1}"
+export QWEN3VL_ATTN_PRUNE_DEBUG="${QWEN3VL_ATTN_PRUNE_DEBUG:-0}"
 export QWEN3VL_ATTN_PRUNE_STRICT_QUERY_MARKER="${QWEN3VL_ATTN_PRUNE_STRICT_QUERY_MARKER:-1}"
 export QWEN3VL_ATTN_PRUNE_PRINT_QUERY_TOKENS="${QWEN3VL_ATTN_PRUNE_PRINT_QUERY_TOKENS:-0}"
 export QWEN3VL_ATTN_PRUNE_SIDE_COMPUTE="${QWEN3VL_ATTN_PRUNE_SIDE_COMPUTE:-1}" #置1是额外再算attn，置0是直接抓取，用eager attn，会慢一些
 export QWEN3VL_ATTN_PRUNE_PRUNE_VIS="${QWEN3VL_ATTN_PRUNE_PRUNE_VIS:-0}" #剪枝后可视化，保留token显示attn，剪掉token标黑
-export QWEN3VL_ATTN_PRUNE_SAFETY_KEEP="${QWEN3VL_ATTN_PRUNE_SAFETY_KEEP:-0}" #额外保留均匀/边缘/中心/文字密集token
-export QWEN3VL_ATTN_PRUNE_SAFETY_MAX_EXTRA_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_MAX_EXTRA_RATIO:-0.20}"
-export QWEN3VL_ATTN_PRUNE_SAFETY_MAX_KEEP_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_MAX_KEEP_RATIO:-1.0}"
-export QWEN3VL_ATTN_PRUNE_SAFETY_SELECT_MODE="${QWEN3VL_ATTN_PRUNE_SAFETY_SELECT_MODE:-priority}" #priority/spatial/attn
-export QWEN3VL_ATTN_PRUNE_SAFETY_ATTN_TIE_WEIGHT="${QWEN3VL_ATTN_PRUNE_SAFETY_ATTN_TIE_WEIGHT:-0.25}"
-export QWEN3VL_ATTN_PRUNE_SAFETY_UNIFORM_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_UNIFORM_RATIO:-0.05}"
-export QWEN3VL_ATTN_PRUNE_SAFETY_TOP_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_TOP_RATIO:-0.08}"
-export QWEN3VL_ATTN_PRUNE_SAFETY_BOTTOM_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_BOTTOM_RATIO:-0.14}"
-export QWEN3VL_ATTN_PRUNE_SAFETY_SIDE_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_SIDE_RATIO:-0.04}"
-export QWEN3VL_ATTN_PRUNE_SAFETY_CENTER_H_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_CENTER_H_RATIO:-0.22}"
-export QWEN3VL_ATTN_PRUNE_SAFETY_CENTER_W_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_CENTER_W_RATIO:-0.28}"
-export QWEN3VL_ATTN_PRUNE_SAFETY_TEXT_DENSE_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_TEXT_DENSE_RATIO:-0.05}"
 
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-off}"
 export VLM_EVAL_SAMPLE_INDEX_FILE="${VLM_EVAL_SAMPLE_INDEX_FILE:-OUTPUT_0/attn_prune_debug/android_control_history_state_packet_step_instruct/selected_indices.txt}"
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-10}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
@@ -92,8 +80,38 @@ DATASET_LIST=(
     "AndroidControl_Curated_High_Task_Improved"
     # "AndroidControl_Curated_Low_BBox"
 )
-PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if [[ -x /opt/conda/envs/qwen3_5/bin/python ]]; then
+    PYTHON_BIN=/opt/conda/envs/qwen3_5/bin/python
+  elif [[ -x /home/ytshen/anaconda3/envs/qwen3_5/bin/python ]]; then
+    PYTHON_BIN=/home/ytshen/anaconda3/envs/qwen3_5/bin/python
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+  else
+    PYTHON_BIN="$(command -v python)"
+  fi
+fi
+
+if [[ -z "${TORCHRUN_BIN:-}" ]]; then
+  PYTHON_ENV_BIN_DIR="$(dirname "${PYTHON_BIN}")"
+  if [[ -x "${PYTHON_ENV_BIN_DIR}/torchrun" ]]; then
+    TORCHRUN_BIN="${PYTHON_ENV_BIN_DIR}/torchrun"
+  elif [[ -x /opt/conda/envs/qwen3_5/bin/torchrun ]]; then
+    TORCHRUN_BIN=/opt/conda/envs/qwen3_5/bin/torchrun
+  elif [[ -x /home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun ]]; then
+    TORCHRUN_BIN=/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun
+  elif command -v torchrun >/dev/null 2>&1; then
+    TORCHRUN_BIN="$(command -v torchrun)"
+  else
+    TORCHRUN_BIN=""
+  fi
+fi
+
+if [[ -n "${TORCHRUN_BIN}" ]]; then
+  TORCHRUN_CMD=("${TORCHRUN_BIN}")
+else
+  TORCHRUN_CMD=("${PYTHON_BIN}" -m torch.distributed.run)
+fi
 TS="$(date +%Y%m%d_%H%M%S)"
 # TAG="${TAG:-hist4_keep_system_prompt_state_packet_attn_prune_structured_fast_official_nonvis_prune_layer${QWEN3VL_ATTN_PRUNE_LAYERS}_${QWEN3VL_ATTN_PRUNE_KEEP_RATIO}_eagerattn_0826_high}"
 TAG="${TAG:-hist4_keep_system_prompt_state_packet_fast_decode_official_nonvis_high_0906}"
@@ -113,6 +131,7 @@ run_one() {
   {
     echo "[Run] tag=${TAG}"
     echo "[Run] python=$(${PYTHON_BIN} -c 'import sys; print(sys.executable)')"
+    echo "[Run] torchrun=${TORCHRUN_CMD[*]}"
     echo "[Run] cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
     echo "[Run] model=${MODEL}"
     echo "[Run] dataset=${dataset_name}"
@@ -171,7 +190,7 @@ run_one() {
     reuse_args+=(--reuse)
   fi
 
-  "${TORCHRUN_BIN}" --standalone --nproc_per_node=1 --master_port="${port}" run.py \
+  "${TORCHRUN_CMD[@]}" --standalone --nproc_per_node=7 --master_port="${port}" run.py \
     --data "${dataset_name}" \
     --model "${MODEL}" \
     --work-dir "${WORK_DIR}/${dataset_name}" \

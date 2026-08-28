@@ -1338,7 +1338,7 @@ qwen3vl_series = {
     ),
     "Qwen3-VL-4B-Instruct-AttnPrune": partial(
         Qwen3VLChat,
-        model_path="/mnt/storage/users/ytshen_data/Qwen3-VL-4B-Instruct",
+        model_path="/public/kanglj/models/Qwen3-VL-4B-Instruct",
         use_custom_prompt=False,
         use_vllm=False,
         use_attn_prune=True,

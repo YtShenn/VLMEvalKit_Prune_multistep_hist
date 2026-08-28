@@ -1,6 +1,7 @@
 import torch
 import time
 import statistics
+import pickle
 import re
 import torch.distributed as dist
 import os.path as osp
@@ -10,6 +11,21 @@ from vlmeval.smp import *
 
 FAIL_MSG = 'Failed to obtain answer via API.'
 SKIP_MISSING_IMAGE_MSG = '__SKIP_MISSING_IMAGE__'
+
+
+def _load_partial_result(path, default=None):
+    if default is None:
+        default = {}
+    if not osp.exists(path):
+        return default
+    if osp.getsize(path) == 0:
+        warnings.warn(f'[SkipBrokenResult] {path} is empty; regenerating missing predictions.')
+        return default
+    try:
+        return load(path)
+    except (EOFError, pickle.UnpicklingError) as err:
+        warnings.warn(f'[SkipBrokenResult] failed to load {path}: {err}; regenerating missing predictions.')
+        return default
 
 
 def _extract_first_image_path(struct):
@@ -393,7 +409,7 @@ def infer_data_api(model, work_dir, model_name, dataset, index_set=None, api_npr
 
     res = {}
     if osp.exists(out_file):
-        res = load(out_file)
+        res = _load_partial_result(out_file, {})
         if ignore_failed:
             res = {k: v for k, v in res.items() if FAIL_MSG not in v}
 
@@ -406,7 +422,7 @@ def infer_data_api(model, work_dir, model_name, dataset, index_set=None, api_npr
     if len(structs):
         track_progress_rich(gen_func, structs, nproc=api_nproc, chunksize=api_nproc, save=out_file, keys=indices)
 
-    res = load(out_file)
+    res = _load_partial_result(out_file, {})
     if index_set is not None:
         res = {k: v for k, v in res.items() if k in index_set}
     os.remove(out_file)
@@ -416,9 +432,9 @@ def infer_data_api(model, work_dir, model_name, dataset, index_set=None, api_npr
 def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, api_nproc=4, use_vllm=False):
     dataset_name = dataset.dataset_name
     prev_file = f'{work_dir}/{model_name}_{dataset_name}_PREV.pkl'
-    res = load(prev_file) if osp.exists(prev_file) else {}
+    res = _load_partial_result(prev_file, {})
     if osp.exists(out_file):
-        res.update(load(out_file))
+        res.update(_load_partial_result(out_file, {}))
 
     rank, world_size = get_rank_and_world_size()
     live_history_predictions = bool(
@@ -1406,7 +1422,7 @@ def infer_data_job(
     if rank == 0:
         data_all = {}
         for i in range(world_size):
-            data_all.update(load(tmpl.format(i)))
+            data_all.update(_load_partial_result(tmpl.format(i), {}))
 
         data = _maybe_apply_eval_sampling(dataset.data, dataset_name, rank=rank).copy()
         for x in data['index']:

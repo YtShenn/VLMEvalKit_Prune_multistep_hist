@@ -32,11 +32,11 @@ set -euo pipefail
 
 # -------- Edit these defaults when you want to run without arguments. --------
 DEFAULT_TARGET_SCRIPT="RUN_BASH/run_android_control_history_state_packet_qwen3_5_current_frame_attn_prune.sh"
-DEFAULT_DOWNLOAD_SOURCE_DIR_1="OUTPUT/android_control_hist4_keep_system_prompt_state_packet_attn_prune_structured_fast_official_prune_layer3_0.8_sideattn_0828_high_task"
-DEFAULT_DOWNLOAD_SOURCE_DIR_2="OUTPUT/attn_prune_debug/android_control_history_state_packet_inst_after_siedeattn_high_prune_vispred"
-DEFAULT_DOWNLOAD_DEST_ROOT="${HOME}/Downloads/VLMEvalKit_Prune_multistep_hist/android_control_attn_prune"
+DEFAULT_DOWNLOAD_SOURCE_DIR_1="OUTPUT/android_control_hist4_keep_system_prompt_state_packet_fast_decode_official_high_all_0828"
+DEFAULT_DOWNLOAD_SOURCE_DIR_2="OUTPUT/android_control_hist4_keep_system_prompt_state_packet_fast_decode_official_prune_0.75_high_all_0828"
+DEFAULT_DOWNLOAD_DEST_ROOT="E:\Download"
 
-DEFAULT_GPU_CANDIDATES="0 1 2 3 4 5 6 7"
+DEFAULT_GPU_CANDIDATES="0 1 2"
 DEFAULT_REQUIRED_GPU_COUNT=3
 DEFAULT_GPU_CHECK_INTERVAL=60
 DEFAULT_GPU_FREE_MAX_MEM_MB=1024

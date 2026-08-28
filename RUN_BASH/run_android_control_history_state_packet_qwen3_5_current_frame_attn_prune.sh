@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=0
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
@@ -37,18 +37,23 @@ export QWEN3VL_ENABLE_ROI_PRUNE=0
 export QWEN3VL_ROI_PRUNE_USE_CACHE="${QWEN3VL_ROI_PRUNE_USE_CACHE:-1}"
 export QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE="${QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE:-1}"
 
-export QWEN3VL_ENABLE_ATTN_PRUNE="${QWEN3VL_ENABLE_ATTN_PRUNE:-0}"
+export QWEN3VL_ENABLE_ATTN_PRUNE="${QWEN3VL_ENABLE_ATTN_PRUNE:-1}"
 export QWEN3VL_ATTN_PRUNE_LAYERS="${QWEN3VL_ATTN_PRUNE_LAYERS:-3}"
-export QWEN3VL_ATTN_PRUNE_VIS_LAYERS="${QWEN3VL_ATTN_PRUNE_VIS_LAYERS:-3,5,7,15,23}"
-export QWEN3VL_ATTN_PRUNE_KEEP_RATIO="${QWEN3VL_ATTN_PRUNE_KEEP_RATIO:-0.5}"
+export QWEN3VL_ATTN_PRUNE_VIS_LAYERS="${QWEN3VL_ATTN_PRUNE_VIS_LAYERS:-1,2,3,5,7,15,23}"
+export QWEN3VL_ATTN_PRUNE_KEEP_RATIO="${QWEN3VL_ATTN_PRUNE_KEEP_RATIO:-0.8}"
 export QWEN3VL_ATTN_PRUNE_USE_CACHE="${QWEN3VL_ATTN_PRUNE_USE_CACHE:-1}"
-export QWEN3VL_ATTN_PRUNE_VIS="${QWEN3VL_ATTN_PRUNE_VIS:-1}"        #attn可视化开关
-export QWEN3VL_ATTN_PRUNE_STATS="${QWEN3VL_ATTN_PRUNE_STATS:-1}"    #分布尖锐程度统计
-export QWEN3VL_ATTN_PRUNE_OUT_DIR="${QWEN3VL_ATTN_PRUNE_OUT_DIR:-OUTPUT/attn_prune_debug/android_control_history_state_packet}"
-export QWEN3VL_ATTN_PRUNE_PRED_DETAIL_JSON="${QWEN3VL_ATTN_PRUNE_PRED_DETAIL_JSON:-OUTPUT/ablation_android_control_hist4_keep_system_prompt_state_packet_official_xiabanqian_node5_0812(only_HTI)_ratio2/AndroidControl_Curated_High_Task_Improved/Qwen3-VL-4B-Instruct/T20260812_G1e13089b/Qwen3-VL-4B-Instruct_AndroidControl_Curated_High_Task_Improved_android_control_detail_official.json}"
+export QWEN3VL_ATTN_PRUNE_VIS="${QWEN3VL_ATTN_PRUNE_VIS:-0}"        #attn可视化开关
+export QWEN3VL_ATTN_PRUNE_STATS="${QWEN3VL_ATTN_PRUNE_STATS:-0}"    #分布尖锐程度统计
+export QWEN3VL_ATTN_PRUNE_OUT_DIR="${QWEN3VL_ATTN_PRUNE_OUT_DIR:-OUTPUT/attn_prune_debug/android_control_history_state_packet_inst_after_siedeattn_high_prune_vispred}"
+export QWEN3VL_ATTN_PRUNE_PRED_DETAIL_JSON="${QWEN3VL_ATTN_PRUNE_PRED_DETAIL_JSON:-OUTPUT_0/ablation_android_control_hist4_keep_system_prompt_state_packet_official_xiabanqian_node5_0812(only_HTI)_ratio2/AndroidControl_Curated_High_Task_Improved/Qwen3-VL-4B-Instruct/T20260812_G1e13089b/Qwen3-VL-4B-Instruct_AndroidControl_Curated_High_Task_Improved_android_control_detail_official.json}"
 export QWEN3VL_ATTN_PRUNE_DEBUG="${QWEN3VL_ATTN_PRUNE_DEBUG:-1}"
+export QWEN3VL_ATTN_PRUNE_STRICT_QUERY_MARKER="${QWEN3VL_ATTN_PRUNE_STRICT_QUERY_MARKER:-1}"
+export QWEN3VL_ATTN_PRUNE_PRINT_QUERY_TOKENS="${QWEN3VL_ATTN_PRUNE_PRINT_QUERY_TOKENS:-0}"
+export QWEN3VL_ATTN_PRUNE_SIDE_COMPUTE="${QWEN3VL_ATTN_PRUNE_SIDE_COMPUTE:-1}" #置1是额外再算attn，置0是直接抓取，用eager attn，会慢一些
+export QWEN3VL_ATTN_PRUNE_PRUNE_VIS="${QWEN3VL_ATTN_PRUNE_PRUNE_VIS:-1}" #剪枝后可视化，保留token显示attn，剪掉token标黑
 
 export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
+export VLM_EVAL_SAMPLE_INDEX_FILE="${VLM_EVAL_SAMPLE_INDEX_FILE:-OUTPUT_0/attn_prune_debug/android_control_history_state_packet_step_instruct/selected_indices.txt}"
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-10}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
@@ -71,15 +76,18 @@ export ANDROID_CONTROL_STATE_PACKET_ROI_MIN_SIDE_PX="${ANDROID_CONTROL_STATE_PAC
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct-AttnPrune}"
 DATASET_LIST=(
     # "AndroidControl_Curated_High_Point"
-    # "AndroidControl_Curated_High_Task_Improved"
-    "AndroidControl_Curated_Low_BBox"
+    "AndroidControl_Curated_High_Task_Improved"
+    # "AndroidControl_Curated_Low_BBox"
 )
 PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
 TS="$(date +%Y%m%d_%H%M%S)"
-# TAG="${TAG:-hist4_keep_system_prompt_state_packet_attn_prune_structured_fast_official_nonvis_nonprune_layer${QWEN3VL_ATTN_PRUNE_LAYERS}}"
-TAG="${TAG:-hist4_keep_system_prompt_state_packet_fast_decode_official_nonvis_Low_BBox}"
-# TAG="${TAG:-hist4_keep_system_prompt_baseline_official_nonvis_Low_BBox}"
+# TAG="${TAG:-hist4_keep_system_prompt_state_packet_attn_prune_structured_fast_official_nonvis_prune_layer${QWEN3VL_ATTN_PRUNE_LAYERS}_${QWEN3VL_ATTN_PRUNE_KEEP_RATIO}_eagerattn_0826_high}"
+# TAG="${TAG:-hist4_keep_system_prompt_state_packet_fast_decode_official_nonvis_high_0828}"
+# TAG="${TAG:-hist4_keep_system_prompt_baseline_official_nonvis_Low_BBox_0825}"
+# TAG="${TAG:-hist4_keep_system_prompt_baseline_official_nonvis_high_0828}"
+TAG="${TAG:-hist4_keep_system_prompt_state_packet_attn_prune_structured_fast_official_prune_layer${QWEN3VL_ATTN_PRUNE_LAYERS}_${QWEN3VL_ATTN_PRUNE_KEEP_RATIO}_sideattn_0828_high_task}"
+
 WORK_DIR="${WORK_DIR:-OUTPUT/android_control_${TAG}}"
 LOG_FILE="run_output_${TS}_android_control_${TAG}.log"
 
@@ -121,7 +129,12 @@ run_one() {
     echo "[Run] attn_prune_stats=${QWEN3VL_ATTN_PRUNE_STATS}"
     echo "[Run] attn_prune_out_dir=${QWEN3VL_ATTN_PRUNE_OUT_DIR}"
     echo "[Run] attn_prune_pred_detail_json=${QWEN3VL_ATTN_PRUNE_PRED_DETAIL_JSON}"
+    echo "[Run] attn_prune_strict_query_marker=${QWEN3VL_ATTN_PRUNE_STRICT_QUERY_MARKER}"
+    echo "[Run] attn_prune_print_query_tokens=${QWEN3VL_ATTN_PRUNE_PRINT_QUERY_TOKENS}"
+    echo "[Run] attn_prune_side_compute=${QWEN3VL_ATTN_PRUNE_SIDE_COMPUTE}"
+    echo "[Run] attn_prune_prune_vis=${QWEN3VL_ATTN_PRUNE_PRUNE_VIS}"
     echo "[Run] sample_mode=${VLM_EVAL_SAMPLE_MODE}"
+    echo "[Run] sample_index_file=${VLM_EVAL_SAMPLE_INDEX_FILE:-}"
     echo "[Run] sample_tasks=${VLM_EVAL_SAMPLE_TASKS}"
     echo "[Run] sample_seed=${VLM_EVAL_SAMPLE_SEED}"
   } | tee -a "${LOG_FILE}"

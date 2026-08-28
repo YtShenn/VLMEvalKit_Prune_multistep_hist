@@ -190,6 +190,22 @@ def _attn_prune_env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _attn_prune_strict_query_marker() -> bool:
+    return _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_STRICT_QUERY_MARKER", "1")
+
+
+def _attn_prune_side_compute() -> bool:
+    return _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_SIDE_COMPUTE", "1")
+
+
+def _attn_prune_prune_vis_enabled() -> bool:
+    return _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_PRUNE_VIS", "1")
+
+
+def _attn_prune_score_source() -> str:
+    return "side_compute_qk_rows" if _attn_prune_side_compute() else "forward_attention_weights"
+
+
 def _attn_prune_parse_layers(
     value: object | None = None,
     env_name: str = "QWEN3VL_ATTN_PRUNE_LAYERS",
@@ -513,12 +529,17 @@ def _attn_prune_parse_prediction_payload(text: object) -> dict:
 
 def _attn_prune_pred_from_config(config, image: Image.Image) -> dict:
     sample_index = str(getattr(config, "_vlmeval_current_sample_index", "") or "").strip()
-    detail = _attn_prune_load_pred_detail(_attn_prune_pred_detail_json_path())
-    rec = detail.get(sample_index, {}) if sample_index else {}
-    if not isinstance(rec, dict):
-        return {}
-
-    pred_payload = _attn_prune_parse_prediction_payload(rec.get("prediction", ""))
+    actual_prediction = str(getattr(config, "_vlmeval_current_actual_prediction", "") or "").strip()
+    rec = {}
+    if actual_prediction:
+        pred_payload = _attn_prune_parse_prediction_payload(actual_prediction)
+        rec = {"prediction": actual_prediction}
+    else:
+        detail = _attn_prune_load_pred_detail(_attn_prune_pred_detail_json_path())
+        rec = detail.get(sample_index, {}) if sample_index else {}
+        if not isinstance(rec, dict):
+            return {}
+        pred_payload = _attn_prune_parse_prediction_payload(rec.get("prediction", ""))
     pred_box = None
     pred_point = None
     for key in ("bbox_2d", "bbox", "box"):
@@ -1011,6 +1032,7 @@ class Qwen3VLTextAttention(nn.Module):
         past_key_values: Cache | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        attn_prune_meta = kwargs.pop("attn_prune_meta", None)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -1024,9 +1046,26 @@ class Qwen3VLTextAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface: Callable
+        self._attn_prune_last_weights = None
+        if attn_prune_meta is not None and not self.training and _attn_prune_side_compute():
+            self._attn_prune_last_weights = self._compute_instruction_to_visual_attention_from_qk(
+                query_states=query_states,
+                key_states=key_states,
+                attention_mask=attention_mask,
+                query_indices=attn_prune_meta.get("query_indices"),
+                visual_indices=attn_prune_meta.get("visual_indices"),
+            )
+
+        # Flash/sdpa kernels usually do not expose attention probabilities. When
+        # side-compute is disabled, selected debug/prune layers intentionally use
+        # eager attention so the probabilities can be captured from this forward.
+        if attn_prune_meta is not None and not self.training and not _attn_prune_side_compute():
+            attention_interface = eager_attention_forward
+        else:
+            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, eager_attention_forward
+            )
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -1038,16 +1077,27 @@ class Qwen3VLTextAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
+        if (
+            attn_prune_meta is not None
+            and not self.training
+            and not _attn_prune_side_compute()
+            and torch.is_tensor(attn_weights)
+        ):
+            self._attn_prune_last_weights = self._slice_instruction_to_visual_attention(
+                attn_weights=attn_weights,
+                query_indices=attn_prune_meta.get("query_indices"),
+                visual_indices=attn_prune_meta.get("visual_indices"),
+            )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
     @torch.no_grad()
-    def compute_instruction_to_visual_attention(
+    def _compute_instruction_to_visual_attention_from_qk(
         self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
         query_indices: torch.Tensor,
         visual_indices: torch.Tensor,
@@ -1056,33 +1106,45 @@ class Qwen3VLTextAttention(nn.Module):
             return None
         if query_indices.numel() == 0 or visual_indices.numel() == 0:
             return None
+        query_indices = query_indices.to(device=query_states.device, dtype=torch.long)
+        visual_indices = visual_indices.to(device=query_states.device, dtype=torch.long)
+        query_indices = query_indices[(query_indices >= 0) & (query_indices < query_states.shape[-2])]
+        visual_indices = visual_indices[(visual_indices >= 0) & (visual_indices < key_states.shape[-2])]
+        if query_indices.numel() == 0 or visual_indices.numel() == 0:
+            return None
 
-        query_indices = query_indices.to(device=hidden_states.device, dtype=torch.long)
-        visual_indices = visual_indices.to(device=hidden_states.device, dtype=torch.long)
-        hidden_q = hidden_states.index_select(1, query_indices)
-        hidden_k = hidden_states.index_select(1, visual_indices)
-        q_shape = (*hidden_q.shape[:-1], -1, self.head_dim)
-        k_shape = (*hidden_k.shape[:-1], -1, self.head_dim)
-
-        query_states = self.q_norm(self.q_proj(hidden_q).view(q_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_k).view(k_shape)).transpose(1, 2)
         key_states = repeat_kv(key_states, self.num_key_value_groups)
+        selected_queries = query_states.index_select(-2, query_indices)
+        attn_logits = torch.matmul(selected_queries.float(), key_states.float().transpose(2, 3)) * float(self.scaling)
+        if attention_mask is not None:
+            if attention_mask.dim() == 4:
+                mask = attention_mask.index_select(2, query_indices).to(device=attn_logits.device)
+                attn_logits = attn_logits + mask.float()
+            else:
+                attn_logits = attn_logits + attention_mask.to(device=attn_logits.device).float()
+        attn_weights = nn.functional.softmax(attn_logits, dim=-1, dtype=torch.float32)
+        selected = attn_weights.index_select(-1, visual_indices)
+        return selected.mean(dim=1).mean(dim=1).detach()
 
-        cos, sin = position_embeddings
-        cos_q = cos.index_select(1, query_indices)
-        sin_q = sin.index_select(1, query_indices)
-        cos_k = cos.index_select(1, visual_indices)
-        sin_k = sin.index_select(1, visual_indices)
-        query_states = _attn_prune_apply_rope_subset(query_states, cos_q, sin_q)
-        key_states = _attn_prune_apply_rope_subset(key_states, cos_k, sin_k)
-
-        logits = torch.matmul(query_states.float(), key_states.float().transpose(2, 3)) * float(self.scaling)
-        if attention_mask is not None and attention_mask.dim() == 4:
-            compact_mask = attention_mask.index_select(2, query_indices).index_select(3, visual_indices)
-            logits = logits + compact_mask.float()
-        weights = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        return weights.mean(dim=1).mean(dim=1).detach()
-
+    @torch.no_grad()
+    def _slice_instruction_to_visual_attention(
+        self,
+        attn_weights: torch.Tensor,
+        query_indices: torch.Tensor,
+        visual_indices: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if query_indices is None or visual_indices is None:
+            return None
+        if query_indices.numel() == 0 or visual_indices.numel() == 0:
+            return None
+        query_indices = query_indices.to(device=attn_weights.device, dtype=torch.long)
+        visual_indices = visual_indices.to(device=attn_weights.device, dtype=torch.long)
+        query_indices = query_indices[(query_indices >= 0) & (query_indices < attn_weights.shape[-2])]
+        visual_indices = visual_indices[(visual_indices >= 0) & (visual_indices < attn_weights.shape[-1])]
+        if query_indices.numel() == 0 or visual_indices.numel() == 0:
+            return None
+        selected = attn_weights.index_select(-2, query_indices).index_select(-1, visual_indices)
+        return selected.float().mean(dim=1).mean(dim=1).detach()
 
 class Qwen3VLTextMLP(nn.Module):
     def __init__(self, config):
@@ -1125,14 +1187,6 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.input_layernorm(hidden_states)
         self._attn_prune_last_weights = None
         attn_prune_meta = kwargs.pop("attn_prune_meta", None)
-        if attn_prune_meta is not None and not self.training:
-            self._attn_prune_last_weights = self.self_attn.compute_instruction_to_visual_attention(
-                hidden_states=hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-                query_indices=attn_prune_meta.get("query_indices"),
-                visual_indices=attn_prune_meta.get("visual_indices"),
-            )
         # Self Attention
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
@@ -1141,8 +1195,10 @@ class Qwen3VLTextDecoderLayer(GradientCheckpointingLayer):
             past_key_values=past_key_values,
             use_cache=use_cache,
             position_embeddings=position_embeddings,
+            attn_prune_meta=attn_prune_meta,
             **kwargs,
         )
+        self._attn_prune_last_weights = getattr(self.self_attn, "_attn_prune_last_weights", None)
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -1516,6 +1572,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         keep_ratio = _attn_prune_keep_ratio()
         vis_enabled = _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_VIS", "0")
         stats_enabled = _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_STATS", "0")
+        prune_vis_enabled = _attn_prune_prune_vis_enabled()
         vis_layer_set = _attn_prune_parse_layers(
             getattr(self.config, "_attn_prune_vis_layers", None),
             env_name="QWEN3VL_ATTN_PRUNE_VIS_LAYERS",
@@ -1544,6 +1601,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         )
         current_visual_indices = None
         current_visual_index_map = None
+        attn_query_indices = None
         if attn_prune_token_meta is not None:
             current_visual_indices = attn_prune_token_meta.get("current_visual_indices")
             if torch.is_tensor(current_visual_indices):
@@ -1551,14 +1609,22 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 current_visual_index_map = torch.arange(
                     int(current_visual_indices.numel()), device=hidden_states.device, dtype=torch.long
                 )
+            attn_query_indices = attn_prune_token_meta.get("attn_query_indices")
+            if torch.is_tensor(attn_query_indices):
+                attn_query_indices = attn_query_indices.to(hidden_states.device, dtype=torch.long)
         sample_stats = {
             "prune_applied": False,
             "layers": sorted(int(x) for x in prune_layer_set),
             "prune_layers": sorted(int(x) for x in prune_layer_set),
             "vis_layers": sorted(int(x) for x in vis_layer_set),
             "keep_ratio": float(keep_ratio),
+            "prune_vis_enabled": bool(prune_vis_enabled),
             "visual_tokens_before": int(current_visual_indices.numel()) if torch.is_tensor(current_visual_indices) else 0,
             "visual_tokens_after": int(current_visual_indices.numel()) if torch.is_tensor(current_visual_indices) else 0,
+            "query_tokens": int(attn_query_indices.numel()) if torch.is_tensor(attn_query_indices) else 0,
+            "query_source": "attn_query_marker" if torch.is_tensor(attn_query_indices) and attn_query_indices.numel() > 0 else "attn_query_missing",
+            "strict_query_marker": bool(_attn_prune_strict_query_marker()),
+            "attn_score_source": _attn_prune_score_source(),
             "seq_tokens_before": int(hidden_states.shape[1]),
             "seq_tokens_after": int(hidden_states.shape[1]),
             "prune_selection_sec": 0.0,
@@ -1578,9 +1644,35 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 query_indices = self._attn_prune_query_indices(
                     visual_pos_masks=visual_pos_masks,
                     current_visual_indices=current_visual_indices,
+                    attn_query_indices=attn_query_indices,
                     raw_attention_mask=raw_attention_mask,
                     seq_len=int(hidden_states.shape[1]),
                 )
+                marker_query_tokens = int(attn_query_indices.numel()) if torch.is_tensor(attn_query_indices) else 0
+                selected_query_tokens = int(query_indices.numel()) if torch.is_tensor(query_indices) else 0
+                fallback_used = bool(marker_query_tokens == 0 and selected_query_tokens > 0)
+                if fallback_used:
+                    sample_stats["query_source"] = "after_current_fallback"
+                if should_emit_debug and _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_DEBUG", "0"):
+                    token_detail = ""
+                    if _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_PRINT_QUERY_TOKENS", "0"):
+                        query_token_ids = getattr(self.config, "_attn_prune_query_token_ids_from_input_ids", [])
+                        query_token_texts = getattr(self.config, "_attn_prune_query_token_texts_from_input_ids", [])
+                        token_detail = f" query_token_ids={query_token_ids} query_token_texts={query_token_texts!r}"
+                    print(
+                        "[AttnPruneQuery] "
+                        f"sample_index={getattr(self.config, '_vlmeval_current_sample_index', '')} "
+                        f"fwd={forward_index} "
+                        f"layer={layer_idx} "
+                        f"strict_marker={int(_attn_prune_strict_query_marker())} "
+                        f"marker_query_tokens={marker_query_tokens} "
+                        f"selected_query_tokens={selected_query_tokens} "
+                        f"fallback_used={int(fallback_used)} "
+                        f"query_source={sample_stats.get('query_source')} "
+                        f"attn_score_source={sample_stats.get('attn_score_source')}"
+                        f"{token_detail}",
+                        flush=True,
+                    )
                 if query_indices is not None and query_indices.numel() > 0 and current_visual_indices.numel() > 0:
                     attn_meta = {
                         "query_indices": query_indices,
@@ -1693,6 +1785,11 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             new_is_current = is_current_visual.index_select(0, keep_indices)
             current_visual_indices = torch.where(new_is_current)[0]
             current_visual_index_map = current_visual_index_map.index_select(0, keep_rel_idx)
+            if torch.is_tensor(attn_query_indices) and attn_query_indices.numel() > 0:
+                remap = torch.full((original_seq_len,), -1, dtype=torch.long, device=hidden_states.device)
+                remap[keep_indices] = torch.arange(keep_indices.numel(), device=hidden_states.device)
+                attn_query_indices = remap.index_select(0, attn_query_indices)
+                attn_query_indices = attn_query_indices[attn_query_indices >= 0]
             prune_finish_time = time.perf_counter()
             if split_boundary_time is None:
                 split_boundary_time = t_prune0
@@ -1707,8 +1804,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     "prune_op_sec": float(sample_stats.get("prune_op_sec", 0.0) + (prune_finish_time - t_prune0)),
                 }
             )
-            if should_emit_debug and vis_enabled and layer_idx in vis_layer_set:
-                self._attn_prune_save_heatmap(
+            if should_emit_debug and prune_vis_enabled:
+                self._attn_prune_queue_pruned_heatmap(
                     weights=full_weights,
                     layer_idx=layer_idx,
                     current_visual_index_map=current_visual_index_map,
@@ -1725,7 +1822,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             sample_stats["pre_prune_1_to_16_sec"] = float(split_boundary_time - t_forward0)
             sample_stats["post_prune_to_end_sec"] = float(t_forward1 - (prune_finish_time or split_boundary_time))
             sample_stats["prune_layer_to_finish_sec"] = float((prune_finish_time or t_forward1) - split_boundary_time)
-        setattr(self.config, "_attn_prune_last_stats", sample_stats)
+        if int(sample_stats.get("visual_tokens_before", 0) or 0) > 0 or not getattr(self.config, "_attn_prune_last_stats", None):
+            setattr(self.config, "_attn_prune_last_stats", sample_stats)
 
         runtime = dict(getattr(self.config, "_vlmeval_generate_timing_accum", {}) or {})
         runtime.setdefault("prefill_s", 0.0)
@@ -1769,6 +1867,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         self,
         visual_pos_masks: torch.Tensor,
         current_visual_indices: torch.Tensor,
+        attn_query_indices: torch.Tensor | None,
         raw_attention_mask: torch.Tensor | None,
         seq_len: int,
     ) -> torch.Tensor | None:
@@ -1780,6 +1879,15 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             valid = raw_attention_mask[0].bool().to(device)
         else:
             valid = torch.ones(seq_len, dtype=torch.bool, device=device)
+        if torch.is_tensor(attn_query_indices) and attn_query_indices.numel() > 0:
+            query = attn_query_indices.to(device=device, dtype=torch.long)
+            query = query[(query >= 0) & (query < seq_len)]
+            if query.numel() > 0:
+                query = query[non_visual.index_select(0, query) & valid.index_select(0, query)]
+            if query.numel() > 0:
+                return query
+        if _attn_prune_strict_query_marker():
+            return None
         start = int(current_visual_indices.max().item()) + 1
         after_current = torch.arange(start, seq_len, device=device, dtype=torch.long)
         if after_current.numel() > 0:
@@ -2019,16 +2127,28 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         patch_w = image.width / float(grid_w)
         patch_h = image.height / float(grid_h)
         draw = ImageDraw.Draw(image, mode="RGBA")
+        draw.rectangle([0, 0, image.width, image.height], fill=(0, 0, 0, 70))
         w_min = float(weights.min().item())
         w_max = float(weights.max().item())
         denom = w_max - w_min if w_max > w_min else 1.0
         for idx in range(int(weights.numel())):
             row, col = divmod(idx, grid_w)
             value = float((weights[idx].item() - w_min) / denom)
-            alpha = int(210 * value)
+            boosted = value ** 0.65
+            if boosted < 0.5:
+                t = boosted / 0.5
+                red = int(30 + 225 * t)
+                green = int(90 + 40 * t)
+                blue = int(220 * (1.0 - t))
+            else:
+                t = (boosted - 0.5) / 0.5
+                red = 255
+                green = int(130 + 125 * t)
+                blue = 0
+            alpha = int(55 + 200 * boosted)
             x0, y0 = col * patch_w, row * patch_h
             x1, y1 = x0 + patch_w, y0 + patch_h
-            draw.rectangle([x0, y0, x1, y1], fill=(255, 0, 0, alpha))
+            draw.rectangle([x0, y0, x1, y1], fill=(red, green, blue, alpha))
         if kept_current_map is not None:
             keep_mask = torch.zeros(int(weights.numel()), dtype=torch.bool)
             keep_mask[kept_current_map.detach().cpu().long()] = True
@@ -2037,12 +2157,49 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 row, col = divmod(int(idx), grid_w)
                 x0, y0 = col * patch_w, row * patch_h
                 x1, y1 = x0 + patch_w, y0 + patch_h
-                draw.rectangle([x0, y0, x1, y1], fill=(120, 120, 120, 130))
+                draw.rectangle([x0, y0, x1, y1], fill=(0, 0, 0, 255))
         _attn_prune_draw_gt(self.config, image)
         _attn_prune_draw_prediction(self.config, image)
         image = self._attn_prune_add_caption(image, layer_idx=layer_idx, pruned=kept_current_map is not None)
         suffix = "attn_pruned.png" if kept_current_map is not None else "attn.png"
         image.save(self._attn_prune_output_prefix(layer_idx, suffix))
+
+    def _attn_prune_queue_pruned_heatmap(
+        self,
+        weights: torch.Tensor,
+        layer_idx: int,
+        current_visual_index_map: torch.Tensor | None,
+        kept_current_map: torch.Tensor | None,
+    ) -> None:
+        if weights is None or kept_current_map is None:
+            return
+        pending = list(getattr(self.config, "_attn_prune_pending_prune_visualizations", []) or [])
+        pending.append(
+            {
+                "weights": weights.detach().float().cpu(),
+                "layer_idx": int(layer_idx),
+                "current_visual_index_map": (
+                    current_visual_index_map.detach().cpu().long()
+                    if torch.is_tensor(current_visual_index_map)
+                    else None
+                ),
+                "kept_current_map": kept_current_map.detach().cpu().long() if torch.is_tensor(kept_current_map) else None,
+            }
+        )
+        self.config._attn_prune_pending_prune_visualizations = pending
+
+    def _attn_prune_flush_pending_prune_visualizations(self) -> None:
+        pending = list(getattr(self.config, "_attn_prune_pending_prune_visualizations", []) or [])
+        self.config._attn_prune_pending_prune_visualizations = []
+        for item in pending:
+            if not isinstance(item, dict):
+                continue
+            self._attn_prune_save_heatmap(
+                weights=item.get("weights"),
+                layer_idx=int(item.get("layer_idx", 0) or 0),
+                current_visual_index_map=item.get("current_visual_index_map"),
+                kept_current_map=item.get("kept_current_map"),
+            )
 
     def _attn_prune_write_stats(self, stats: dict) -> None:
         if not stats:
@@ -2177,6 +2334,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
     def _attn_prune_current_image_meta(
         self,
+        input_ids: torch.Tensor | None,
         image_mask: torch.Tensor | None,
         image_grid_thw: torch.Tensor | None,
     ) -> dict | None:
@@ -2197,13 +2355,94 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             if current_count <= 0 or offset + current_count > int(positions.numel()):
                 return None
             current_visual_indices = positions[offset : offset + current_count]
+            query_indices = self._attn_prune_marker_query_indices(input_ids, current_visual_indices)
+            if _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_DEBUG", "0"):
+                print(
+                    "[AttnPruneTokenMeta] "
+                    f"sample_index={getattr(self.config.text_config, '_vlmeval_current_sample_index', '')} "
+                    f"input_seq_len={int(input_ids.shape[1]) if input_ids is not None and input_ids.dim() == 2 else -1} "
+                    f"image_positions={int(positions.numel())} "
+                    f"image_count={int(counts.numel())} "
+                    f"current_visual_tokens={int(current_visual_indices.numel())} "
+                    f"current_start={int(current_visual_indices.min().item()) if current_visual_indices.numel() > 0 else -1} "
+                    f"current_end={int(current_visual_indices.max().item()) if current_visual_indices.numel() > 0 else -1} "
+                    f"query_tokens={int(query_indices.numel()) if torch.is_tensor(query_indices) else 0}",
+                    flush=True,
+                )
             self.config.text_config._attn_prune_current_image_grid_thw = image_grid_thw[-1:].detach()
             return {
                 "current_visual_indices": current_visual_indices,
                 "current_image_grid_thw": image_grid_thw[-1:].detach(),
+                "attn_query_indices": query_indices,
             }
         except Exception:
             return None
+
+    def _attn_prune_marker_query_indices(
+        self,
+        input_ids: torch.Tensor | None,
+        current_visual_indices: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if input_ids is None or current_visual_indices is None or current_visual_indices.numel() == 0:
+            return None
+        if input_ids.dim() != 2 or input_ids.shape[0] != 1:
+            return None
+        cfg = self.config.text_config
+        fixed_query_indices = getattr(cfg, "_attn_prune_query_indices_from_input_ids", None)
+        if fixed_query_indices:
+            query = torch.tensor([int(x) for x in fixed_query_indices], device=current_visual_indices.device, dtype=torch.long)
+            query = query[query > int(current_visual_indices.max().item())]
+            return query if query.numel() > 0 else None
+        begin_patterns = getattr(cfg, "_attn_prune_query_begin_token_patterns", None)
+        end_patterns = getattr(cfg, "_attn_prune_query_end_token_patterns", None)
+        if not begin_patterns:
+            begin_ids = getattr(cfg, "_attn_prune_query_begin_token_ids", None)
+            begin_patterns = [begin_ids] if begin_ids else []
+        if not end_patterns:
+            end_ids = getattr(cfg, "_attn_prune_query_end_token_ids", None)
+            end_patterns = [end_ids] if end_ids else []
+        begin_patterns = [[int(x) for x in pattern] for pattern in begin_patterns if pattern]
+        end_patterns = [[int(x) for x in pattern] for pattern in end_patterns if pattern]
+        if not begin_patterns or not end_patterns:
+            return None
+        tokens = input_ids[0].detach().to(device=current_visual_indices.device, dtype=torch.long)
+        search_start = int(current_visual_indices.max().item()) + 1
+        begin_match = self._attn_prune_find_first_pattern(tokens, begin_patterns, start=search_start)
+        if begin_match is None:
+            return None
+        begin_pos, begin_len = begin_match
+        query_start = begin_pos + begin_len
+        end_match = self._attn_prune_find_first_pattern(tokens, end_patterns, start=query_start)
+        if end_match is None:
+            return None
+        end_pos, _ = end_match
+        if end_pos is None or end_pos <= query_start:
+            return None
+        return torch.arange(query_start, end_pos, device=tokens.device, dtype=torch.long)
+
+    @staticmethod
+    def _attn_prune_find_first_pattern(tokens: torch.Tensor, patterns: list[list[int]], start: int = 0) -> tuple[int, int] | None:
+        best = None
+        for pattern_ids in patterns:
+            pattern = torch.tensor([int(x) for x in pattern_ids], device=tokens.device, dtype=torch.long)
+            pos = Qwen3VLModel._attn_prune_find_subsequence(tokens, pattern, start=start)
+            if pos is None:
+                continue
+            candidate = (int(pos), int(pattern.numel()))
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+        return best
+
+    @staticmethod
+    def _attn_prune_find_subsequence(tokens: torch.Tensor, pattern: torch.Tensor, start: int = 0) -> int | None:
+        if pattern.numel() == 0 or tokens.numel() < pattern.numel():
+            return None
+        max_start = int(tokens.numel() - pattern.numel())
+        start = max(0, min(int(start), max_start))
+        for pos in range(start, max_start + 1):
+            if torch.equal(tokens[pos : pos + pattern.numel()], pattern):
+                return int(pos)
+        return None
 
     def get_vision_position_ids(
         self,
@@ -2567,7 +2806,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             visual_pos_masks = video_mask
             deepstack_visual_embeds = deepstack_video_embeds
 
-        attn_prune_token_meta = self._attn_prune_current_image_meta(image_mask, image_grid_thw)
+        attn_prune_token_meta = self._attn_prune_current_image_meta(input_ids, image_mask, image_grid_thw)
 
         if position_ids is None:
             position_ids = self.compute_3d_position_ids(

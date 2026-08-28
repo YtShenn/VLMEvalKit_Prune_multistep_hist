@@ -16,6 +16,10 @@ from .state_packet import build_state_packet, state_packet_debug_enabled, state_
 from ..utils.current_delta_packet import DeltaPacketConfig, build_current_delta_packet
 
 
+ATTN_QUERY_BEGIN = "<attn_query>"
+ATTN_QUERY_END = "</attn_query>"
+
+
 PROMPT_TEMPLATE = """
 Instruction:
 Observe screenshot(s) carefully and propose the most possible element in screenshot1 with bbox_2d[x1, y1, x2, y2] and action_type that can make screenshot1 finish the following Task.
@@ -845,6 +849,15 @@ class AndroidControlCurated(ImageBaseDataset):
             "If current region crops are provided, their crop_xyxy labels are in original current screenshot coordinates."
         )
 
+    def _build_post_current_task_text(self, instruction: str) -> str:
+        return (
+            "Current task:\n"
+            f"{ATTN_QUERY_BEGIN}\n"
+            f"{instruction}\n"
+            f"{ATTN_QUERY_END}\n"
+            "Use the current screenshot above to identify the target element for this task."
+        )
+
     def _current_image_label(self, kind: str) -> str:
         label_map = {
             "current_full": "Current Screenshot",
@@ -1001,6 +1014,8 @@ class AndroidControlCurated(ImageBaseDataset):
                         msgs.append(dict(image_item))
                     msgs.append(dict(type="text", value=f"{i + 1}. {action_text}\n"))
             self._append_current_visual_entries(msgs, debug_parts, current_entries)
+            post_current_task = self._build_post_current_task_text(instruction)
+            debug_parts.append(post_current_task)
             debug_parts.append(outro)
             self._maybe_debug_print_prompt(
                 line=line,
@@ -1009,6 +1024,7 @@ class AndroidControlCurated(ImageBaseDataset):
                 history_text=history,
                 prompt="\n".join(debug_parts),
             )
+            msgs.append(dict(type="text", value=post_current_task))
             msgs.append(dict(type="text", value=outro))
             self._debug_print_current_delta_entries(current_entries)
             if state_packet_debug_enabled() and history_entries:
@@ -1046,6 +1062,7 @@ class AndroidControlCurated(ImageBaseDataset):
             prompt += f"Image_{len(hist_actions_kept)}: [current delta packet images]\n"
         else:
             prompt += f"Image_{len(hist_actions_kept)}: [current screenshot]\n"
+        prompt += self._build_post_current_task_text(instruction) + "\n"
         prompt += self._build_reference_style_outro()
         self._maybe_debug_print_prompt(
             line=line,
@@ -1071,6 +1088,7 @@ class AndroidControlCurated(ImageBaseDataset):
                 msgs.append(dict(type="text", value=f"Step_{i}: {action_text}.\n"))
         current_debug_parts = []
         self._append_current_visual_entries(msgs, current_debug_parts, current_entries)
+        msgs.append(dict(type="text", value=self._build_post_current_task_text(instruction)))
         msgs.append(dict(type="text", value=self._build_reference_style_outro()))
         self._debug_print_current_delta_entries(current_entries)
         if state_packet_debug_enabled() and history_entries:

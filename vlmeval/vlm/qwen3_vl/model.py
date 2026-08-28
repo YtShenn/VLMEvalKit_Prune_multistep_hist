@@ -773,6 +773,8 @@ def _configure_roi_prune_context(model, dataset: str | None, message: list[dict]
     cfg._vlmeval_generate_timing_accum = {}
     cfg._vlmeval_generate_timing_last = {}
     cfg._vlmeval_generate_forward_index = 0
+    cfg._vlmeval_current_actual_prediction = ''
+    cfg._attn_prune_pending_prune_visualizations = []
     cfg._roi_prune_last_stats = {}
     cfg._roi_prune_json_path = json_path or None
     cfg._roi_prune_debug = _env_flag('QWEN3VL_ROI_PRUNE_DEBUG', '0')
@@ -809,6 +811,115 @@ def _configure_roi_prune_context(model, dataset: str | None, message: list[dict]
     cfg._roi_prune_enabled = bool(enabled and json_path and _sample_allows_roi_prune(dataset, sample_meta))
 
 
+def _configure_attn_prune_query_markers(model, processor) -> None:
+    try:
+        cfg = model.config.text_config
+    except Exception:
+        return
+    tokenizer = getattr(processor, 'tokenizer', None)
+    if tokenizer is None:
+        return
+    try:
+        begin_patterns = []
+        end_patterns = []
+        for prefix in ('', '\n', ' '):
+            begin_ids = tokenizer.encode(f'{prefix}<attn_query>', add_special_tokens=False)
+            end_ids = tokenizer.encode(f'{prefix}</attn_query>', add_special_tokens=False)
+            if begin_ids:
+                begin_patterns.append([int(x) for x in begin_ids])
+            if end_ids:
+                end_patterns.append([int(x) for x in end_ids])
+    except Exception:
+        return
+    if begin_patterns and end_patterns:
+        cfg._attn_prune_query_begin_token_ids = begin_patterns[0]
+        cfg._attn_prune_query_end_token_ids = end_patterns[0]
+        cfg._attn_prune_query_begin_token_patterns = begin_patterns
+        cfg._attn_prune_query_end_token_patterns = end_patterns
+        if _env_flag('QWEN3VL_ATTN_PRUNE_DEBUG', '0'):
+            print(
+                '[AttnPruneMarkerConfig] '
+                f'begin_patterns={begin_patterns} end_patterns={end_patterns}',
+                flush=True,
+            )
+
+
+def _input_ids_from_batch(inputs):
+    if isinstance(inputs, dict):
+        return inputs.get('input_ids', None)
+    return getattr(inputs, 'input_ids', None)
+
+
+def _configure_attn_prune_query_indices(model, processor, inputs) -> None:
+    try:
+        cfg = model.config.text_config
+    except Exception:
+        return
+    cfg._attn_prune_query_indices_from_input_ids = []
+    tokenizer = getattr(processor, 'tokenizer', None)
+    input_ids = _input_ids_from_batch(inputs)
+    if tokenizer is None or input_ids is None:
+        return
+    try:
+        if int(input_ids.shape[0]) != 1:
+            return
+        ids = [int(x) for x in input_ids[0].detach().cpu().tolist()]
+        pieces = []
+        spans = []
+        cursor = 0
+        for tok in ids:
+            text = tokenizer.decode([tok], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            start = cursor
+            cursor += len(text)
+            spans.append((start, cursor))
+            pieces.append(text)
+        decoded = ''.join(pieces)
+        begin = decoded.find('<attn_query>')
+        end = decoded.find('</attn_query>', begin + len('<attn_query>')) if begin >= 0 else -1
+        if begin < 0 or end < 0:
+            if _env_flag('QWEN3VL_ATTN_PRUNE_DEBUG', '0'):
+                print(
+                    '[AttnPruneMarkerLocate] '
+                    f'found=0 input_tokens={len(ids)} decoded_has_begin={int("<attn_query>" in decoded)}',
+                    flush=True,
+                )
+            return
+        content_start = begin + len('<attn_query>')
+        content_end = end
+        query_indices = [
+            i for i, (s, e) in enumerate(spans)
+            if e > content_start and s < content_end and pieces[i].strip()
+        ]
+        cfg._attn_prune_query_indices_from_input_ids = [int(x) for x in query_indices]
+        print_query_tokens = _env_flag('QWEN3VL_ATTN_PRUNE_PRINT_QUERY_TOKENS', '0')
+        if print_query_tokens:
+            cfg._attn_prune_query_token_ids_from_input_ids = [int(ids[i]) for i in query_indices]
+            cfg._attn_prune_query_token_texts_from_input_ids = [str(pieces[i]) for i in query_indices]
+        else:
+            cfg._attn_prune_query_token_ids_from_input_ids = []
+            cfg._attn_prune_query_token_texts_from_input_ids = []
+        if _env_flag('QWEN3VL_ATTN_PRUNE_DEBUG', '0'):
+            query_text = decoded[content_start:content_end].strip().replace('\n', '\\n')
+            preview = decoded[begin:min(len(decoded), end + len('</attn_query>') + 80)].replace('\n', '\\n')
+            print(
+                '[AttnPruneMarkerLocate] '
+                f'found=1 input_tokens={len(ids)} query_tokens={len(query_indices)} '
+                f'begin_char={begin} end_char={end} query_text={query_text!r} preview={preview!r}',
+                flush=True,
+            )
+        if print_query_tokens:
+            print(
+                '[AttnPruneQueryTokens] '
+                f'query_indices={cfg._attn_prune_query_indices_from_input_ids} '
+                f'query_token_ids={cfg._attn_prune_query_token_ids_from_input_ids} '
+                f'query_token_texts={cfg._attn_prune_query_token_texts_from_input_ids!r}',
+                flush=True,
+            )
+    except Exception as err:
+        if _env_flag('QWEN3VL_ATTN_PRUNE_DEBUG', '0'):
+            print(f'[AttnPruneMarkerLocate] error={type(err).__name__}:{err}', flush=True)
+
+
 def _record_attn_prune_stats(owner, model, sample_meta: dict | None) -> None:
     if not _use_qwen3vl_attn_prune_model(getattr(owner, 'use_attn_prune', False)):
         return
@@ -838,6 +949,8 @@ def _record_attn_prune_stats(owner, model, sample_meta: dict | None) -> None:
             f"prune_layers={stats.get('prune_layers', stats.get('layers'))} "
             f"vis_layers={stats.get('vis_layers')} "
             f"keep_ratio={float(stats.get('keep_ratio', 1.0) or 1.0):.3f} "
+            f"attn_score_source={stats.get('attn_score_source')} "
+            f"prune_vis={int(bool(stats.get('prune_vis_enabled', False)))} "
             f"visual_before={stats.get('visual_tokens_before')} "
             f"visual_after={stats.get('visual_tokens_after')} "
             f"seq_before={stats.get('seq_tokens_before')} "
@@ -846,6 +959,21 @@ def _record_attn_prune_stats(owner, model, sample_meta: dict | None) -> None:
             f"prune_op_s={float(stats.get('prune_op_sec', 0.0) or 0.0):.6f}",
             flush=True,
         )
+
+
+def _flush_attn_prune_actual_prediction_visuals(owner, model, response: str) -> None:
+    if not _use_qwen3vl_attn_prune_model(getattr(owner, 'use_attn_prune', False)):
+        return
+    try:
+        cfg = model.config.text_config
+        cfg._vlmeval_current_actual_prediction = str(response or '')
+        text_model = getattr(getattr(model, 'model', None), 'language_model', None)
+        flush = getattr(text_model, '_attn_prune_flush_pending_prune_visualizations', None)
+        if callable(flush):
+            flush()
+    except Exception as exc:
+        if _env_flag('QWEN3VL_ATTN_PRUNE_DEBUG', '0'):
+            print(f'[AttnPrunePruneVis] flush_error={type(exc).__name__}:{exc}', flush=True)
 
 
 def _record_roi_prune_stats(owner, model, sample_meta: dict | None) -> None:
@@ -1483,7 +1611,9 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 pass
         sample_meta = kwargs.get('sample_meta') if isinstance(kwargs, dict) else None
         if not is_omni and hasattr(self, 'model'):
+            _configure_attn_prune_query_markers(self.model, self.processor)
             _configure_roi_prune_context(self.model, dataset, message, sample_meta, inputs)
+            _configure_attn_prune_query_indices(self.model, self.processor, inputs)
         try:
             inputs = inputs.to(self.model.device)
             if hasattr(self.model, 'dtype'):
@@ -1835,4 +1965,6 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 base=denorm_base,
                 denorm=enable_android_denorm,
             )
+            if not self.use_vllm and hasattr(self, 'model'):
+                _flush_attn_prune_actual_prediction_visuals(self, self.model, response)
         return response

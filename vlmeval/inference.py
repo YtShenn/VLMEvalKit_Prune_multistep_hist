@@ -110,6 +110,23 @@ def _sort_androidcontrol_sequential(data):
     return ordered.drop(columns=['_tmp_traj_key', '_tmp_step_idx', '_tmp_row_order'])
 
 
+def _load_sample_indices_from_env():
+    index_text = os.getenv('VLM_EVAL_SAMPLE_INDICES', '').strip()
+    index_file = os.getenv('VLM_EVAL_SAMPLE_INDEX_FILE', '').strip()
+    if index_file:
+        try:
+            with open(index_file, 'r', encoding='utf-8') as f:
+                file_text = f.read()
+        except Exception as err:
+            warnings.warn(f'[EvalSample] failed to read VLM_EVAL_SAMPLE_INDEX_FILE={index_file}: {err}')
+            file_text = ''
+        index_text = f'{index_text}\n{file_text}' if index_text else file_text
+    if not index_text:
+        return []
+    parts = re.split(r'[\s,]+', index_text)
+    return [x.strip() for x in parts if x.strip()]
+
+
 def _task_key_for_sampling(dataset_name, row):
     dataset_name = str(dataset_name or '')
     if 'AndroidControl_Curated' in dataset_name:
@@ -168,6 +185,31 @@ def _task_key_for_sampling(dataset_name, row):
 
 def _maybe_apply_eval_sampling(data, dataset_name, rank=0):
     mode = os.getenv('VLM_EVAL_SAMPLE_MODE', 'off').strip().lower()
+    if mode in ('index', 'indices', 'fixed_index', 'fixed_indices'):
+        wanted_indices = _load_sample_indices_from_env()
+        if not wanted_indices:
+            if rank == 0:
+                print('[EvalSample] mode=index no indices provided, fallback to full dataset', flush=True)
+            if 'AndroidControl_Curated' in str(dataset_name or ''):
+                return _sort_androidcontrol_sequential(data)
+            return data
+
+        wanted = set(str(x) for x in wanted_indices)
+        filtered = data.loc[[str(x) in wanted for x in data['index']]].copy()
+        if 'AndroidControl_Curated' in str(dataset_name or ''):
+            filtered = _sort_androidcontrol_sequential(filtered)
+        if rank == 0:
+            kept = [str(x) for x in filtered['index']]
+            missing = sorted(wanted.difference(kept), key=lambda x: (len(x), x))
+            msg = (
+                f'[EvalSample] mode=index requested_indices={len(wanted)} '
+                f'kept_steps={len(filtered)}/{len(data)}'
+            )
+            if missing:
+                msg += f' missing={len(missing)}'
+            print(msg, flush=True)
+        return filtered
+
     if mode in ('', '0', 'off', 'false', 'none'):
         if 'AndroidControl_Curated' in str(dataset_name or ''):
             return _sort_androidcontrol_sequential(data)

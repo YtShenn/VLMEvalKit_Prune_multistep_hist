@@ -119,6 +119,17 @@ def _cache_seq_len(past_key_values, fallback: int) -> int:
         return int(fallback)
 
 
+def _align_attention_mask_to_past(
+    attention_mask: torch.Tensor,
+    past_key_values,
+    device: torch.device,
+) -> torch.Tensor:
+    past_len = _cache_seq_len(past_key_values, int(attention_mask.shape[1]))
+    if past_len <= 0 or int(attention_mask.shape[1]) == past_len:
+        return attention_mask
+    return torch.ones((attention_mask.shape[0], past_len), dtype=attention_mask.dtype, device=device)
+
+
 def _select_next_token(logits: torch.Tensor, generate_kwargs: dict[str, Any]) -> int:
     next_logits = logits[:, -1, :]
     do_sample = bool(generate_kwargs.get("do_sample", False))
@@ -184,6 +195,7 @@ def _decode_position_kwargs(model, past_key_values, q_len: int, device: torch.de
     past_len = _cache_seq_len(past_key_values, 0)
     positions = torch.arange(past_len, past_len + int(q_len), dtype=torch.long, device=device)
     kwargs = {"cache_position": positions}
+    prune_offset = 0
 
     # Qwen3-VL uses multimodal RoPE deltas after the first prefill. If we omit
     # position_ids here, the model recomputes them from the full attention_mask
@@ -192,11 +204,20 @@ def _decode_position_kwargs(model, past_key_values, q_len: int, device: torch.de
     qwen_model = getattr(model, "model", None)
     rope_deltas = getattr(qwen_model, "rope_deltas", None)
     if torch.is_tensor(rope_deltas):
+        text_model = getattr(qwen_model, "language_model", None)
+        text_config = getattr(text_model, "config", None)
+        prune_offset = int(getattr(text_config, "_attn_prune_cache_position_offset", 0) or 0)
+        logical_positions = positions + prune_offset
         delta = rope_deltas.to(device=device, dtype=torch.long)
         batch = int(delta.shape[0]) if delta.ndim >= 1 else 1
-        base = positions.view(1, 1, -1).expand(3, batch, -1)
+        base = logical_positions.view(1, 1, -1).expand(3, batch, -1)
         delta = delta.view(1, batch, 1)
         kwargs["position_ids"] = base + delta
+    if _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG_POS", "0"):
+        print(
+            f"[StructuredFastDecodePos] past_len={past_len} q_len={int(q_len)} prune_offset={prune_offset}",
+            flush=True,
+        )
     return kwargs
 
 
@@ -255,6 +276,7 @@ def _forward_token_ids(
         n_tok = int(ids.shape[1])
         if n_tok == 0:
             continue
+        attention_mask = _align_attention_mask_to_past(attention_mask, past_key_values, device)
         new_mask = torch.ones((attention_mask.shape[0], n_tok), dtype=attention_mask.dtype, device=device)
         attention_mask = torch.cat([attention_mask, new_mask], dim=1)
         start = time.perf_counter()

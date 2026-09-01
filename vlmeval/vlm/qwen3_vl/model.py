@@ -955,6 +955,14 @@ def _record_attn_prune_stats(owner, model, sample_meta: dict | None) -> None:
             f"visual_after={stats.get('visual_tokens_after')} "
             f"seq_before={stats.get('seq_tokens_before')} "
             f"seq_after={stats.get('seq_tokens_after')} "
+            f"safety={int(bool(stats.get('safety_keep_enabled', False)))} "
+            f"safety_mode={stats.get('safety_keep_select_mode', 'disabled')} "
+            f"safety_added={stats.get('safety_keep_added_tokens', 0)} "
+            f"safety_candidates={stats.get('safety_keep_candidate_tokens', 0)} "
+            f"safety_final={stats.get('safety_keep_final_tokens', 0)} "
+            f"safety_uniform={stats.get('safety_keep_uniform_tokens', 0)} "
+            f"safety_region={stats.get('safety_keep_region_tokens', 0)} "
+            f"safety_text={stats.get('safety_keep_text_dense_tokens', 0)} "
             f"selection_s={float(stats.get('prune_selection_sec', 0.0) or 0.0):.6f} "
             f"prune_op_s={float(stats.get('prune_op_sec', 0.0) or 0.0):.6f}",
             flush=True,

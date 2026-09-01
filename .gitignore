@@ -221,5 +221,6 @@ outputs*/
 LOGS*/
 *.log
 *.zip
-OUTPUT/
+OUTPUT*/
+OUTPUT_0*/
 VISUALIZE/

@@ -32,7 +32,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from transformers import initialization as init
 from transformers.activations import ACT2FN
@@ -190,6 +190,28 @@ def _attn_prune_env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _attn_prune_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return int(default)
+
+
+def _attn_prune_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return float(default)
+
+
+def _attn_prune_env_choice(name: str, default: str) -> str:
+    value = os.getenv(name, default)
+    try:
+        return value.strip().lower()
+    except Exception:
+        return str(default).lower()
+
+
 def _attn_prune_strict_query_marker() -> bool:
     return _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_STRICT_QUERY_MARKER", "1")
 
@@ -245,12 +267,31 @@ def _attn_prune_keep_ratio() -> float:
     return min(1.0, value)
 
 
+def _attn_prune_safety_keep_enabled() -> bool:
+    return _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_SAFETY_KEEP", "0")
+
+
 def _attn_prune_out_dir() -> str:
     return os.getenv("QWEN3VL_ATTN_PRUNE_OUT_DIR", "OUTPUT/attn_prune_debug")
 
 
 def _attn_prune_prefill_only() -> bool:
     return _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_PREFILL_ONLY", "1")
+
+
+def _attn_conf_enabled() -> bool:
+    return _attn_prune_env_flag("QWEN3VL_ATTN_CONF_ENABLE", "0")
+
+
+def _attn_conf_layers() -> set[int]:
+    return _attn_prune_parse_layers(
+        os.getenv("QWEN3VL_ATTN_CONF_LAYERS", "0,1,2,3"),
+        env_name="QWEN3VL_ATTN_CONF_LAYERS",
+    )
+
+
+def _attn_conf_out_dir() -> str:
+    return os.getenv("QWEN3VL_ATTN_CONF_OUT_DIR", _attn_prune_out_dir())
 
 
 def _attn_prune_sanitize_filename(value: object, max_len: int = 80) -> str:
@@ -352,6 +393,56 @@ def _attn_prune_distribution_stats(weights: torch.Tensor, keep_ratio: float, lay
         "topk_mass": float(top_values.sum().item()),
         "max_mean_ratio": float(max_value / max(mean, 1e-12)),
         "hist_bins": [float(x) for x in hist.tolist()],
+    }
+
+
+def _attn_confidence_stats(weights: torch.Tensor, layer_idx: int) -> dict:
+    values = weights.detach().float().flatten().cpu()
+    if values.numel() == 0:
+        return {}
+    values = values.clamp_min(0.0)
+    total = values.sum().clamp_min(1e-12)
+    prob = values / total
+    n = int(prob.numel())
+    entropy = float((-(prob * prob.clamp_min(1e-12).log()).sum()).item())
+    normalized_entropy = float(entropy / math.log(max(2, n)))
+    confidence = max(0.0, min(1.0, 1.0 - normalized_entropy))
+    sorted_prob = torch.sort(prob, descending=True).values
+
+    def top_mass(ratio: float) -> float:
+        k = min(n, max(1, int(math.ceil(float(n) * float(ratio)))))
+        return float(sorted_prob[:k].sum().item())
+
+    if n > 1:
+        ascending = torch.sort(values).values
+        denom = float(n) * float(values.sum().item())
+        if denom > 0:
+            idx = torch.arange(1, n + 1, dtype=torch.float32)
+            gini = float(((2.0 * idx - n - 1.0) * ascending).sum().item() / denom)
+        else:
+            gini = 0.0
+    else:
+        gini = 0.0
+
+    mean = float(values.mean().item())
+    max_value = float(values.max().item())
+    return {
+        "layer_idx": int(layer_idx),
+        "num_visual_tokens": n,
+        "entropy": entropy,
+        "normalized_entropy": normalized_entropy,
+        "confidence": confidence,
+        "uncertainty": normalized_entropy,
+        "top1_mass": float(prob.max().item()),
+        "top5_mass": top_mass(0.05),
+        "top10_mass": top_mass(0.10),
+        "top20_mass": top_mass(0.20),
+        "gini": gini,
+        "max_mean_ratio": float(max_value / max(mean, 1e-12)),
+        "min": float(values.min().item()),
+        "max": max_value,
+        "mean": mean,
+        "std": float(values.std(unbiased=False).item()) if n > 1 else 0.0,
     }
 
 
@@ -1551,6 +1642,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             position_ids = position_ids[1:]
         else:
             text_position_ids = None
+        if is_prefill_forward:
+            setattr(self.config, "_attn_prune_cache_position_offset", 0)
 
         attention_mask = create_causal_mask(
             config=self.config,
@@ -1572,6 +1665,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         keep_ratio = _attn_prune_keep_ratio()
         vis_enabled = _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_VIS", "0")
         stats_enabled = _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_STATS", "0")
+        conf_enabled = _attn_conf_enabled()
+        conf_layer_set = _attn_conf_layers() if conf_enabled else set()
         prune_vis_enabled = _attn_prune_prune_vis_enabled()
         vis_layer_set = _attn_prune_parse_layers(
             getattr(self.config, "_attn_prune_vis_layers", None),
@@ -1591,8 +1686,10 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         attn_layer_set = set(prune_layer_set) if prune_enabled else set()
         if vis_enabled or stats_enabled:
             attn_layer_set |= set(vis_layer_set)
+        if conf_enabled:
+            attn_layer_set |= set(conf_layer_set)
         need_attn = (
-            (prune_enabled or vis_enabled or stats_enabled)
+            (prune_enabled or vis_enabled or stats_enabled or conf_enabled)
             and bool(attn_layer_set)
             and visual_pos_masks is not None
             and attn_prune_token_meta is not None
@@ -1629,6 +1726,16 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             "seq_tokens_after": int(hidden_states.shape[1]),
             "prune_selection_sec": 0.0,
             "prune_op_sec": 0.0,
+            "safety_keep_enabled": bool(_attn_prune_safety_keep_enabled()),
+            "safety_keep_select_mode": _attn_prune_env_choice("QWEN3VL_ATTN_PRUNE_SAFETY_SELECT_MODE", "spatial")
+            if _attn_prune_safety_keep_enabled()
+            else "disabled",
+            "safety_keep_added_tokens": 0,
+            "safety_keep_candidate_tokens": 0,
+            "safety_keep_final_tokens": 0,
+            "safety_keep_uniform_tokens": 0,
+            "safety_keep_region_tokens": 0,
+            "safety_keep_text_dense_tokens": 0,
             "selected_top4_grids": [],
             "layer_stats": [],
         }
@@ -1728,6 +1835,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     current_visual_index_map=current_visual_index_map,
                     kept_current_map=None,
                 )
+            if should_emit_debug and conf_enabled and layer_idx in conf_layer_set:
+                self._attn_conf_write_record(full_weights, layer_idx=layer_idx)
 
             if (
                 not prune_enabled
@@ -1741,7 +1850,25 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             keep_count = max(1, int(math.ceil(float(attn_weights_1d.numel()) * keep_ratio)))
             keep_count = min(keep_count, int(attn_weights_1d.numel()))
             keep_rel_idx = torch.topk(attn_weights_1d.float(), k=keep_count, largest=True).indices.sort().values
+            keep_rel_idx, safety_meta = self._attn_prune_merge_safety_keep(
+                keep_rel_idx,
+                token_count=int(attn_weights_1d.numel()),
+                device=attn_weights_1d.device,
+                attn_weights_1d=attn_weights_1d,
+            )
             sample_stats["prune_selection_sec"] += float(time.perf_counter() - t_select0)
+            sample_stats.update(
+                {
+                    "safety_keep_enabled": bool(safety_meta.get("enabled", False)),
+                    "safety_keep_select_mode": str(safety_meta.get("select_mode", "")),
+                    "safety_keep_added_tokens": int(safety_meta.get("added_tokens", 0) or 0),
+                    "safety_keep_candidate_tokens": int(safety_meta.get("candidate_tokens", 0) or 0),
+                    "safety_keep_final_tokens": int(safety_meta.get("final_keep_tokens", keep_rel_idx.numel()) or 0),
+                    "safety_keep_uniform_tokens": int(safety_meta.get("uniform_tokens", 0) or 0),
+                    "safety_keep_region_tokens": int(safety_meta.get("region_tokens", 0) or 0),
+                    "safety_keep_text_dense_tokens": int(safety_meta.get("text_dense_tokens", 0) or 0),
+                }
+            )
 
             t_prune0 = time.perf_counter()
             original_seq_len = int(hidden_states.shape[1])
@@ -1762,6 +1889,9 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 original_seq_len=original_seq_len,
             )
             hidden_states = hidden_states.index_select(1, keep_indices)
+            dropped_tokens = int(original_seq_len - int(hidden_states.shape[1]))
+            previous_offset = int(getattr(self.config, "_attn_prune_cache_position_offset", 0) or 0)
+            setattr(self.config, "_attn_prune_cache_position_offset", previous_offset + dropped_tokens)
             if text_position_ids is not None:
                 text_position_ids = text_position_ids.index_select(1, keep_indices)
             position_ids = position_ids.index_select(2, keep_indices)
@@ -1916,6 +2046,158 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         except Exception:
             return None
         return None
+
+    def _attn_prune_safety_keep_mask(self, token_count: int, device: torch.device) -> tuple[torch.Tensor, dict]:
+        mask = torch.zeros(int(token_count), dtype=torch.bool, device=device)
+        priority = torch.zeros(int(token_count), dtype=torch.float32, device=device)
+        meta = {
+            "enabled": bool(_attn_prune_safety_keep_enabled()),
+            "uniform_tokens": 0,
+            "region_tokens": 0,
+            "text_dense_tokens": 0,
+            "candidate_tokens": 0,
+            "_priority": priority,
+        }
+        if not meta["enabled"] or token_count <= 0:
+            return mask, meta
+        grid_size = self._attn_prune_grid_size(int(token_count))
+        if grid_size is None:
+            return mask, meta
+        grid_h, grid_w = grid_size
+        rows = torch.arange(grid_h, device=device, dtype=torch.long).repeat_interleave(grid_w)
+        cols = torch.arange(grid_w, device=device, dtype=torch.long).repeat(grid_h)
+
+        uniform_ratio = max(0.0, _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_UNIFORM_RATIO", 0.05))
+        if uniform_ratio > 0.0:
+            target = max(1, int(math.ceil(float(token_count) * min(1.0, uniform_ratio))))
+            stride = max(1, int(math.ceil(math.sqrt(float(token_count) / float(target)))))
+            offset = stride // 2
+            uniform = ((rows - offset).remainder(stride) == 0) & ((cols - offset).remainder(stride) == 0)
+            mask |= uniform
+            priority += uniform.float()
+            meta["uniform_tokens"] = int(uniform.sum().item())
+
+        top_ratio = max(0.0, _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_TOP_RATIO", 0.08))
+        bottom_ratio = max(0.0, _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_BOTTOM_RATIO", 0.14))
+        side_ratio = max(0.0, _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_SIDE_RATIO", 0.04))
+        center_h_ratio = max(0.0, _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_CENTER_H_RATIO", 0.22))
+        center_w_ratio = max(0.0, _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_CENTER_W_RATIO", 0.28))
+        region = torch.zeros_like(mask)
+        if top_ratio > 0.0:
+            top = rows < max(1, int(math.ceil(grid_h * min(1.0, top_ratio))))
+            region |= top
+            priority += top.float() * 3.0
+        if bottom_ratio > 0.0:
+            bottom = rows >= max(0, grid_h - max(1, int(math.ceil(grid_h * min(1.0, bottom_ratio)))))
+            region |= bottom
+            priority += bottom.float() * 3.5
+        if side_ratio > 0.0:
+            side = max(1, int(math.ceil(grid_w * min(1.0, side_ratio))))
+            side_mask = (cols < side) | (cols >= grid_w - side)
+            region |= side_mask
+            priority += side_mask.float() * 1.5
+        if center_h_ratio > 0.0 and center_w_ratio > 0.0:
+            center_h = max(1, int(math.ceil(grid_h * min(1.0, center_h_ratio))))
+            center_w = max(1, int(math.ceil(grid_w * min(1.0, center_w_ratio))))
+            r0 = max(0, (grid_h - center_h) // 2)
+            c0 = max(0, (grid_w - center_w) // 2)
+            center = (rows >= r0) & (rows < r0 + center_h) & (cols >= c0) & (cols < c0 + center_w)
+            region |= center
+            priority += center.float() * 2.0
+        mask |= region
+        meta["region_tokens"] = int(region.sum().item())
+
+        text_dense_ratio = max(0.0, _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_TEXT_DENSE_RATIO", 0.05))
+        if text_dense_ratio > 0.0:
+            image = self._attn_prune_vis_image()
+            if image is not None:
+                try:
+                    edge = image.convert("L").filter(ImageFilter.FIND_EDGES).resize((grid_w, grid_h), Image.BILINEAR)
+                    values = torch.tensor(list(edge.getdata()), dtype=torch.float32, device=device)
+                    k = min(int(token_count), max(1, int(math.ceil(float(token_count) * min(1.0, text_dense_ratio)))))
+                    text_idx = torch.topk(values, k=k, largest=True).indices
+                    text_dense = torch.zeros_like(mask)
+                    text_dense[text_idx] = True
+                    mask |= text_dense
+                    value_span = values.max() - values.min()
+                    if value_span > 0:
+                        values = (values - values.min()) / value_span
+                    priority += text_dense.float() * (4.0 + values)
+                    meta["text_dense_tokens"] = int(text_dense.sum().item())
+                except Exception:
+                    pass
+
+        meta["candidate_tokens"] = int(mask.sum().item())
+        meta["grid_h"] = int(grid_h)
+        meta["grid_w"] = int(grid_w)
+        return mask, meta
+
+    def _attn_prune_merge_safety_keep(
+        self,
+        base_keep_rel_idx: torch.Tensor,
+        token_count: int,
+        device: torch.device,
+        attn_weights_1d: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        safety_mask, meta = self._attn_prune_safety_keep_mask(int(token_count), device)
+        safety_priority = meta.pop("_priority", None)
+        base_keep_rel_idx = base_keep_rel_idx.to(device=device, dtype=torch.long)
+        if not bool(meta.get("enabled")) or safety_mask.numel() == 0:
+            meta["added_tokens"] = 0
+            meta["final_keep_tokens"] = int(base_keep_rel_idx.numel())
+            meta["select_mode"] = "disabled"
+            return base_keep_rel_idx, meta
+
+        base_mask = torch.zeros(int(token_count), dtype=torch.bool, device=device)
+        base_mask[base_keep_rel_idx] = True
+        extra_idx = torch.where(safety_mask & ~base_mask)[0]
+
+        max_extra_ratio = max(0.0, _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_MAX_EXTRA_RATIO", 0.10))
+        max_keep_ratio = _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_MAX_KEEP_RATIO", 1.0)
+        max_keep_ratio = min(1.0, max(0.0, max_keep_ratio))
+        max_by_extra = int(base_keep_rel_idx.numel()) + int(math.ceil(float(token_count) * max_extra_ratio))
+        max_by_keep = int(math.ceil(float(token_count) * max_keep_ratio)) if max_keep_ratio > 0 else int(token_count)
+        max_total = min(int(token_count), max_by_extra, max_by_keep)
+        extra_budget = max(0, max_total - int(base_keep_rel_idx.numel()))
+        if extra_idx.numel() > extra_budget:
+            if extra_budget <= 0:
+                extra_idx = extra_idx[:0]
+            else:
+                select_mode = _attn_prune_env_choice("QWEN3VL_ATTN_PRUNE_SAFETY_SELECT_MODE", "spatial")
+                if select_mode in {"priority", "prioritized"} and torch.is_tensor(safety_priority):
+                    scores = safety_priority.index_select(0, extra_idx).float()
+                    if torch.is_tensor(attn_weights_1d) and attn_weights_1d.numel() == token_count:
+                        tie_weight = max(
+                            0.0,
+                            _attn_prune_env_float("QWEN3VL_ATTN_PRUNE_SAFETY_ATTN_TIE_WEIGHT", 0.25),
+                        )
+                        if tie_weight > 0.0:
+                            attn_scores = attn_weights_1d.to(device=device).float()
+                            attn_min = attn_scores.min()
+                            attn_span = attn_scores.max() - attn_min
+                            if attn_span > 0:
+                                attn_scores = (attn_scores - attn_min) / attn_span
+                            scores = scores + attn_scores.index_select(0, extra_idx) * tie_weight
+                    pick = torch.topk(scores, k=extra_budget, largest=True).indices
+                    extra_idx = extra_idx.index_select(0, pick).sort().values
+                elif select_mode == "attn" and torch.is_tensor(attn_weights_1d) and attn_weights_1d.numel() == token_count:
+                    scores = attn_weights_1d.to(device=device).float().index_select(0, extra_idx)
+                    pick = torch.topk(scores, k=extra_budget, largest=True).indices
+                    extra_idx = extra_idx.index_select(0, pick).sort().values
+                else:
+                    select_mode = "spatial"
+                    pick = torch.linspace(0, extra_idx.numel() - 1, steps=extra_budget, device=device).round().long()
+                    extra_idx = extra_idx.index_select(0, pick)
+                meta["select_mode"] = select_mode
+        else:
+            meta["select_mode"] = _attn_prune_env_choice("QWEN3VL_ATTN_PRUNE_SAFETY_SELECT_MODE", "spatial")
+
+        merged = torch.cat([base_keep_rel_idx, extra_idx]).unique(sorted=True)
+        meta["added_tokens"] = int(extra_idx.numel())
+        meta["final_keep_tokens"] = int(merged.numel())
+        meta["max_extra_ratio"] = float(max_extra_ratio)
+        meta["max_keep_ratio"] = float(max_keep_ratio)
+        return merged, meta
 
     def _attn_prune_vis_image(self) -> Image.Image | None:
         image = getattr(self.config, "_vlmeval_current_vis_image_pil", None)
@@ -2208,6 +2490,33 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         payload["sample_index"] = str(getattr(self.config, "_vlmeval_current_sample_index", "") or "")
         payload["dataset_name"] = str(getattr(self.config, "_vlmeval_current_dataset_name", "") or "")
         path = os.path.join(_attn_prune_out_dir(), "attn_stats.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _attn_conf_write_record(self, weights: torch.Tensor, layer_idx: int) -> None:
+        if weights is None or weights.numel() == 0:
+            return
+        stats = _attn_confidence_stats(weights, layer_idx=layer_idx)
+        if not stats:
+            return
+        payload = dict(stats)
+        payload.update(
+            {
+                "sample_index": str(getattr(self.config, "_vlmeval_current_sample_index", "") or ""),
+                "dataset_name": str(getattr(self.config, "_vlmeval_current_dataset_name", "") or ""),
+                "question": str(getattr(self.config, "_vlmeval_current_question", "") or ""),
+                "forward_idx": int(getattr(self.config, "_vlmeval_generate_forward_index", 0) or 0),
+                "attn_score_source": _attn_prune_score_source(),
+                "confidence_method": "1_minus_normalized_entropy",
+            }
+        )
+        meta = getattr(self.config, "_vlmeval_current_gt_meta", None)
+        if isinstance(meta, dict):
+            for key in ("gt_action", "task_id", "task_filename", "step_instruction", "instruction"):
+                if key in meta:
+                    payload[key] = str(meta.get(key, "") or "")
+        path = os.path.join(_attn_conf_out_dir(), "attn_confidence_records.jsonl")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")

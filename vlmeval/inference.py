@@ -129,6 +129,24 @@ def _load_sample_indices_from_env():
 
 def _task_key_for_sampling(dataset_name, row):
     dataset_name = str(dataset_name or '')
+    if 'AITW' in dataset_name:
+        task = str(row.get('task', '') or '').strip()
+        for key in ('episode_id', 'ep_id'):
+            value = row.get(key, None)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                prefix = f'{task}:' if task else ''
+                return f'aitw_episode:{prefix}{text}'
+        image_value = row.get('img_filename', row.get('image', row.get('image_path', '')))
+        image_name = osp.basename(str(image_value))
+        stem = osp.splitext(image_name)[0]
+        if '_' in stem:
+            prefix = f'{task}:' if task else ''
+            return f"aitw_episode:{prefix}{stem.rsplit('_', 1)[0]}"
+        return f"index:{row.get('index', '')}"
+
     if 'AndroidControl_Curated' in dataset_name:
         # `High_Task_Improved` uses per-trajectory folders like
         # `android_control_images/<task>/step_<n>.png`, so keeping trajectory-based

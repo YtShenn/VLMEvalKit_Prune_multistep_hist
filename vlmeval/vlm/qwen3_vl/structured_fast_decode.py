@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import time
 from typing import Any
 
@@ -50,12 +52,38 @@ GUI_ACTION_HEADS = (
 GUI_SCROLL_DIRECTIONS = ("UP", "DOWN", "LEFT", "RIGHT")
 GUI_TERMINAL_ACTIONS = ("PRESS_HOME", "PRESS_BACK", "PRESS_RECENT", "COMPLETE", "IMPOSSIBLE")
 GUI_COORD_ACTIONS = ("CLICK", "LONG_PRESS")
+AITW_SEMANTIC_ACTIONS = (
+    "click",
+    "input_text",
+    "input text",
+    "type",
+    "scroll down",
+    "scroll up",
+    "scroll left",
+    "scroll right",
+    "scroll_down",
+    "scroll_up",
+    "scroll_left",
+    "scroll_right",
+    "press back",
+    "press home",
+    "press_back",
+    "press_home",
+    "navigate_back",
+    "navigate_home",
+    "navigate back",
+    "navigate home",
+    "enter",
+    "complete",
+)
 
 
 def _dataset_family(dataset: str | None) -> str:
     name = str(dataset or "")
     if name.startswith("AndroidControl"):
         return "androidcontrol"
+    if name.startswith("AITW"):
+        return "aitw"
     if name.startswith("GUIOdyssey"):
         return "guiodyssey"
     return ""
@@ -393,6 +421,42 @@ def _normalize_action(action: str) -> str:
     return text
 
 
+def _canonical_aitw_semantic_action(action: str) -> str:
+    text = str(action or "").strip().strip('"').strip("'").strip().lower()
+    text = text.replace("_", " ")
+    text = re.sub(r"\s+", " ", text)
+    if text in {"tap", "click"}:
+        return "click"
+    if text in {"input text", "input_text", "type"}:
+        return "input_text"
+    if text in {"swipe up", "scroll down"}:
+        return "scroll down"
+    if text in {"swipe down", "scroll up"}:
+        return "scroll up"
+    if text in {"swipe right", "scroll left"}:
+        return "scroll left"
+    if text in {"swipe left", "scroll right"}:
+        return "scroll right"
+    if text in {"back", "press back", "navigate back", "navigate_back"}:
+        return "navigate_back"
+    if text in {"home", "press home", "navigate home", "navigate_home"}:
+        return "navigate_home"
+    if text in {"enter", "press enter"}:
+        return "enter"
+    if text in {"complete", "done"}:
+        return "complete"
+    return text
+
+
+def _looks_like_aitw_action_id_payload(text: str) -> bool:
+    stripped = str(text or "").strip().strip('"').strip("'").strip()
+    if stripped in {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}:
+        return True
+    nums = re.findall(r"\b(?:0|1|2|3|4|5|6|7|8|9|10)\b", stripped)
+    tokens = re.findall(r"\w+", stripped)
+    return bool(tokens) and len(nums) == len(tokens)
+
+
 def _suffix_after_first_stop(text: str, stop_chars: tuple[str, ...]) -> str | None:
     raw = str(text or "")
     best = None
@@ -552,6 +616,311 @@ def _common_inputs_or_fallback(processor, inputs):
         if k not in ("input_ids", "attention_mask", "position_ids", "cache_position", "past_key_values")
     }
     return tokenizer, input_ids, attention_mask, input_ids.device, extra_inputs, None
+
+
+def _aitw_structured_fast_decode(
+    *,
+    dataset: str | None,
+    model,
+    processor,
+    inputs,
+    generate_kwargs: dict[str, Any],
+    sample_meta: dict | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    tokenizer, input_ids, attention_mask, device, extra_inputs, fallback_meta = _common_inputs_or_fallback(processor, inputs)
+    if fallback_meta is not None:
+        return None, fallback_meta
+
+    static_parts = [
+        '{"action_type": "',
+        ', "click_point": [',
+        '"}',
+    ]
+    template_plan = '{"action_type": "{SEMANTIC_ACTION}", ...}'
+    meta = _empty_meta("not_attempted")
+    meta.update(
+        {
+            "template_schema": "aitw_semantic_json",
+            "template_static_parts": static_parts,
+            "template_plan": template_plan,
+            "template_prefill_enabled": False,
+            "template_prefill_fallback_reason": None,
+        }
+    )
+
+    action_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS", 16)
+    coord_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_AITW_COORD_MAX_TOKENS", 24)
+    text_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_AITW_TEXT_MAX_TOKENS", 32)
+    debug = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0")
+    sample_index = str((sample_meta or {}).get("sample_index", ""))
+
+    static_token_count = 0
+    static_steps = 0
+    dynamic_steps = 0
+    static_s = 0.0
+    dynamic_s = 0.0
+    slot_stats: list[dict[str, Any]] = []
+    coord_pair = ""
+    typed_text = ""
+    action_head = ""
+
+    try:
+        with torch.no_grad():
+            prefill_start = time.perf_counter()
+            out = _model_forward(
+                model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                extra_inputs=extra_inputs,
+            )
+            prefill_s = time.perf_counter() - prefill_start
+            past = out.past_key_values
+            logits = out.logits
+
+            past, attention_mask, logits, n_tok, elapsed = _append_static(
+                model,
+                tokenizer,
+                text=static_parts[0],
+                past_key_values=past,
+                attention_mask=attention_mask,
+                logits=logits,
+                device=device,
+            )
+            static_token_count += n_tok
+            static_steps += int(n_tok > 0)
+            static_s += elapsed
+
+            action_head, raw_action, action_suffix, action_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_gui_closed_set(
+                model,
+                tokenizer,
+                logits=logits,
+                past_key_values=past,
+                attention_mask=attention_mask,
+                device=device,
+                generate_kwargs=generate_kwargs,
+                candidates=AITW_SEMANTIC_ACTIONS,
+                allow_boundary_chars='":,}\n',
+                max_tokens=action_max_tokens,
+                slot_name="aitw_action_head",
+            )
+            dynamic_steps += steps
+            dynamic_s += elapsed
+            semantic_action = _canonical_aitw_semantic_action(action_head)
+            slot_stats.append(
+                {
+                    "slot": "action_head",
+                    "decode_tokens": steps,
+                    "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                    "done": ok,
+                    "fallback": not ok,
+                    "reason": reason,
+                    "raw_text": raw_action,
+                    "rendered_text": semantic_action or action_head,
+                }
+            )
+            if not ok or not semantic_action:
+                meta.update(
+                    {
+                        "template_slot_stats": slot_stats,
+                        "template_prefill_fallback_reason": reason or "aitw_action_head_failed",
+                    }
+                )
+                return None, meta
+
+            if semantic_action == "click":
+                tail = _gui_static_tail_from_suffix(action_suffix, '", "click_point": [')
+                if tail is None:
+                    meta.update(
+                        {
+                            "template_slot_stats": slot_stats,
+                            "template_prefill_fallback_reason": f"aitw_action_suffix_unexpected:{action_suffix!r}",
+                        }
+                    )
+                    return None, meta
+                past, attention_mask, logits, n_tok, elapsed = _append_static(
+                    model,
+                    tokenizer,
+                    text=tail,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    logits=logits,
+                    device=device,
+                )
+                static_token_count += n_tok
+                static_steps += int(n_tok > 0)
+                static_s += elapsed
+
+                coord_pair, raw_coord, coord_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
+                    model,
+                    tokenizer,
+                    logits=logits,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    device=device,
+                    generate_kwargs=generate_kwargs,
+                    stop_chars=("]", ")"),
+                    max_tokens=coord_max_tokens,
+                    slot_name="aitw_click_point",
+                )
+                dynamic_steps += steps
+                dynamic_s += elapsed
+                valid_coord = _valid_gui_coord_pair(coord_pair)
+                slot_stats.append(
+                    {
+                        "slot": "click_point",
+                        "decode_tokens": steps,
+                        "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                        "done": bool(ok and valid_coord),
+                        "fallback": not bool(ok and valid_coord),
+                        "reason": None if valid_coord else (reason or "aitw_click_point_invalid"),
+                        "raw_text": raw_coord,
+                        "rendered_text": coord_pair,
+                    }
+                )
+                if not ok or not valid_coord:
+                    meta.update(
+                        {
+                            "template_slot_stats": slot_stats,
+                            "template_prefill_fallback_reason": reason or "aitw_click_point_invalid",
+                        }
+                    )
+                    return None, meta
+                coords = []
+                for part in coord_pair.split(","):
+                    value = float(part.strip())
+                    coords.append(int(round(value)) if abs(value - round(value)) < 1e-6 else value)
+                final_text = json.dumps({"action_type": "click", "bbox_2d": coords}, ensure_ascii=False)
+
+            elif semantic_action == "input_text":
+                tail = _gui_static_tail_from_suffix(action_suffix, ": ")
+                if tail is None:
+                    meta.update(
+                        {
+                            "template_slot_stats": slot_stats,
+                            "template_prefill_fallback_reason": f"aitw_input_text_suffix_unexpected:{action_suffix!r}",
+                        }
+                    )
+                    return None, meta
+                past, attention_mask, logits, n_tok, elapsed = _append_static(
+                    model,
+                    tokenizer,
+                    text=tail,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    logits=logits,
+                    device=device,
+                )
+                static_token_count += n_tok
+                static_steps += int(n_tok > 0)
+                static_s += elapsed
+
+                typed_text, raw_text, text_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
+                    model,
+                    tokenizer,
+                    logits=logits,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    device=device,
+                    generate_kwargs=generate_kwargs,
+                    stop_chars=('"', "\n"),
+                    max_tokens=text_max_tokens,
+                    slot_name="aitw_typed_text",
+                )
+                dynamic_steps += steps
+                dynamic_s += elapsed
+                slot_stats.append(
+                    {
+                        "slot": "typed_text",
+                        "decode_tokens": steps,
+                        "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                        "done": ok,
+                        "fallback": not ok,
+                        "reason": reason,
+                        "raw_text": raw_text,
+                        "rendered_text": typed_text,
+                    }
+                )
+                if not ok:
+                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": reason or "aitw_typed_text_failed"})
+                    return None, meta
+                if _looks_like_aitw_action_id_payload(typed_text):
+                    meta.update(
+                        {
+                            "template_slot_stats": slot_stats,
+                            "template_prefill_fallback_reason": "aitw_typed_text_looks_like_action_id",
+                        }
+                    )
+                    return None, meta
+                final_text = json.dumps({"action_type": f"input_text: {typed_text}"}, ensure_ascii=False)
+
+            else:
+                tail = _gui_static_tail_from_suffix(action_suffix, '"}')
+                if tail is None:
+                    meta.update(
+                        {
+                            "template_slot_stats": slot_stats,
+                            "template_prefill_fallback_reason": f"aitw_terminal_suffix_unexpected:{action_suffix!r}",
+                        }
+                    )
+                    return None, meta
+                past, attention_mask, logits, n_tok, elapsed = _append_static(
+                    model,
+                    tokenizer,
+                    text=tail,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    logits=logits,
+                    device=device,
+                )
+                static_token_count += n_tok
+                static_steps += int(n_tok > 0)
+                static_s += elapsed
+                final_text = json.dumps({"action_type": semantic_action}, ensure_ascii=False)
+
+    except Exception as exc:
+        meta["template_prefill_fallback_reason"] = f"structured_fast_decode_exception:{type(exc).__name__}:{exc}"
+        return None, meta
+
+    meta.update(
+        {
+            "template_prefill_enabled": True,
+            "template_prefill_fallback_reason": None,
+            "template_slot_stats": slot_stats,
+            "template_static_token_count": int(static_token_count),
+            "template_static_decode_steps": int(static_steps),
+            "template_unknown_decode_steps": int(dynamic_steps),
+            "template_decode_tokens": int(dynamic_steps),
+            "template_final_text": final_text,
+            "template_generated_text": "".join(str(s.get("raw_text", "")) for s in slot_stats),
+            "structured_fast_decode_static_forward_steps": int(static_steps),
+            "structured_fast_decode_dynamic_forward_steps": int(dynamic_steps),
+            "structured_fast_decode_static_s": float(static_s),
+            "structured_fast_decode_dynamic_s": float(dynamic_s),
+            "structured_fast_decode_prefill_s": float(prefill_s),
+            "structured_fast_decode_action": semantic_action,
+            "structured_fast_decode_action_normalized": semantic_action,
+            "structured_fast_decode_bbox": coord_pair,
+            "structured_fast_decode_typed_text": typed_text,
+        }
+    )
+    if debug:
+        print(
+            "[StructuredFastDecode] "
+            f"sample_index={sample_index} "
+            f"enabled=1 schema=aitw_semantic_json "
+            f"template_plan={template_plan!r} "
+            f"static_parts={static_parts!r} "
+            f"static_forward_steps={static_steps} "
+            f"static_tokens={static_token_count} "
+            f"dynamic_forward_steps={dynamic_steps} "
+            f"action={semantic_action!r} "
+            f"coord_pair={coord_pair!r} "
+            f"typed_text={typed_text!r} "
+            f"final={final_text!r}",
+            flush=True,
+        )
+    return final_text, meta
 
 
 def _android_structured_fast_decode(
@@ -1059,6 +1428,15 @@ def maybe_generate_with_structured_fast_decode(
     family = _dataset_family(dataset)
     if family == "androidcontrol":
         return _android_structured_fast_decode(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            inputs=inputs,
+            generate_kwargs=generate_kwargs,
+            sample_meta=sample_meta,
+        )
+    if family == "aitw":
+        return _aitw_structured_fast_decode(
             dataset=dataset,
             model=model,
             processor=processor,

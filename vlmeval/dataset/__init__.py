@@ -84,6 +84,7 @@ from .GUI.screenspot_v2 import ScreenSpotV2
 from .GUI.screenspot_pro import ScreenSpot_Pro
 from .AndroidControl_Curated.android_control_curated import AndroidControlCurated
 from .GUI_Odyssey.gui_odyssey import GUIOdyssey
+from .AITW.aitw import AndroidInTheWild
 from .mmifeval import MMIFEval
 from .chartmimic import ChartMimic
 from .m4bench import M4Bench
@@ -242,7 +243,7 @@ IMAGE_DATASET = [
     AyaVisionBench, TopViewRS, VLMBias, MMHELIX, MedqbenchMCQDataset, MathCanvas, MMReason,
     MedqbenchPairedDescriptionDataset, MedqbenchCaptionDataset, ChartMuseum, ChartQAPro, ReasonMap_Plus,
     olmOCRBench, OceanOCRBench, MATBench, VLRMBench, RefCOCODataset, SimpleVQA, HiPhODataset, MaCBench,
-    UniSVG, SArena_MINI
+    UniSVG, SArena_MINI, AndroidInTheWild
 ]
 
 VIDEO_DATASET = [

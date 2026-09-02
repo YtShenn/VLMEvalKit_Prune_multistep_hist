@@ -51,6 +51,8 @@ def _dataset_family(dataset: str | None) -> str:
     name = str(dataset or "")
     if name.startswith("AndroidControl"):
         return "androidcontrol"
+    if name.startswith("AITW"):
+        return "androidcontrol"
     if name.startswith("GUIOdyssey"):
         return "guiodyssey"
     return ""
@@ -60,6 +62,8 @@ def _dataset_enabled(dataset: str | None) -> bool:
     enabled = os.getenv("QWEN3VL_TEMPLATE_PREFILL_DATASETS", "androidcontrol,guiodyssey")
     families = {x.strip().lower() for x in enabled.split(",") if x.strip()}
     fam = _dataset_family(dataset)
+    if str(dataset or "").startswith("AITW") and "aitw" in families:
+        return True
     return bool(fam and fam in families)
 
 

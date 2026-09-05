@@ -1271,6 +1271,12 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.total_pixels = total_pixels
+        env_max_new_tokens = os.getenv('QWEN3VL_MAX_NEW_TOKENS', '').strip()
+        if env_max_new_tokens:
+            try:
+                max_new_tokens = int(env_max_new_tokens)
+            except Exception:
+                pass
         self.max_new_tokens = max_new_tokens
         self.top_k = top_k
         self.top_p = top_p

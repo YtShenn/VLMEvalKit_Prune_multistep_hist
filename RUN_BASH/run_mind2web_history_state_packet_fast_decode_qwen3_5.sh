@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
+export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
+export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
+
+export MIND2WEB_STATE_PACKET_ENABLE="${MIND2WEB_STATE_PACKET_ENABLE:-1}"
+export MIND2WEB_STATE_PACKET_DEBUG="${MIND2WEB_STATE_PACKET_DEBUG:-1}"
+export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE:-1}"
+export QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG="${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG:-1}"
+export MIND2WEB_HIS_NUM="${MIND2WEB_HIS_NUM:-2}"
+
+export TAG="${TAG:-hist2_state_packet_fast_decode}"
+export PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
+export TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+
+bash RUN_BASH/run_qwen3vl_mind2web_4B.sh
+

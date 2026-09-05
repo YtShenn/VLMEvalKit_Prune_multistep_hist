@@ -86,6 +86,8 @@ def _dataset_family(dataset: str | None) -> str:
         return "aitw"
     if name.startswith("GUIOdyssey"):
         return "guiodyssey"
+    if name.startswith("Mind2Web"):
+        return "mind2web"
     return ""
 
 
@@ -598,6 +600,31 @@ def _valid_gui_coord_pair(text: str) -> bool:
     return True
 
 
+def _normalize_mind2web_coord_pair(text: str) -> tuple[str, bool]:
+    cleaned = str(text or "").strip()
+    cleaned = cleaned.strip("[]() ")
+    parts = [p.strip() for p in cleaned.split(",")]
+    if len(parts) != 2:
+        return cleaned, False
+    out = []
+    try:
+        for part in parts:
+            value = float(part)
+            if not (0.0 <= value <= 1000.0):
+                return cleaned, False
+            if abs(value - round(value)) < 1e-6:
+                out.append(str(int(round(value))))
+            else:
+                out.append(str(value))
+    except Exception:
+        return cleaned, False
+    return ",".join(out), True
+
+
+def _escape_mind2web_value(text: str) -> str:
+    return json.dumps(str(text or "").strip(), ensure_ascii=False)
+
+
 
 def _common_inputs_or_fallback(processor, inputs):
     tokenizer = processor.tokenizer
@@ -917,6 +944,284 @@ def _aitw_structured_fast_decode(
             f"action={semantic_action!r} "
             f"coord_pair={coord_pair!r} "
             f"typed_text={typed_text!r} "
+            f"final={final_text!r}",
+            flush=True,
+        )
+    return final_text, meta
+
+
+def _mind2web_structured_fast_decode(
+    *,
+    dataset: str | None,
+    model,
+    processor,
+    inputs,
+    generate_kwargs: dict[str, Any],
+    sample_meta: dict | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    tokenizer, input_ids, attention_mask, device, extra_inputs, fallback_meta = _common_inputs_or_fallback(processor, inputs)
+    if fallback_meta is not None:
+        return None, fallback_meta
+
+    static_parts = [
+        '{"action_type": ',
+        ', "click_point": (',
+        ', "value": "',
+        '}',
+    ]
+    template_plan = '{"action_type": ACTION_ID, "click_point": (x,y), "value": optional_text}'
+    meta = _empty_meta("not_attempted")
+    meta.update(
+        {
+            "template_schema": "mind2web_action_dict",
+            "template_static_parts": static_parts,
+            "template_plan": template_plan,
+            "template_prefill_enabled": False,
+            "template_prefill_fallback_reason": None,
+        }
+    )
+
+    action_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_MIND2WEB_ACTION_MAX_TOKENS", 4)
+    coord_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_MIND2WEB_COORD_MAX_TOKENS", 24)
+    value_max_tokens = _env_int("QWEN3VL_STRUCTURED_FAST_DECODE_MIND2WEB_VALUE_MAX_TOKENS", 32)
+    debug = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0")
+    sample_index = str((sample_meta or {}).get("sample_index", ""))
+
+    static_token_count = 0
+    static_steps = 0
+    dynamic_steps = 0
+    static_s = 0.0
+    dynamic_s = 0.0
+    slot_stats: list[dict[str, Any]] = []
+    action_id = ""
+    coord_pair = ""
+    value_text = ""
+
+    try:
+        with torch.no_grad():
+            prefill_start = time.perf_counter()
+            out = _model_forward(
+                model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                extra_inputs=extra_inputs,
+            )
+            prefill_s = time.perf_counter() - prefill_start
+            past = out.past_key_values
+            logits = out.logits
+
+            past, attention_mask, logits, n_tok, elapsed = _append_static(
+                model,
+                tokenizer,
+                text=static_parts[0],
+                past_key_values=past,
+                attention_mask=attention_mask,
+                logits=logits,
+                device=device,
+            )
+            static_token_count += n_tok
+            static_steps += int(n_tok > 0)
+            static_s += elapsed
+
+            action_id, raw_action, action_suffix, action_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_gui_closed_set(
+                model,
+                tokenizer,
+                logits=logits,
+                past_key_values=past,
+                attention_mask=attention_mask,
+                device=device,
+                generate_kwargs=generate_kwargs,
+                candidates=("2", "3", "4"),
+                allow_boundary_chars=",}\n ",
+                max_tokens=action_max_tokens,
+                slot_name="mind2web_action_type",
+            )
+            dynamic_steps += steps
+            dynamic_s += elapsed
+            slot_stats.append(
+                {
+                    "slot": "action_type",
+                    "decode_tokens": steps,
+                    "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                    "done": ok,
+                    "fallback": not ok,
+                    "reason": reason,
+                    "raw_text": raw_action,
+                    "rendered_text": action_id,
+                }
+            )
+            if not ok or action_id not in {"2", "3", "4"}:
+                meta.update(
+                    {
+                        "template_slot_stats": slot_stats,
+                        "template_prefill_fallback_reason": reason or "mind2web_action_type_failed",
+                    }
+                )
+                return None, meta
+
+            tail = _gui_static_tail_from_suffix(action_suffix, static_parts[1])
+            if tail is None:
+                meta.update(
+                    {
+                        "template_slot_stats": slot_stats,
+                        "template_prefill_fallback_reason": f"mind2web_action_suffix_unexpected:{action_suffix!r}",
+                    }
+                )
+                return None, meta
+            past, attention_mask, logits, n_tok, elapsed = _append_static(
+                model,
+                tokenizer,
+                text=tail,
+                past_key_values=past,
+                attention_mask=attention_mask,
+                logits=logits,
+                device=device,
+            )
+            static_token_count += n_tok
+            static_steps += int(n_tok > 0)
+            static_s += elapsed
+
+            coord_raw_pair, raw_coord, coord_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
+                model,
+                tokenizer,
+                logits=logits,
+                past_key_values=past,
+                attention_mask=attention_mask,
+                device=device,
+                generate_kwargs=generate_kwargs,
+                stop_chars=(")", "]", "\n"),
+                max_tokens=coord_max_tokens,
+                slot_name="mind2web_click_point",
+            )
+            dynamic_steps += steps
+            dynamic_s += elapsed
+            coord_pair, valid_coord = _normalize_mind2web_coord_pair(coord_raw_pair)
+            slot_stats.append(
+                {
+                    "slot": "click_point",
+                    "decode_tokens": steps,
+                    "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                    "done": bool(ok and valid_coord),
+                    "fallback": not bool(ok and valid_coord),
+                    "reason": None if valid_coord else (reason or "mind2web_click_point_invalid"),
+                    "raw_text": raw_coord,
+                    "rendered_text": coord_pair,
+                }
+            )
+            if not ok or not valid_coord:
+                meta.update(
+                    {
+                        "template_slot_stats": slot_stats,
+                        "template_prefill_fallback_reason": reason or "mind2web_click_point_invalid",
+                    }
+                )
+                return None, meta
+
+            if action_id in {"2", "3"}:
+                coord_suffix = _suffix_after_first_stop(raw_coord, (")", "]", "\n")) or ""
+                value_prefix_tail = _gui_static_tail_from_suffix(coord_suffix, static_parts[2])
+                if value_prefix_tail is None:
+                    meta.update(
+                        {
+                            "template_slot_stats": slot_stats,
+                            "template_prefill_fallback_reason": f"mind2web_coord_suffix_unexpected:{coord_suffix!r}",
+                        }
+                    )
+                    return None, meta
+                past, attention_mask, logits, n_tok, elapsed = _append_static(
+                    model,
+                    tokenizer,
+                    text=value_prefix_tail,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    logits=logits,
+                    device=device,
+                )
+                static_token_count += n_tok
+                static_steps += int(n_tok > 0)
+                static_s += elapsed
+
+                value_text, raw_value, value_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
+                    model,
+                    tokenizer,
+                    logits=logits,
+                    past_key_values=past,
+                    attention_mask=attention_mask,
+                    device=device,
+                    generate_kwargs=generate_kwargs,
+                    stop_chars=('"', "\n", "}"),
+                    max_tokens=value_max_tokens,
+                    slot_name="mind2web_value",
+                )
+                dynamic_steps += steps
+                dynamic_s += elapsed
+                slot_stats.append(
+                    {
+                        "slot": "value",
+                        "decode_tokens": steps,
+                        "prompt_tokens": _cache_seq_len(past, int(attention_mask.shape[1])),
+                        "done": ok,
+                        "fallback": not ok,
+                        "reason": reason,
+                        "raw_text": raw_value,
+                        "rendered_text": value_text,
+                    }
+                )
+                if not ok:
+                    meta.update(
+                        {
+                            "template_slot_stats": slot_stats,
+                            "template_prefill_fallback_reason": reason or "mind2web_value_failed",
+                        }
+                    )
+                    return None, meta
+                final_text = (
+                    f'{{"action_type": {action_id}, "click_point": ({coord_pair}), '
+                    f'"value": {_escape_mind2web_value(value_text)}}}'
+                )
+            else:
+                final_text = f'{{"action_type": {action_id}, "click_point": ({coord_pair})}}'
+
+    except Exception as exc:
+        meta["template_prefill_fallback_reason"] = f"structured_fast_decode_exception:{type(exc).__name__}:{exc}"
+        return None, meta
+
+    meta.update(
+        {
+            "template_prefill_enabled": True,
+            "template_prefill_fallback_reason": None,
+            "template_slot_stats": slot_stats,
+            "template_static_token_count": int(static_token_count),
+            "template_static_decode_steps": int(static_steps),
+            "template_unknown_decode_steps": int(dynamic_steps),
+            "template_decode_tokens": int(dynamic_steps),
+            "template_final_text": final_text,
+            "template_generated_text": "".join(str(s.get("raw_text", "")) for s in slot_stats),
+            "structured_fast_decode_static_forward_steps": int(static_steps),
+            "structured_fast_decode_dynamic_forward_steps": int(dynamic_steps),
+            "structured_fast_decode_static_s": float(static_s),
+            "structured_fast_decode_dynamic_s": float(dynamic_s),
+            "structured_fast_decode_prefill_s": float(prefill_s),
+            "structured_fast_decode_action": action_id,
+            "structured_fast_decode_action_normalized": action_id,
+            "structured_fast_decode_bbox": coord_pair,
+            "structured_fast_decode_typed_text": value_text,
+        }
+    )
+    if debug:
+        print(
+            "[StructuredFastDecode] "
+            f"sample_index={sample_index} "
+            "enabled=1 schema=mind2web_action_dict "
+            f"template_plan={template_plan!r} "
+            f"static_parts={static_parts!r} "
+            f"static_forward_steps={static_steps} "
+            f"static_tokens={static_token_count} "
+            f"dynamic_forward_steps={dynamic_steps} "
+            f"action={action_id!r} "
+            f"coord_pair={coord_pair!r} "
+            f"value={value_text!r} "
             f"final={final_text!r}",
             flush=True,
         )
@@ -1446,6 +1751,15 @@ def maybe_generate_with_structured_fast_decode(
         )
     if family == "guiodyssey":
         return _gui_structured_fast_decode(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            inputs=inputs,
+            generate_kwargs=generate_kwargs,
+            sample_meta=sample_meta,
+        )
+    if family == "mind2web":
+        return _mind2web_structured_fast_decode(
             dataset=dataset,
             model=model,
             processor=processor,

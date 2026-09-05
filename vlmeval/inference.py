@@ -52,6 +52,7 @@ def _build_sample_meta(dataset_name, row, struct):
     }
     for key in (
         'gt_action',
+        'gt_action_dict',
         'gt_coordinate',
         'gt_bbox',
         'gt_min_bbox',
@@ -65,6 +66,11 @@ def _build_sample_meta(dataset_name, row, struct):
         'history',
         'task_id',
         'task_filename',
+        'annotation_id',
+        'annot_id',
+        'episode_id',
+        'action_uid',
+        'confirmed_task',
     ):
         if key in row and row.get(key) is not None:
             meta[key] = row.get(key)
@@ -189,6 +195,28 @@ def _task_key_for_sampling(dataset_name, row):
             text = str(value).strip()
             if text:
                 return f'{key}:{text}'
+        return f"image:{stem}"
+
+    if 'Mind2Web' in dataset_name:
+        for key in ('annotation_id', 'annot_id', 'episode_id'):
+            value = row.get(key, None)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return f'mind2web_episode:{text}'
+        for key in ('confirmed_task', 'instruction', 'question'):
+            value = row.get(key, None)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return f'{key}:{text}'
+        image_value = row.get('image', row.get('image_path', ''))
+        image_name = osp.basename(str(image_value))
+        stem = osp.splitext(image_name)[0]
+        if '-' in stem:
+            return f"mind2web_episode:{stem.rsplit('-', 1)[0]}"
         return f"image:{stem}"
 
     for key in ('task_id', 'episode', 'task_filename', 'instruction', 'question'):

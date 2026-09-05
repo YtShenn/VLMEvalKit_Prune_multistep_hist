@@ -13,19 +13,21 @@ set -euo pipefail
 #   VLM_EVAL_SAMPLE_MODE=task
 #   VLM_EVAL_SAMPLE_TASKS=3
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6}"
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-7}"
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct}"
-TAG="${TAG:-hist4_state_packet_fast_decode_sample_num}"
-WORK_DIR="${WORK_DIR:-OUTPUT/aitw_${TAG}_4B}"
-PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+# TAG="${TAG:-hist4_state_packet_fast_decode_sample_num}"
+TAG="${TAG:-hist4_fast_decode_only_all_num}"
 
-export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_annots}"
-export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_images}"
+WORK_DIR="${WORK_DIR:-OUTPUT/aitw_${TAG}_4B}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
+
+export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/public/ytshen/aitw_data/aitw_annots}"
+export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/public/ytshen/aitw_data/aitw_images}"
 export AITW_SPLIT="${AITW_SPLIT:-test}"
 export AITW_HIS_NUM="${AITW_HIS_NUM:-4}"
 export AITW_WITH_NO_HISTORY="${AITW_WITH_NO_HISTORY:-0}"
@@ -63,22 +65,22 @@ export QWEN3VL_ENABLE_ROI_PRUNE="${QWEN3VL_ENABLE_ROI_PRUNE:-0}"
 export QWEN3VL_ROI_PRUNE_USE_CACHE="${QWEN3VL_ROI_PRUNE_USE_CACHE:-1}"
 export QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE="${QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE:-1}"
 
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}" # off=full, task=episodes, sample=steps, index=fixed indices
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-off}" # off=full, task=episodes, sample=steps, index=fixed indices
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-3}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 export VLM_EVAL_SAMPLE_COUNT="${VLM_EVAL_SAMPLE_COUNT:-20}"
 export VLM_EVAL_SAMPLE_INDICES="${VLM_EVAL_SAMPLE_INDICES:-}"
 export VLM_EVAL_SAMPLE_INDEX_FILE="${VLM_EVAL_SAMPLE_INDEX_FILE:-}"
 
-export AITW_STATE_PACKET_ENABLE="${AITW_STATE_PACKET_ENABLE:-1}"
+export AITW_STATE_PACKET_ENABLE="${AITW_STATE_PACKET_ENABLE:-0}"
 export AITW_STATE_PACKET_DEBUG="${AITW_STATE_PACKET_DEBUG:-1}"
 export AITW_STATE_PACKET_CACHE_DIR="${AITW_STATE_PACKET_CACHE_DIR:-tmp/aitw_state_packet_cache}"
 export AITW_STATE_PACKET_PATCH_SIZE="${AITW_STATE_PACKET_PATCH_SIZE:-16}"
 export AITW_STATE_PACKET_MERGE_SIZE="${AITW_STATE_PACKET_MERGE_SIZE:-2}"
 export AITW_STATE_PACKET_THUMB_LONG_EDGE="${AITW_STATE_PACKET_THUMB_LONG_EDGE:-192}"
-export AITW_STATE_PACKET_ROI_LONG_EDGE="${AITW_STATE_PACKET_ROI_LONG_EDGE:-192}"
+export AITW_STATE_PACKET_ROI_LONG_EDGE="${AITW_STATE_PACKET_ROI_LONG_EDGE:-224}"
 export AITW_STATE_PACKET_ROI_SHORT_SIDE_RATIO="${AITW_STATE_PACKET_ROI_SHORT_SIDE_RATIO:-0.22}"
-export AITW_STATE_PACKET_ROI_MIN_SIDE_PX="${AITW_STATE_PACKET_ROI_MIN_SIDE_PX:-128}"
+export AITW_STATE_PACKET_ROI_MIN_SIDE_PX="${AITW_STATE_PACKET_ROI_MIN_SIDE_PX:-160}"
 
 # AITW prompt/eval uses normalized 0-1000 coordinates. Keep AndroidControl-only
 # denormalization disabled for AITW runs.

@@ -58,7 +58,7 @@ export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-10}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
 export ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS="${ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS:-1}"
-export ANDROID_CONTROL_MAX_HISTORY_IMAGES="${ANDROID_CONTROL_MAX_HISTORY_IMAGES:-4}"
+export ANDROID_CONTROL_MAX_HISTORY_IMAGES="${ANDROID_CONTROL_MAX_HISTORY_IMAGES:-2}"
 export ANDROID_CONTROL_HISTORY_KEEP_SYSTEM_PROMPT="${ANDROID_CONTROL_HISTORY_KEEP_SYSTEM_PROMPT:-1}"
 
 export ANDROID_CONTROL_STATE_PACKET_ENABLE="0" #${ANDROID_CONTROL_STATE_PACKET_ENABLE:-1}"
@@ -115,7 +115,7 @@ TS="$(date +%Y%m%d_%H%M%S)"
 # TAG="${TAG:-hist4_keep_system_prompt_state_packet_attn_prune_structured_fast_official_nonvis_nonprune_layer${QWEN3VL_ATTN_PRUNE_LAYERS}}"
 # TAG="${TAG:-hist4_keep_system_prompt_state_packet_fast_decode_official_prune_${QWEN3VL_ATTN_PRUNE_KEEP_RATIO}_high_all_0828}"
 # TAG="${TAG:-hist4_keep_system_prompt_baseline_official_nonvis_high_all_0828}"
-TAG="${TAG:-hist4_baseline_official_high_all_0902_7card}"
+TAG="${TAG:-hist2_baseline_official_high_all_0903_7card}"
 
 WORK_DIR="${WORK_DIR:-OUTPUT/android_control_${TAG}}"
 LOG_FILE="run_output_${TS}_android_control_${TAG}.log"

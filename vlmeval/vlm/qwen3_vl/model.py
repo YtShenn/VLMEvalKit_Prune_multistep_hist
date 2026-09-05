@@ -1560,6 +1560,15 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
         **kwargs,
     ) -> None:
         super().__init__(use_custom_prompt=use_custom_prompt)
+        max_new_tokens_env = os.getenv("QWEN3VL_MAX_NEW_TOKENS", "").strip()
+        if max_new_tokens_env:
+            try:
+                max_new_tokens = int(max_new_tokens_env)
+            except ValueError:
+                print(
+                    f"[Qwen3VL] ignore invalid QWEN3VL_MAX_NEW_TOKENS={max_new_tokens_env!r}",
+                    flush=True,
+                )
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.total_pixels = total_pixels

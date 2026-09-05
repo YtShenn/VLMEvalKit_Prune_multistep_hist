@@ -18,10 +18,18 @@ DEFAULT_SCRIPTS=(
     # Edit this list when running without command-line args or SEQ_SCRIPT_FILE.
     # "RUN_BASH/run_gui_odyssey_history_state_packet_qwen3_5.sh"
     # "RUN_BASH/run_android_control_history_state_packet_qwen3_5.sh"
-    "RUN_BASH/run_android_control_history_state_packet_only_hist4.sh"
-    "RUN_BASH/run_android_control_history_fast_decode_only_hist4.sh"
-    "RUN_BASH/run_android_control_history_state_packet_qwen3_5_current_frame_attn_prune.sh"
+    # "RUN_BASH/run_android_control_history_state_packet_only_hist4.sh"
+    # "RUN_BASH/run_android_control_history_fast_decode_only_hist4.sh"
+    # "RUN_BASH/run_android_control_history_state_packet_qwen3_5_current_frame_attn_prune.sh"
+    # "RUN_BASH/run_android_control_history_baseline_hist4.sh"
+    # "RUN_BASH/run_qwen3vl_aitw_4B_baseline.sh"
+    # "RUN_BASH/run_qwen3vl_aitw_4B_fast_decode_only.sh"
+    # "RUN_BASH/run_qwen3vl_aitw_4B_state_packet_fast_decode_only.sh"
+    # "RUN_BASH/run_qwen3vl_aitw_4B_state_packet_only.sh"
+    "RUN_BASH/run_gui_odyssey_history_state_packet_qwen3_5.sh"
     "RUN_BASH/run_android_control_history_baseline_hist4.sh"
+    "RUN_BASH/run_android_control_history_state_packet_qwen3_5_current_frame_attn_prune.sh"
+
 )
 
 STOP_ON_ERROR="${SEQ_STOP_ON_ERROR:-1}"

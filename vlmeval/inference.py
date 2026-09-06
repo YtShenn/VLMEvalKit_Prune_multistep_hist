@@ -486,6 +486,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     progress_acc = os.getenv('VLM_PROGRESS_ACC', '1') == '1'
     timing_records = [] if timing_enabled else None
     infer_records = [] if timing_enabled else None
+    stlite_sample_stats = []
     processed_count = 0
     online_correct = 0
     online_total = 0
@@ -557,6 +558,9 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                 response = f'{FAIL_MSG}: {type(err)} {str(err)}'
         else:
             response = model.generate(message=struct, dataset=dataset_name, **extra_kwargs) # jingyz1
+        stlite_stats = getattr(model, "_stlite_last_sample_stats", None)
+        if isinstance(stlite_stats, dict):
+            stlite_sample_stats.append(dict(stlite_stats))
         if timing_enabled:
             if timing_sync and torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -996,6 +1000,86 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                 f'[PruneTimingSummary] samples={int(total_count)} sort_avg_s={total_sort_sum/total_count:.6f} recycle_avg_s={total_recycle_sum/total_count:.6f}',
                 flush=True,
             )
+    if stlite_sample_stats or (world_size > 1 and dist.is_available() and dist.is_initialized()):
+            local_rate_sum = 0.0
+            local_before_sum = 0.0
+            local_after_sum = 0.0
+            local_sample_count = 0.0
+            local_flops = [0.0, 0.0, 0.0, 0.0]
+            local_flops_samples = 0.0
+            for record in stlite_sample_stats:
+                before = float(record.get("ST_LITE_history_visual_tokens", 0) or 0)
+                after = float(record.get("ST_LITE_history_visual_tokens_after", 0) or 0)
+                e2e_flops = float(record.get("ST_LITE_e2e_flops", 0.0) or 0.0)
+                if e2e_flops > 0.0:
+                    local_flops[0] += float(record.get("ST_LITE_vision_flops", 0.0) or 0.0)
+                    local_flops[1] += float(record.get("ST_LITE_llm_flops", 0.0) or 0.0)
+                    local_flops[2] += float(record.get("ST_LITE_lm_head_flops", 0.0) or 0.0)
+                    local_flops[3] += e2e_flops
+                    local_flops_samples += 1.0
+                if before <= 0:
+                    continue
+                local_before_sum += before
+                local_after_sum += after
+                local_rate_sum += after / before
+                local_sample_count += 1.0
+            stlite_aggregate = torch.tensor(
+                [
+                    local_rate_sum,
+                    local_before_sum,
+                    local_after_sum,
+                    local_sample_count,
+                    local_flops[0],
+                    local_flops[1],
+                    local_flops[2],
+                    local_flops[3],
+                    local_flops_samples,
+                ],
+                device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
+                dtype=torch.float64,
+            )
+            if world_size > 1 and dist.is_available() and dist.is_initialized():
+                dist.all_reduce(stlite_aggregate, op=dist.ReduceOp.SUM)
+            (
+                rate_sum,
+                before_sum,
+                after_sum,
+                sample_count,
+                vision_flops_sum,
+                llm_flops_sum,
+                lm_head_flops_sum,
+                e2e_flops_sum,
+                flops_sample_count,
+            ) = stlite_aggregate.tolist()
+            if rank == 0:
+                if sample_count > 0:
+                    summary.update(
+                        {
+                            "ST_LITE_history_visual_retention_rate_avg": float(rate_sum / sample_count),
+                            "ST_LITE_history_visual_tokens_before_total": float(before_sum),
+                            "ST_LITE_history_visual_tokens_after_total": float(after_sum),
+                            "ST_LITE_history_visual_retention_rate_global": float(after_sum / before_sum)
+                            if before_sum > 0 else 0.0,
+                            "ST_LITE_history_visual_retention_samples": int(sample_count),
+                            "ST_LITE_keep_ratio": float(os.getenv("ST_LITE_KEEP_RATIO", "0.20")),
+                        }
+                    )
+                if flops_sample_count > 0:
+                    summary.update(
+                        {
+                            "ST_LITE_flops_profiled_samples": int(flops_sample_count),
+                            "ST_LITE_avg_vision_flops": float(vision_flops_sum / flops_sample_count),
+                            "ST_LITE_avg_llm_flops": float(llm_flops_sum / flops_sample_count),
+                            "ST_LITE_avg_lm_head_flops": float(lm_head_flops_sum / flops_sample_count),
+                            "ST_LITE_avg_e2e_flops": float(e2e_flops_sum / flops_sample_count),
+                            "ST_LITE_total_vision_flops": float(vision_flops_sum),
+                            "ST_LITE_total_llm_flops": float(llm_flops_sum),
+                            "ST_LITE_total_lm_head_flops": float(lm_head_flops_sum),
+                            "ST_LITE_total_e2e_flops": float(e2e_flops_sum),
+                            "ST_LITE_avg_e2e_flops_sci": f"{e2e_flops_sum / flops_sample_count:.6e}",
+                            "ST_LITE_total_e2e_flops_sci": f"{e2e_flops_sum:.6e}",
+                        }
+                    )
     if rank == 0:
         if hasattr(dataset, 'summarize_state_packet_records'):
             try:

@@ -38,6 +38,7 @@ from .qwen_vl import QwenVL, QwenVLChat
 from .qwen2_vl import Qwen2VLChat, Qwen2VLChatAguvis
 from .qwen3_vl import Qwen3VLChat
 from .qwen3_vl_guikv import Qwen3VLGUIKVChat
+from .qwen3_vl_stlite import Qwen3VLSTLiteChat
 # from .qwen3_vl_prune import Qwen3VLChat
 from .transcore_m import TransCoreM
 from .visualglm import VisualGLM

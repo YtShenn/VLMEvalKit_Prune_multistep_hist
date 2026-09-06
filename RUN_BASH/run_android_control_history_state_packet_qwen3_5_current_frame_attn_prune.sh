@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=3
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
@@ -26,7 +26,7 @@ export QWEN3VL_PROFILE_FLOPS="${QWEN3VL_PROFILE_FLOPS:-1}"
 export QWEN3VL_RUNTIME_TRACKING="${QWEN3VL_RUNTIME_TRACKING:-1}"
 
 export QWEN3VL_ENABLE_TEMPLATE_PREFILL="${QWEN3VL_ENABLE_TEMPLATE_PREFILL:-0}"
-export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="0"
+export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="1"
 export QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG="${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG:-1}"
 export QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG_POS="${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG_POS:-0}"
 export QWEN3VL_TEMPLATE_PREFILL_IMPL="${QWEN3VL_TEMPLATE_PREFILL_IMPL:-stateful}" #single_generate
@@ -65,16 +65,16 @@ export QWEN3VL_ATTN_PRUNE_SAFETY_CENTER_H_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_CEN
 export QWEN3VL_ATTN_PRUNE_SAFETY_CENTER_W_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_CENTER_W_RATIO:-0.28}"
 export QWEN3VL_ATTN_PRUNE_SAFETY_TEXT_DENSE_RATIO="${QWEN3VL_ATTN_PRUNE_SAFETY_TEXT_DENSE_RATIO:-0.05}"
 
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-index}"
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
 export VLM_EVAL_SAMPLE_INDEX_FILE="${VLM_EVAL_SAMPLE_INDEX_FILE:-OUTPUT_0/attn_prune_debug/android_control_history_state_packet_step_instruct/selected_indices.txt}"
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-10}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
-export ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS="${ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS:-0}"
-export ANDROID_CONTROL_MAX_HISTORY_IMAGES="${ANDROID_CONTROL_MAX_HISTORY_IMAGES:-0}"
+export ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS="${ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS:-1}"
+export ANDROID_CONTROL_MAX_HISTORY_IMAGES="${ANDROID_CONTROL_MAX_HISTORY_IMAGES:-4}"
 export ANDROID_CONTROL_HISTORY_KEEP_SYSTEM_PROMPT="${ANDROID_CONTROL_HISTORY_KEEP_SYSTEM_PROMPT:-0}"
 
-export ANDROID_CONTROL_STATE_PACKET_ENABLE="0" #${ANDROID_CONTROL_STATE_PACKET_ENABLE:-1}"
+export ANDROID_CONTROL_STATE_PACKET_ENABLE="1" #${ANDROID_CONTROL_STATE_PACKET_ENABLE:-1}"
 export ANDROID_CONTROL_STATE_PACKET_DEBUG="${ANDROID_CONTROL_STATE_PACKET_DEBUG:-1}"
 export ANDROID_CONTROL_STATE_PACKET_CACHE_DIR="${ANDROID_CONTROL_STATE_PACKET_CACHE_DIR:-/tmp/android_control_state_packet_cache}"
 export ANDROID_CONTROL_STATE_PACKET_PATCH_SIZE="${ANDROID_CONTROL_STATE_PACKET_PATCH_SIZE:-16}"
@@ -96,11 +96,11 @@ PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
 TS="$(date +%Y%m%d_%H%M%S)"
 # TAG="${TAG:-hist4_keep_system_prompt_state_packet_attn_prune_structured_fast_official_nonvis_prune_layer${QWEN3VL_ATTN_PRUNE_LAYERS}_${QWEN3VL_ATTN_PRUNE_KEEP_RATIO}_eagerattn_0826_high}"
-# TAG="${TAG:-hist4_keep_system_prompt_state_packet_fast_decode_official_nonvis_low_0829}"
+TAG="${TAG:-hist4_keep_system_prompt_state_packet_fast_decode_official_nonvis_high_0906}"
 # TAG="${TAG:-hist4_keep_system_prompt_baseline_official_nonvis_Low_BBox_0825}"
 # TAG="${TAG:-hist4_keep_system_prompt_baseline_official_nonvis_high_0828}"
 # TAG="${TAG:-hist4_keep_system_prompt_state_packet_attn_prune_structured_fast_official_prune_layer${QWEN3VL_ATTN_PRUNE_LAYERS}_${QWEN3VL_ATTN_PRUNE_KEEP_RATIO}_sideattn_0830_high}"
-TAG="${TAG:-hist4_keep_system_prompt_baseline_official_nonhistory_atall_high_0831}"
+# TAG="${TAG:-hist4_keep_system_prompt_baseline_official_nonhistory_atall_high_0906_task}"
 
 WORK_DIR="${WORK_DIR:-OUTPUT/android_control_${TAG}}"
 LOG_FILE="run_output_${TS}_android_control_${TAG}.log"

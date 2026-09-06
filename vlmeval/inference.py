@@ -729,6 +729,12 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                 local_template_static_decode_steps_sum = 0.0
                 local_template_unknown_decode_steps_sum = 0.0
                 local_template_total_decode_tokens_sum = 0.0
+                local_seq_tokens_before_sum = 0.0
+                local_seq_tokens_after_sum = 0.0
+                local_visual_tokens_before_sum = 0.0
+                local_visual_tokens_after_sum = 0.0
+                local_guikv_compressed_kv_tokens_sum = 0.0
+                local_guikv_compressed_kv_tokens_count = 0.0
                 local_template_fallback_reason_counts = {}
                 for rec in recs:
                     if not isinstance(rec, dict):
@@ -736,6 +742,14 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                     local_decode_tokens_sum += float(rec.get('decode_tokens', 0.0) or 0.0)
                     local_decode_steps_sum += float(rec.get('decode_steps', 0.0) or 0.0)
                     local_prompt_seq_tokens_sum += float(rec.get('prompt_seq_tokens', 0.0) or 0.0)
+                    local_seq_tokens_before_sum += float(rec.get('seq_tokens_before', 0.0) or 0.0)
+                    local_seq_tokens_after_sum += float(rec.get('seq_tokens_after', 0.0) or 0.0)
+                    local_visual_tokens_before_sum += float(rec.get('visual_tokens_before', 0.0) or 0.0)
+                    local_visual_tokens_after_sum += float(rec.get('visual_tokens_after', 0.0) or 0.0)
+                    guikv_compressed = float(rec.get('guikv_compressed_kv_tokens', 0.0) or 0.0)
+                    if guikv_compressed > 0.0:
+                        local_guikv_compressed_kv_tokens_sum += guikv_compressed
+                        local_guikv_compressed_kv_tokens_count += 1.0
                     enabled = float(bool(rec.get('template_prefill_enabled', False)))
                     local_template_enabled_count += enabled
                     if not bool(enabled):
@@ -757,6 +771,12 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                         local_template_static_decode_steps_sum,
                         local_template_unknown_decode_steps_sum,
                         local_template_total_decode_tokens_sum,
+                        local_seq_tokens_before_sum,
+                        local_seq_tokens_after_sum,
+                        local_visual_tokens_before_sum,
+                        local_visual_tokens_after_sum,
+                        local_guikv_compressed_kv_tokens_sum,
+                        local_guikv_compressed_kv_tokens_count,
                     ],
                     device=device,
                     dtype=torch.float64,
@@ -785,6 +805,15 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                         'total_decode_steps': float(extra_vals[1]),
                         'avg_prompt_seq_tokens': float(extra_vals[2] / total_count),
                         'total_prompt_seq_tokens': float(extra_vals[2]),
+                        'avg_seq_tokens_before': float(extra_vals[8] / total_count),
+                        'avg_seq_tokens_after': float(extra_vals[9] / total_count),
+                        'avg_visual_tokens_before': float(extra_vals[10] / total_count),
+                        'avg_visual_tokens_after': float(extra_vals[11] / total_count),
+                        'total_seq_tokens_before': float(extra_vals[8]),
+                        'total_seq_tokens_after': float(extra_vals[9]),
+                        'total_visual_tokens_before': float(extra_vals[10]),
+                        'total_visual_tokens_after': float(extra_vals[11]),
+                        'guikv_compressed_kv_token_samples': int(extra_vals[13]),
                         'template_prefill_enabled_count': int(total_template_enabled),
                         'template_prefill_failed_count': int(template_failed_count),
                         'template_prefill_success_rate': float(total_template_enabled / total_count),
@@ -803,6 +832,9 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                         'total_template_total_decode_tokens': float(extra_vals[7]),
                     }
                 )
+                if extra_vals[13] > 0:
+                    summary['avg_guikv_compressed_kv_tokens'] = float(extra_vals[12] / extra_vals[13])
+                    summary['total_guikv_compressed_kv_tokens'] = float(extra_vals[12])
                 if total_template_enabled > 0:
                     summary.update(
                         {

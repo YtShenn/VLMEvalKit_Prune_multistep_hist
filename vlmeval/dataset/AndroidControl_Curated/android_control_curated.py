@@ -398,6 +398,19 @@ class AndroidControlCurated(ImageBaseDataset):
                 return c
         return cands[0]
 
+    def dump_image(self, line):
+        if isinstance(line, int):
+            line = self.data.iloc[line]
+        if "image_path" in line and line.get("image_path") is not None:
+            p = str(line.get("image_path"))
+        else:
+            p = self._resolve_image_path(line.get("image", ""))
+        assert osp.exists(p), (
+            f"AndroidControl screenshot not found: {p}. "
+            "Set ANDROID_CONTROL_CURATED_IMAGE_ROOT to the directory containing screenshot files."
+        )
+        return [p]
+
     def _parse_history_image_list(self, value) -> List[str]:
         parsed = _safe_literal_eval(value)
         if isinstance(parsed, (list, tuple)):

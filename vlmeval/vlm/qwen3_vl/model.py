@@ -515,6 +515,30 @@ def _estimate_vision_forward_flops(model, visual_tokens: int) -> float:
     return float(layers) * float(attn_linear + attn_kernel + mlp)
 
 
+def _guikv_tracking_stats(model) -> dict:
+    cfg = getattr(getattr(model, 'config', None), 'text_config', None)
+    if cfg is None:
+        cfg = getattr(model, 'config', None)
+    if cfg is None:
+        return {}
+    out = {}
+    for key, attr in (
+        ('original_prompt_len', '_guikv_last_original_prompt_len'),
+        ('compressed_seq_len', '_guikv_last_compressed_seq_len'),
+        ('actual_kv_seq_len', '_guikv_last_actual_kv_seq_len'),
+        ('original_seq_len', '_guikv_last_original_seq_len'),
+        ('visual_tokens_before', '_guikv_last_visual_tokens_before'),
+        ('visual_tokens_after', '_guikv_last_visual_tokens_after'),
+    ):
+        value = getattr(cfg, attr, None)
+        if value is not None:
+            try:
+                out[key] = float(value)
+            except Exception:
+                pass
+    return out
+
+
 def _patch_qwen3vl_runtime_tracking(model) -> None:
     # Deprecated wrapper-based tracking path. Kept as a no-op because wrapping the
     # official HF Qwen3-VL forward/generate chain can perturb cache-sensitive decode.
@@ -588,19 +612,29 @@ class _RuntimeTrackingHooks:
                 torch.cuda.synchronize()
             elapsed = float(time.perf_counter() - start_obj)
         self.forward_steps += 1
-        kv_len = max(int(q_len), int(cache_len + q_len))
+        guikv_stats = _guikv_tracking_stats(self.model)
+        guikv_actual_kv_len = int(guikv_stats.get('actual_kv_seq_len', 0) or 0)
+        if is_prefill or guikv_actual_kv_len <= 0:
+            kv_len = max(int(q_len), int(cache_len + q_len))
+        else:
+            kv_len = max(int(q_len), guikv_actual_kv_len)
         self.llm_flops += _estimate_llm_forward_flops(self.model, q_len=int(q_len), kv_len=int(kv_len))
         self.lm_head_flops += _estimate_lm_head_flops(self.model, q_len=max(1, int(q_len)))
         if is_prefill:
             self.prefill_seen = True
             if q_len > 0:
                 self.seq_tokens_before = int(q_len)
-                self.seq_tokens_after = int(q_len)
+                self.seq_tokens_after = int(guikv_stats.get('compressed_seq_len', 0) or q_len)
+            if guikv_stats.get('visual_tokens_before') is not None:
+                self.visual_tokens_before = int(guikv_stats.get('visual_tokens_before', self.visual_tokens_before) or 0)
+            if guikv_stats.get('visual_tokens_after') is not None:
+                self.visual_tokens_after = int(round(guikv_stats.get('visual_tokens_after', self.visual_tokens_after) or 0))
             self._accumulate_prefill_elapsed(elapsed)
         else:
             self.decode_steps += 1
             if q_len > 0:
-                self.seq_tokens_after = int(max(self.seq_tokens_after, self.seq_tokens_before + self.decode_steps))
+                after_base = int(guikv_actual_kv_len or (self.seq_tokens_before + self.decode_steps))
+                self.seq_tokens_after = int(max(self.seq_tokens_after, after_base))
             self._accumulate_decode_elapsed(elapsed)
         return output
 
@@ -1372,8 +1406,9 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                         model_path, torch_dtype='auto', device_map='auto', attn_implementation='sdpa'
                     )
                 else:
+                    attn_implementation = kwargs.get('attn_implementation', 'sdpa')
                     self.model = AutoModelForImageTextToText.from_pretrained(
-                        model_path, torch_dtype='auto', device_map='auto', attn_implementation='sdpa'#'flash_attention_2'
+                        model_path, torch_dtype='auto', device_map='auto', attn_implementation=attn_implementation
                     )
                     _patch_upstream_qwen3vl_prepare_inputs_for_generation(self.model)
             self.model.eval()
@@ -1769,15 +1804,38 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             finally:
                 if runtime_tracker is not None:
                     try:
+                        guikv_stats = _guikv_tracking_stats(self.model)
                         runtime_tracker.seq_tokens_before = int(prompt_seq_tokens or runtime_tracker.seq_tokens_before)
-                        runtime_tracker.seq_tokens_after = int(
-                            max(runtime_tracker.seq_tokens_after, (prompt_seq_tokens or 0) + (decode_tokens or 0))
+                        guikv_after = int(
+                            guikv_stats.get('actual_kv_seq_len', 0)
+                            or guikv_stats.get('compressed_seq_len', 0)
+                            or 0
                         )
+                        if guikv_after > 0:
+                            runtime_tracker.seq_tokens_after = int(guikv_after)
+                        else:
+                            runtime_tracker.seq_tokens_after = int(
+                                max(runtime_tracker.seq_tokens_after, (prompt_seq_tokens or 0) + (decode_tokens or 0))
+                            )
+                        if guikv_stats.get('visual_tokens_before') is not None:
+                            runtime_tracker.visual_tokens_before = int(
+                                guikv_stats.get('visual_tokens_before', runtime_tracker.visual_tokens_before) or 0
+                            )
+                        if guikv_stats.get('visual_tokens_after') is not None:
+                            runtime_tracker.visual_tokens_after = int(
+                                round(guikv_stats.get('visual_tokens_after', runtime_tracker.visual_tokens_after) or 0)
+                            )
                         runtime_tracker.decode_steps = int(max(runtime_tracker.decode_steps, decode_tokens or 0))
                         runtime_tracker.finalize()
                         runtime_dict = runtime_tracker.to_runtime_dict()
                         runtime_dict['prompt_seq_tokens'] = int(prompt_seq_tokens or runtime_dict.get('prompt_seq_tokens', 0) or 0)
                         runtime_dict['decode_tokens'] = int(decode_tokens or runtime_dict.get('decode_tokens', 0) or 0)
+                        if guikv_after > 0:
+                            runtime_dict['guikv_compressed_kv_tokens'] = int(guikv_after)
+                        if guikv_stats:
+                            runtime_dict['guikv_original_prompt_tokens'] = int(
+                                guikv_stats.get('original_prompt_len', prompt_seq_tokens or 0) or 0
+                            )
                         runtime_dict.update(dict(template_meta or {}))
                         cfg = self.model.config.text_config
                         setattr(cfg, '_vlmeval_generate_timing_last', runtime_dict)

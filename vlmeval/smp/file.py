@@ -527,6 +527,12 @@ def prepare_reuse_files(pred_root_meta, eval_id, model_name, dataset_name, reuse
         if prev_file is not None:
             warnings.warn(f'--reuse is set, will reuse prediction file {prev_file}')
             os.system(f'cp {prev_file} {work_dir}')
+            prev_dir = osp.dirname(prev_file)
+            telemetry_prefix = f"{model_name}_{dataset_name}."
+            for telemetry_name in os.listdir(prev_dir):
+                if telemetry_name.startswith(telemetry_prefix) and telemetry_name.endswith(".telemetry.pkl"):
+                    shutil.copy(osp.join(prev_dir, telemetry_name), osp.join(work_dir, telemetry_name))
+                    warnings.warn(f"--reuse is set, will reuse telemetry file {osp.join(prev_dir, telemetry_name)}")
 
     if not reuse_aux:
         warnings.warn(f'--reuse-aux is not set, all auxiliary files in {work_dir} are removed. ')

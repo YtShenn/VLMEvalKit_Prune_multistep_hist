@@ -340,6 +340,16 @@ def _write_experiment_summary(work_dir, summary: dict) -> None:
         warnings.warn(f'[SummaryWriteFailed] work_dir={work_dir} error={err}')
 
 
+def _load_telemetry(path):
+    """Load per-sample runtime records so interrupted inference can resume metrics."""
+    value = _load_partial_result(path, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _dump_telemetry(path, telemetry):
+    dump(telemetry, path)
+
+
 def build_sheet_indices(dataset_len, rank, world_size):
     shuffle_before_split = os.getenv('VLM_SHUFFLE_BEFORE_SPLIT', '1') == '1'
     if not shuffle_before_split or world_size <= 1:
@@ -436,6 +446,15 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     if osp.exists(out_file):
         res.update(_load_partial_result(out_file, {}))
 
+    telemetry_path = f"{out_file}.telemetry.pkl"
+    telemetry = _load_telemetry(telemetry_path)
+    telemetry_samples = telemetry.get("samples", {}) if isinstance(telemetry.get("samples", {}), dict) else {}
+    restored_timing = [tuple(v["timing"]) for v in telemetry_samples.values() if isinstance(v, dict) and isinstance(v.get("timing"), (list, tuple)) and len(v["timing"]) == 2]
+    restored_infer = [tuple(v["infer"]) for v in telemetry_samples.values() if isinstance(v, dict) and isinstance(v.get("infer"), (list, tuple)) and len(v["infer"]) == 2]
+    restored_generate = [v["generate"] for v in telemetry_samples.values() if isinstance(v, dict) and isinstance(v.get("generate"), dict)]
+    restored_stage = [v["stage"] for v in telemetry_samples.values() if isinstance(v, dict) and isinstance(v.get("stage"), dict)]
+    restored_prune = [v["prune"] for v in telemetry_samples.values() if isinstance(v, dict) and isinstance(v.get("prune"), dict)]
+
     rank, world_size = get_rank_and_world_size()
     live_history_predictions = bool(
         'AndroidControl_Curated' in str(dataset_name)
@@ -517,7 +536,15 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     else:
         model.set_dump_image(dataset.dump_image)
 
-    stop_after_index = None
+    if restored_generate:
+        model._vlmeval_generate_timing_records = list(restored_generate)
+    if restored_stage:
+        model._vlmeval_stage_records = list(restored_stage)
+    if restored_prune:
+        model._vlmeval_prune_records = list(restored_prune)
+
+    stop_after_index = os.getenv("VLM_STOP_AFTER_INDEX", "").strip() or None
+    stop_after_samples = int(os.getenv("VLM_STOP_AFTER_SAMPLES", "0") or 0)
     timing_enabled = os.getenv('VLM_TIMING', '0') == '1'
     timing_verbose = os.getenv('VLM_TIMING_VERBOSE', '0') == '1'
     timing_sync = os.getenv('VLM_TIMING_SYNC', '1') == '1'
@@ -628,6 +655,16 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                 print(f'[Timing] index={idx} seconds={elapsed:.6f} prompt_time={prompt_time:.6f} infer_time={infer_time:.6f}', flush=True)
             else:
                 pbar.set_postfix({'sec': f'{elapsed:.3f}'})
+
+        sample_record = {'prediction': response}
+        if timing_enabled:
+            sample_record['timing'] = (idx, float(elapsed))
+            sample_record['infer'] = (idx, float(infer_time))
+        for attr, key in (('_vlmeval_generate_timing_records', 'generate'), ('_vlmeval_stage_records', 'stage'), ('_vlmeval_prune_records', 'prune')):
+            records = getattr(model, attr, None) or []
+            if records and isinstance(records[-1], dict):
+                sample_record[key] = dict(records[-1])
+        telemetry_samples[str(idx)] = sample_record
         processed_count += 1
 
         torch.cuda.empty_cache()
@@ -647,6 +684,14 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         res[idx] = response
         if (i + 1) % 10 == 0:
             dump(res, out_file)
+            telemetry['samples'] = telemetry_samples
+            _dump_telemetry(telemetry_path, telemetry)
+        if stop_after_samples > 0 and processed_count >= stop_after_samples:
+            dump(res, out_file)
+            telemetry['samples'] = telemetry_samples
+            _dump_telemetry(telemetry_path, telemetry)
+            print(f"[Resume] stopped after {processed_count} newly inferred samples", flush=True)
+            raise SystemExit(0)
         if progress_interval > 0 and processed_count % progress_interval == 0:
             acc_msg = ''
             if progress_acc and online_total > 0:
@@ -664,10 +709,14 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                 print(f'[Progress] processed={processed_count}/{lt}{acc_msg}', flush=True)
         if stop_after_index is not None and str(idx) == str(stop_after_index):
             dump(res, out_file)
+            telemetry['samples'] = telemetry_samples
+            _dump_telemetry(telemetry_path, telemetry)
             raise SystemExit(0)
 
     res = {k: res[k] for k in data_indices}
     dump(res, out_file)
+    telemetry['samples'] = telemetry_samples
+    _dump_telemetry(telemetry_path, telemetry)
     if timing_enabled and timing_records:
         durations = [x[1] for x in timing_records]
         avg = sum(durations) / len(durations)

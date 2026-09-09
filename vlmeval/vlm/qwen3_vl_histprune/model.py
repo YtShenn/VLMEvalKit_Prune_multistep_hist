@@ -89,8 +89,17 @@ class Qwen3VLHistPruneChat(Qwen3VLChat):
         # turns it into the prescribed recent-first rank map.
         current_key = _path(message[current_index]) if current_index is not None else None
         self._publish_config(history_images, history_keys + ([os.path.abspath(current_key)] if current_key else [""]))
+        # Do not let a current-only step inherit the previous step's metrics.
+        self._histprune_last_sample_stats = None
+        self.model.config.text_config._histprune_last_stats = None
         try:
             return super().generate_inner_transformers(message, dataset=dataset, **kwargs)
         finally:
+            # The decoder produces this compact metadata after it has aligned
+            # image placeholders and applied (or intentionally skipped) prune.
+            # Keep a request-local snapshot for inference.py's summary writer.
+            stats = getattr(self.model.config.text_config, "_histprune_last_stats", None)
+            if isinstance(stats, dict):
+                self._histprune_last_sample_stats = dict(stats)
             # PIL references are per request; cache itself is explicitly episode-managed.
             self.model.config.text_config._histprune_history_images = []

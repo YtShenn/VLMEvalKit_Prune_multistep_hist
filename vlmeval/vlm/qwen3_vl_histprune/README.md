@@ -16,6 +16,12 @@ DeepStack features by absolute image path plus processed grid; call
 Set `HISTPRUNE_LOG_STATS=1` to print one JSON budget audit per pruning step.
 It is disabled by default; the latest record remains available at
 `model.config.text_config._histprune_last_stats` for programmatic collection.
+At the end of an evaluation, `summary.json` additionally reports token-weighted
+global retention/pruning rates across all steps containing history: historical
+visual tokens only (`HistPrune_history_visual_*`), all visual tokens including
+the unpruned current frame (`HistPrune_visual_*`), and full prompts including
+text (`HistPrune_prompt_*`).  The `*_global` values are computed from summed
+token totals, while `*_avg` is the unweighted per-step mean.
 
 HistPrune requires generation KV caching. Its runner keeps caching on and
 defaults FLOPs profiling and forced CUDA synchronization to off; enable

@@ -488,6 +488,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     infer_records = [] if timing_enabled else None
     stlite_sample_stats = []
     guipruner_sample_stats = []
+    histprune_sample_stats = []
     processed_count = 0
     online_correct = 0
     online_total = 0
@@ -565,6 +566,9 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         guipruner_stats = getattr(model, "_guipruner_last_sample_stats", None)
         if isinstance(guipruner_stats, dict):
             guipruner_sample_stats.append(dict(guipruner_stats))
+        histprune_stats = getattr(model, "_histprune_last_sample_stats", None)
+        if isinstance(histprune_stats, dict):
+            histprune_sample_stats.append(dict(histprune_stats))
         if timing_enabled:
             if timing_sync and torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -1205,6 +1209,76 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                     ),
                     "GUIPruner_actual_retention_samples": int(sample_count),
                     "GUIPruner_actual_history_retention_samples": int(history_samples),
+                }
+            )
+    if histprune_sample_stats or (world_size > 1 and dist.is_available() and dist.is_initialized()):
+        # Sum tokens first, then divide.  These global rates are therefore
+        # token-weighted across all history-bearing evaluation steps, rather
+        # than an unweighted mean of per-step rates.
+        # history before/after, current visual, text, sample-rate sums/counts.
+        local = [0.0] * 8
+        for record in histprune_sample_stats:
+            history_before = float(record.get("history_tokens", 0) or 0)
+            history_after = float(record.get("history_keep_budget", 0) or 0)
+            current_visual = float(record.get("current_visual_tokens", 0) or 0)
+            text_tokens = float(record.get("text_tokens", 0) or 0)
+            if history_before <= 0:
+                continue
+            # `actual` is the authoritative post-selection count when present.
+            actual = record.get("actual")
+            if isinstance(actual, (list, tuple)):
+                history_after = float(sum(int(value) for value in actual))
+            local[0] += history_before
+            local[1] += history_after
+            local[2] += current_visual
+            local[3] += text_tokens
+            local[4] += history_after / history_before
+            visual_before = history_before + current_visual
+            prompt_before = visual_before + text_tokens
+            if visual_before > 0:
+                local[5] += (history_after + current_visual) / visual_before
+            if prompt_before > 0:
+                local[6] += (history_after + current_visual + text_tokens) / prompt_before
+            local[7] += 1.0
+        aggregate = torch.tensor(
+            local,
+            device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
+            dtype=torch.float64,
+        )
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(aggregate, op=dist.ReduceOp.SUM)
+        (
+            history_before_total, history_after_total, current_visual_total, text_tokens_total,
+            history_rate_sum, visual_rate_sum, prompt_rate_sum, sample_count,
+        ) = aggregate.tolist()
+        if rank == 0 and sample_count > 0:
+            visual_before_total = history_before_total + current_visual_total
+            visual_after_total = history_after_total + current_visual_total
+            prompt_before_total = visual_before_total + text_tokens_total
+            prompt_after_total = visual_after_total + text_tokens_total
+            history_retention = history_after_total / history_before_total
+            visual_retention = visual_after_total / visual_before_total if visual_before_total > 0 else 0.0
+            prompt_retention = prompt_after_total / prompt_before_total if prompt_before_total > 0 else 0.0
+            summary.update(
+                {
+                    "HistPrune_history_visual_tokens_before_total": float(history_before_total),
+                    "HistPrune_history_visual_tokens_after_total": float(history_after_total),
+                    "HistPrune_history_visual_retention_rate_global": float(history_retention),
+                    "HistPrune_history_visual_pruning_rate_global": float(1.0 - history_retention),
+                    "HistPrune_history_visual_retention_rate_avg": float(history_rate_sum / sample_count),
+                    "HistPrune_visual_tokens_before_total": float(visual_before_total),
+                    "HistPrune_visual_tokens_after_total": float(visual_after_total),
+                    "HistPrune_visual_retention_rate_global": float(visual_retention),
+                    "HistPrune_visual_pruning_rate_global": float(1.0 - visual_retention),
+                    "HistPrune_visual_retention_rate_avg": float(visual_rate_sum / sample_count),
+                    "HistPrune_prompt_tokens_before_total": float(prompt_before_total),
+                    "HistPrune_prompt_tokens_after_total": float(prompt_after_total),
+                    "HistPrune_prompt_retention_rate_global": float(prompt_retention),
+                    "HistPrune_prompt_pruning_rate_global": float(1.0 - prompt_retention),
+                    "HistPrune_prompt_retention_rate_avg": float(prompt_rate_sum / sample_count),
+                    "HistPrune_retention_samples": int(sample_count),
+                    "HistPrune_history_keep_ratio_requested": float(os.getenv("HISTPRUNE_HISTORY_KEEP_RATIO", "0.40")),
+                    "HistPrune_mode": str(os.getenv("HISTPRUNE_MODE", "random")),
                 }
             )
     if rank == 0:

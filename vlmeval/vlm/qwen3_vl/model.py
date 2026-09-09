@@ -1338,7 +1338,11 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
         self.verbose = verbose
         self.post_process = post_process
         self.use_histprune = bool(kwargs.pop('histprune', False))
-        self.use_attn_prune = bool(kwargs.pop('use_attn_prune', False) or kwargs.pop('attn_prune', False) or self.use_histprune)
+        # FastV deliberately uses the same isolated custom decoder only for
+        # its cache/DeepStack-safe physical sequence surgery. Its scoring and
+        # configuration remain independent of AttnPrune.
+        self.use_fastv = bool(kwargs.pop('fastv', False))
+        self.use_attn_prune = bool(kwargs.pop('use_attn_prune', False) or kwargs.pop('attn_prune', False) or self.use_histprune or self.use_fastv)
         self.fps = kwargs.pop('fps', 2)
         self.nframe = kwargs.pop('nframe', 128)
         self.FRAME_FACTOR = 2
@@ -1434,7 +1438,7 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             # HistPrune physically trims the prefill cache and therefore needs
             # normal generation caching. Existing AttnPrune keeps its legacy
             # cache-off default unchanged.
-            if _use_qwen3vl_attn_prune_model(self.use_attn_prune) and not self.use_histprune and not _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0'):
+            if _use_qwen3vl_attn_prune_model(self.use_attn_prune) and not self.use_histprune and not self.use_fastv and not _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0'):
                 try:
                     self.model.config.use_cache = False
                 except Exception:

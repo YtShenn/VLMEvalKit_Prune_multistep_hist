@@ -24,7 +24,7 @@ DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
 # HistPrune: one fixed total history budget, allocated recent -> old. Current
 # screenshot is never pruned. Set keep ratio=1.0 for full-history control.
 export HISTPRUNE_MODE="${HISTPRUNE_MODE:-random}"
-export HISTPRUNE_HISTORY_KEEP_RATIO="${HISTPRUNE_HISTORY_KEEP_RATIO:-0.40}"
+export HISTPRUNE_HISTORY_KEEP_RATIO="${HISTPRUNE_HISTORY_KEEP_RATIO:-0.0236}"
 export HISTPRUNE_TEMPORAL_WEIGHTS="${HISTPRUNE_TEMPORAL_WEIGHTS:-0.4,0.3,0.2,0.1}"
 export HISTPRUNE_DROP_LAYER="${HISTPRUNE_DROP_LAYER:-4}"
 export HISTPRUNE_RANDOM_SEED="${HISTPRUNE_RANDOM_SEED:-42}"

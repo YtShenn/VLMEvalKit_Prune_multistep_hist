@@ -1602,6 +1602,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         attn_prune_token_meta: dict | None = None,
         histprune_token_meta: dict | None = None,
+        fastv_token_meta: dict | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple | BaseModelOutputWithPast:
         r"""
@@ -1674,6 +1675,42 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 histprune_stats["prune_applied"] = False
             except Exception as exc:
                 raise RuntimeError(f"HistPrune setup failed; refusing unsafe pruning: {exc}") from exc
+
+        # FastV is intentionally independent from AttnPrune. It scores every
+        # visual token from the previous layer with the *last sequence query*,
+        # averaged across heads, exactly as the official implementation does.
+        fastv_cfg = getattr(self.config, "_fastv_config", None)
+        fastv_enabled = bool(
+            getattr(self.config, "_fastv_enabled", False)
+            and bool(getattr(fastv_cfg, "enabled", False))
+            and fastv_token_meta is not None
+            and hidden_states.shape[0] == 1
+            and hidden_states.shape[1] > 1
+            and is_prefill_forward
+            and not self.training
+        )
+        fastv_visual_indices = fastv_token_meta.get("visual_indices") if fastv_enabled else None
+        if torch.is_tensor(fastv_visual_indices):
+            fastv_visual_indices = fastv_visual_indices.to(hidden_states.device, dtype=torch.long)
+            fastv_visual_indices = fastv_visual_indices[
+                (fastv_visual_indices >= 0) & (fastv_visual_indices < hidden_states.shape[1])
+            ]
+        else:
+            fastv_enabled = False
+        fastv_k = int(getattr(fastv_cfg, "k", 2)) if fastv_enabled else -1
+        fastv_r = float(getattr(fastv_cfg, "r", .5)) if fastv_enabled else 0.0
+        fastv_stats = {
+            "prune_applied": False,
+            "enabled": bool(fastv_enabled),
+            "k": fastv_k,
+            "r": fastv_r,
+            "score_source": "previous_layer_last_query_head_mean",
+            "visual_tokens_before": int(fastv_visual_indices.numel()) if torch.is_tensor(fastv_visual_indices) else 0,
+            "visual_tokens_after": int(fastv_visual_indices.numel()) if torch.is_tensor(fastv_visual_indices) else 0,
+            "seq_tokens_before": int(hidden_states.shape[1]),
+            "seq_tokens_after": int(hidden_states.shape[1]),
+            "reason": "ready" if fastv_enabled else "disabled_or_missing_visual_metadata",
+        }
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -1799,6 +1836,13 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                                             "sequence_length_after": int(hidden_states.shape[1]), "prune_applied": True})
             attn_meta = None
             query_indices = None
+            # At layer K-1 request exactly the official FastV attention row:
+            # last query token -> every visual token, mean over heads.
+            if fastv_enabled and layer_idx == fastv_k - 1 and fastv_visual_indices.numel() > 0:
+                attn_meta = {
+                    "query_indices": torch.tensor([hidden_states.shape[1] - 1], device=hidden_states.device),
+                    "visual_indices": fastv_visual_indices,
+                }
             if need_attn and layer_idx in attn_layer_set and torch.is_tensor(current_visual_indices):
                 query_indices = self._attn_prune_query_indices(
                     visual_pos_masks=visual_pos_masks,
@@ -1857,6 +1901,63 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                 )
 
             attn_weights = getattr(decoder_layer, "_attn_prune_last_weights", None)
+            if fastv_enabled and layer_idx == fastv_k - 1:
+                if not torch.is_tensor(attn_weights) or attn_weights.numel() != fastv_visual_indices.numel():
+                    fastv_stats["reason"] = "attention_scores_unavailable_or_misaligned"
+                    fastv_enabled = False
+                elif fastv_r == 0.0:
+                    fastv_stats["reason"] = "r_zero_no_pruning"
+                    fastv_enabled = False
+                else:
+                    # This occurs immediately after K-1 and therefore before
+                    # decoder layer K, matching the official fastv_forward.
+                    from ..qwen3_vl_fastv.token import select_keep_indices
+                    original_seq_len = int(hidden_states.shape[1])
+                    keep_indices = select_keep_indices(
+                        original_seq_len, fastv_visual_indices, attn_weights.flatten(), fastv_r
+                    )
+                    if int(keep_indices.numel()) != original_seq_len:
+                        visual_positions = torch.where(visual_pos_masks[0].bool())[0] if visual_pos_masks is not None else None
+                        if visual_positions is None:
+                            fastv_stats["reason"] = "visual_mask_missing"
+                            fastv_enabled = False
+                        else:
+                            keep_visual_rel_idx = torch.where(
+                                torch.isin(visual_positions, keep_indices)
+                            )[0]
+                            _attn_prune_past_key_values(
+                                past_key_values, keep_indices, layer_idx, original_seq_len
+                            )
+                            hidden_states = hidden_states.index_select(1, keep_indices)
+                            if text_position_ids is not None:
+                                text_position_ids = text_position_ids.index_select(1, keep_indices)
+                            position_ids = position_ids.index_select(2, keep_indices)
+                            visual_pos_masks = visual_pos_masks.index_select(1, keep_indices)
+                            if deepstack_visual_embeds is not None:
+                                deepstack_visual_embeds = [
+                                    emb.index_select(0, keep_visual_rel_idx.to(emb.device))
+                                    for emb in deepstack_visual_embeds
+                                ]
+                            raw_attention_mask = torch.ones(
+                                (1, hidden_states.shape[1]), dtype=torch.bool, device=hidden_states.device
+                            )
+                            attention_mask = create_causal_mask(
+                                config=self.config, inputs_embeds=hidden_states,
+                                attention_mask=raw_attention_mask, past_key_values=None,
+                                position_ids=text_position_ids,
+                            )
+                            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+                            fastv_stats.update({
+                                "prune_applied": True,
+                                "reason": "applied",
+                                "drop_layer": int(fastv_k),
+                                "visual_tokens_after": int(keep_indices.numel() - (original_seq_len - int(fastv_visual_indices.numel()))),
+                                "seq_tokens_after": int(hidden_states.shape[1]),
+                                "kept_visual_rel_indices": torch.where(torch.isin(fastv_visual_indices, keep_indices))[0].tolist(),
+                            })
+                    else:
+                        fastv_stats["reason"] = "selection_kept_all"
+                    fastv_enabled = False
             if attn_weights is None or not torch.is_tensor(attn_weights) or attn_weights.numel() == 0:
                 continue
 
@@ -2026,6 +2127,9 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             setattr(self.config, "_histprune_last_stats", histprune_stats)
             if histprune_stats.get("prune_applied") and os.getenv("HISTPRUNE_LOG_STATS", "0").strip().lower() in {"1", "true", "yes"}:
                 print("[HistPrune] " + json.dumps(histprune_stats, sort_keys=True), flush=True)
+        setattr(self.config, "_fastv_last_stats", fastv_stats)
+        if bool(getattr(fastv_cfg, "debug", False)):
+            print("[FastV] " + json.dumps(fastv_stats, sort_keys=True), flush=True)
 
         runtime = dict(getattr(self.config, "_vlmeval_generate_timing_accum", {}) or {})
         runtime.setdefault("prefill_s", 0.0)
@@ -3230,6 +3334,13 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
 
         attn_prune_token_meta = self._attn_prune_current_image_meta(input_ids, image_mask, image_grid_thw)
         histprune_token_meta = None
+        fastv_token_meta = None
+        if bool(getattr(self.config.text_config, "_fastv_enabled", False)):
+            # `visual_pos_masks` is built after Qwen has expanded all image
+            # placeholders, so it naturally represents every history and the
+            # current screenshot, even when their grids differ.
+            from ..qwen3_vl_fastv.token import build_token_meta as build_fastv_token_meta
+            fastv_token_meta = build_fastv_token_meta(visual_pos_masks)
         if bool(getattr(self.config.text_config, "_histprune_enabled", False)):
             try:
                 from ..qwen3_vl_histprune.history import build_token_meta
@@ -3262,6 +3373,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             deepstack_visual_embeds=deepstack_visual_embeds,
             attn_prune_token_meta=attn_prune_token_meta,
             histprune_token_meta=histprune_token_meta,
+            fastv_token_meta=fastv_token_meta,
             **kwargs,
         )
 

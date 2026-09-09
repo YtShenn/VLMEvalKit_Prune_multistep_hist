@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Isolated FastV run: retain four old->new history screenshots plus current.
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export FASTV_ENABLED="${FASTV_ENABLED:-1}"
+export FASTV_K="${FASTV_K:-2}"
+export FASTV_R="${FASTV_R:-0.5}"
+export FASTV_DEBUG="${FASTV_DEBUG:-1}"
+export GUI_ODYSSEY_USE_HISTORY_SCREENSHOTS="${GUI_ODYSSEY_USE_HISTORY_SCREENSHOTS:-1}"
+export GUI_ODYSSEY_MAX_HISTORY_IMAGES="${GUI_ODYSSEY_MAX_HISTORY_IMAGES:-4}"
+export ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS="${ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS:-1}"
+export ANDROID_CONTROL_MAX_HISTORY_IMAGES="${ANDROID_CONTROL_MAX_HISTORY_IMAGES:-4}"
+export AITW_HIS_NUM="${AITW_HIS_NUM:-4}"
+export MIND2WEB_HIS_NUM="${MIND2WEB_HIS_NUM:-4}"
+export QWEN3VL_ENABLE_ATTN_PRUNE=0
+export QWEN3VL_ENABLE_ROI_PRUNE=0
+export QWEN3VL_ENABLE_TEMPLATE_PREFILL=0
+export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE=0
+
+MODEL="${MODEL:-Qwen3-VL-4B-Instruct-FastV}"
+DATASET="${DATASET:-AndroidControl_Curated_High_Task_Improved}"
+WORK_DIR="${WORK_DIR:-OUTPUT_FASTV/4B_hist4_k${FASTV_K}_r${FASTV_R}}"
+mkdir -p "${WORK_DIR}"
+python run.py --data "${DATASET}" --model "${MODEL}" --work-dir "${WORK_DIR}" --mode all

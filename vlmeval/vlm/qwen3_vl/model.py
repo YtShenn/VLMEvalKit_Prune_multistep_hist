@@ -1329,7 +1329,8 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
         self.system_prompt = system_prompt
         self.verbose = verbose
         self.post_process = post_process
-        self.use_attn_prune = bool(kwargs.pop('use_attn_prune', False) or kwargs.pop('attn_prune', False))
+        self.use_histprune = bool(kwargs.pop('histprune', False))
+        self.use_attn_prune = bool(kwargs.pop('use_attn_prune', False) or kwargs.pop('attn_prune', False) or self.use_histprune)
         self.fps = kwargs.pop('fps', 2)
         self.nframe = kwargs.pop('nframe', 128)
         self.FRAME_FACTOR = 2
@@ -1422,7 +1423,10 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                     self.model.generation_config.use_cache = False
                 except Exception:
                     pass
-            if _use_qwen3vl_attn_prune_model(self.use_attn_prune) and not _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0'):
+            # HistPrune physically trims the prefill cache and therefore needs
+            # normal generation caching. Existing AttnPrune keeps its legacy
+            # cache-off default unchanged.
+            if _use_qwen3vl_attn_prune_model(self.use_attn_prune) and not self.use_histprune and not _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0'):
                 try:
                     self.model.config.use_cache = False
                 except Exception:

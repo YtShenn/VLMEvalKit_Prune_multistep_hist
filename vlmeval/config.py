@@ -1261,7 +1261,7 @@ qwen3vl_series = {
     ),
     "Qwen3-VL-4B-Instruct-STLite": partial(
         Qwen3VLSTLiteChat,
-        model_path="/mnt/storage/users/ytshen_data/Qwen3-VL-4B-Instruct",
+        model_path="/public/kanglj/models/Qwen3-VL-4B-Instruct",
         use_custom_prompt=False,
         use_vllm=False,
         attn_implementation="sdpa",

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import math
 import unittest
+from types import SimpleNamespace
 
 import torch
 from PIL import Image
 
 from vlmeval.vlm.qwen3_vl_guipruner.config import GUIPrunerConfig, resolve_current_keep_ratio
+from vlmeval.vlm.qwen3_vl_guipruner.attention_patch import _trim_prefill_attention_mask
+from vlmeval.vlm.qwen3_vl_guipruner.flops import correct_split_prefill_flops
 from vlmeval.vlm.qwen3_vl_guipruner.ssp import select_stratified
 from vlmeval.vlm.qwen3_vl_guipruner.tar import apply_tar, temporal_token_quotas
 from vlmeval.vlm.qwen3_vl_guipruner.model import _history_and_current_indices
@@ -51,6 +54,15 @@ class TestSSP(unittest.TestCase):
         result = select_stratified(torch.arange(12.0), torch.zeros(12, dtype=torch.bool), .75, .3)
         self.assertTrue(torch.all(result.final < 12))
 
+    def test_prefill_attention_mask_uses_the_same_selection_as_kv(self):
+        keep = torch.tensor([0, 2, 3])
+        mask_2d = torch.ones(1, 4)
+        mask_4d = torch.arange(16.0).reshape(1, 1, 4, 4)
+        self.assertEqual(tuple(_trim_prefill_attention_mask(mask_2d, keep, 4).shape), (1, 3))
+        trimmed_4d = _trim_prefill_attention_mask(mask_4d, keep, 4)
+        self.assertEqual(tuple(trimmed_4d.shape), (1, 1, 3, 3))
+        self.assertTrue(torch.equal(trimmed_4d[0, 0], mask_4d[0, 0][keep][:, keep]))
+
 
 class TestConfig(unittest.TestCase):
     def test_rejects_more_than_four_history_images(self):
@@ -61,17 +73,55 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(GUIPrunerConfig().prune_layer, 2)
 
     def test_global_budget_derives_current_ratio(self):
-        # H=4000, C=2000, lambda=.4, eta=.5 -> current ratio=.7.
+        # H=4000, lambda=.4 -> H_tar=1600; C=2000, eta=.5 on
+        # (H_tar+C) -> current ratio=(.5*3600-1600)/2000=.1.
         self.assertAlmostEqual(
             resolve_current_keep_ratio(history_original_tokens=4000, current_original_tokens=2000,
                                        history_keep_ratio=.4, overall_keep_ratio=.5),
-            .7,
+            .1,
+        )
+
+    def test_global_prompt_budget_derives_current_ratio(self):
+        # Exact endpoint accounting: baseline=1000, TAR/text fixed=100,
+        # current=500, eta=.35 -> keep (350-100)/500=.5 of current.
+        self.assertAlmostEqual(
+            resolve_current_keep_ratio(history_original_tokens=0, current_original_tokens=500,
+                                       history_keep_ratio=.4, overall_keep_ratio=.35,
+                                       baseline_prompt_tokens=1000,
+                                       fixed_prompt_tokens_after_tar=100),
+            .5,
         )
 
     def test_infeasible_global_budget_fails_closed(self):
         with self.assertRaises(ValueError):
-            resolve_current_keep_ratio(history_original_tokens=4000, current_original_tokens=2000,
+            resolve_current_keep_ratio(history_original_tokens=4000, current_original_tokens=500,
                                        history_keep_ratio=.8, overall_keep_ratio=.1)
+
+    def test_infeasible_global_budget_can_clip_current_frame(self):
+        # Requested current budget exceeds C; clip policy saturates at 100%.
+        self.assertEqual(
+            resolve_current_keep_ratio(history_original_tokens=4000, current_original_tokens=500,
+                                       history_keep_ratio=.8, overall_keep_ratio=.9,
+                                       baseline_prompt_tokens=1000,
+                                       fixed_prompt_tokens_after_tar=100,
+                                       infeasible_policy="clip"),
+            1.0,
+        )
+
+
+class TestFlops(unittest.TestCase):
+    def test_split_prefill_replaces_full_length_accounting(self):
+        cfg = SimpleNamespace(
+            hidden_size=64, intermediate_size=128, num_attention_heads=4,
+            num_key_value_heads=4, head_dim=16, num_hidden_layers=8, vocab_size=256,
+        )
+        model = SimpleNamespace(config=SimpleNamespace(text_config=cfg))
+        generic = {"vision_flops": 100.0, "llm_flops": 1e9, "lm_head_flops": 1e8, "e2e_flops": 1.1e9}
+        result = correct_split_prefill_flops(
+            model, generic, prompt_tokens_before_ssp=100, prompt_tokens_after_ssp=40, prune_layer_one_based=2,
+        )
+        self.assertLess(result["prefill_split_llm_flops"], result["prefill_full_length_llm_flops_replaced"])
+        self.assertAlmostEqual(result["e2e_flops"], result["vision_flops"] + result["llm_flops"] + result["lm_head_flops"])
 
 
 class TestHistoryIdentification(unittest.TestCase):

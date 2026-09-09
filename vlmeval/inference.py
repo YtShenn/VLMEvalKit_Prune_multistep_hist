@@ -487,6 +487,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     timing_records = [] if timing_enabled else None
     infer_records = [] if timing_enabled else None
     stlite_sample_stats = []
+    guipruner_sample_stats = []
     processed_count = 0
     online_correct = 0
     online_total = 0
@@ -561,6 +562,9 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         stlite_stats = getattr(model, "_stlite_last_sample_stats", None)
         if isinstance(stlite_stats, dict):
             stlite_sample_stats.append(dict(stlite_stats))
+        guipruner_stats = getattr(model, "_guipruner_last_sample_stats", None)
+        if isinstance(guipruner_stats, dict):
+            guipruner_sample_stats.append(dict(guipruner_stats))
         if timing_enabled:
             if timing_sync and torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -870,6 +874,11 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                 )
                 flops_keys = ['vision_flops', 'llm_flops', 'lm_head_flops', 'e2e_flops']
                 flops_values = [0.0, 0.0, 0.0, 0.0, 0.0]
+                guipruner_prefill_values = [0.0, 0.0, 0.0]
+                flops_estimations = sorted({
+                    str(rec.get('estimation')) for rec in recs
+                    if isinstance(rec, dict) and rec.get('estimation')
+                })
                 for rec in recs:
                     if not isinstance(rec, dict):
                         continue
@@ -878,10 +887,17 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                     flops_values[2] += float(rec.get('lm_head_flops', 0.0) or 0.0)
                     flops_values[3] += float(rec.get('e2e_flops', 0.0) or 0.0)
                     flops_values[4] += float(bool(float(rec.get('e2e_flops', 0.0) or 0.0) > 0.0))
+                    if rec.get('prefill_split_llm_flops') is not None:
+                        guipruner_prefill_values[0] += float(rec.get('prefill_full_length_llm_flops_replaced', 0.0) or 0.0)
+                        guipruner_prefill_values[1] += float(rec.get('prefill_split_llm_flops', 0.0) or 0.0)
+                        guipruner_prefill_values[2] += 1.0
                 flops_tensor = torch.tensor(flops_values, device=device, dtype=torch.float64)
+                guipruner_prefill_tensor = torch.tensor(guipruner_prefill_values, device=device, dtype=torch.float64)
                 if world_size > 1 and dist.is_available() and dist.is_initialized():
                     dist.all_reduce(flops_tensor, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(guipruner_prefill_tensor, op=dist.ReduceOp.SUM)
                 fv = flops_tensor.tolist()
+                gui_prefill = guipruner_prefill_tensor.tolist()
                 if fv[4] > 0:
                     avg_vision_flops = float(fv[0] / fv[4])
                     avg_llm_flops = float(fv[1] / fv[4])
@@ -908,6 +924,17 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                             'total_e2e_flops_sci': f'{float(fv[3]):.6e}',
                         }
                     )
+                    if flops_estimations:
+                        summary['flops_estimation'] = '; '.join(flops_estimations)
+                    if gui_prefill[2] > 0:
+                        summary.update(
+                            {
+                                'GUIPruner_avg_prefill_full_length_llm_flops_replaced': float(gui_prefill[0] / gui_prefill[2]),
+                                'GUIPruner_avg_prefill_split_llm_flops': float(gui_prefill[1] / gui_prefill[2]),
+                                'GUIPruner_prefill_llm_flops_retention': float(gui_prefill[1] / gui_prefill[0])
+                                if gui_prefill[0] > 0 else None,
+                            }
+                        )
                     print(
                         '[FlopsSummary] '
                         f"samples={int(fv[4])} "
@@ -1080,6 +1107,106 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                             "ST_LITE_total_e2e_flops_sci": f"{e2e_flops_sum:.6e}",
                         }
                     )
+    if guipruner_sample_stats or (world_size > 1 and dist.is_available() and dist.is_initialized()):
+        # Totals are aggregated before division: this is the actual token
+        # retention after TAR alignment and SSP integer budget rounding.
+        local = [0.0] * 17
+        # history_before, history_after, stage_before, stage_after,
+        # history_rate_sum, history_rate_samples, stage_rate_sum, samples,
+        # raw_before, raw_after, prompt_baseline, prompt_after,
+        # prompt_before_ssp, prompt_samples, prompt_rate_sum,
+        # global-budget-clamped samples, samples with an eta request.
+        for record in guipruner_sample_stats:
+            history_before = float(record.get("GUIPruner_history_visual_tokens_before", 0) or 0)
+            history_after = float(record.get("GUIPruner_history_visual_tokens_after", 0) or 0)
+            global_before = float(record.get("GUIPruner_visual_tokens_before", 0) or 0)
+            global_after = float(record.get("GUIPruner_visual_tokens_after", 0) or 0)
+            raw_before = float(record.get("GUIPruner_raw_visual_tokens_before", 0) or 0)
+            raw_after = float(record.get("GUIPruner_raw_visual_tokens_after", 0) or 0)
+            prompt_baseline = float(record.get("GUIPruner_prompt_tokens_before_baseline", 0) or 0)
+            prompt_after = float(record.get("GUIPruner_prompt_tokens_after_ssp", 0) or 0)
+            prompt_before_ssp = float(record.get("GUIPruner_prompt_tokens_before_ssp", 0) or 0)
+            eta_requested = record.get("overall_keep_ratio", None)
+            if global_before <= 0:
+                continue
+            local[0] += history_before
+            local[1] += history_after
+            local[2] += global_before
+            local[3] += global_after
+            if history_before > 0:
+                local[4] += history_after / history_before
+                local[5] += 1.0
+            local[6] += global_after / global_before
+            local[7] += 1.0
+            local[8] += raw_before
+            local[9] += raw_after
+            if prompt_baseline > 0 and prompt_after > 0 and prompt_before_ssp > 0:
+                local[10] += prompt_baseline
+                local[11] += prompt_after
+                local[12] += prompt_before_ssp
+                local[13] += 1.0
+                local[14] += prompt_after / prompt_baseline
+            if eta_requested is not None:
+                local[15] += float(bool(record.get("global_budget_clamped", False)))
+                local[16] += 1.0
+        aggregate = torch.tensor(
+            local,
+            device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
+            dtype=torch.float64,
+        )
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(aggregate, op=dist.ReduceOp.SUM)
+        (
+            history_before_total, history_after_total, global_before_total, global_after_total,
+            history_rate_sum, history_samples, global_rate_sum, sample_count,
+            raw_before_total, raw_after_total,
+            prompt_baseline_total, prompt_after_total, prompt_before_ssp_total,
+            prompt_samples, prompt_rate_sum,
+            global_budget_clamped_samples, global_budget_requested_samples,
+        ) = aggregate.tolist()
+        if rank == 0 and sample_count > 0:
+            history_retention_global = history_after_total / history_before_total if history_before_total > 0 else 0.0
+            global_retention_global = global_after_total / global_before_total
+            raw_retention_global = raw_after_total / raw_before_total if raw_before_total > 0 else 0.0
+            summary.update(
+                {
+                    "GUIPruner_actual_history_visual_tokens_before_total": float(history_before_total),
+                    "GUIPruner_actual_history_visual_tokens_after_total": float(history_after_total),
+                    "GUIPruner_actual_history_retention_rate_global": float(history_retention_global),
+                    "GUIPruner_actual_history_pruning_rate_global": float(1.0 - history_retention_global),
+                    "GUIPruner_actual_history_retention_rate_avg": float(history_rate_sum / history_samples)
+                    if history_samples > 0 else None,
+                    "GUIPruner_actual_visual_tokens_before_total": float(global_before_total),
+                    "GUIPruner_actual_visual_tokens_after_total": float(global_after_total),
+                    "GUIPruner_actual_global_retention_rate_global": float(global_retention_global),
+                    "GUIPruner_actual_global_pruning_rate_global": float(1.0 - global_retention_global),
+                    "GUIPruner_actual_global_retention_rate_avg": float(global_rate_sum / sample_count),
+                    "GUIPruner_actual_end_to_end_visual_tokens_before_total": float(raw_before_total),
+                    "GUIPruner_actual_end_to_end_visual_tokens_after_total": float(raw_after_total),
+                    "GUIPruner_actual_end_to_end_retention_rate_global": float(raw_retention_global),
+                    "GUIPruner_actual_end_to_end_pruning_rate_global": float(1.0 - raw_retention_global),
+                    "GUIPruner_actual_prompt_tokens_before_baseline_total": float(prompt_baseline_total),
+                    "GUIPruner_actual_prompt_tokens_after_ssp_total": float(prompt_after_total),
+                    "GUIPruner_actual_prompt_retention_rate_global": (
+                        float(prompt_after_total / prompt_baseline_total) if prompt_baseline_total > 0 else None
+                    ),
+                    "GUIPruner_actual_prompt_retention_rate_avg": (
+                        float(prompt_rate_sum / prompt_samples) if prompt_samples > 0 else None
+                    ),
+                    "GUIPruner_actual_post_tar_prompt_retention_rate_global": (
+                        float(prompt_after_total / prompt_before_ssp_total) if prompt_before_ssp_total > 0 else None
+                    ),
+                    "GUIPruner_actual_prompt_retention_samples": int(prompt_samples),
+                    "GUIPruner_global_budget_clamped_samples": int(global_budget_clamped_samples),
+                    "GUIPruner_global_budget_requested_samples": int(global_budget_requested_samples),
+                    "GUIPruner_global_budget_clamped_rate": (
+                        float(global_budget_clamped_samples / global_budget_requested_samples)
+                        if global_budget_requested_samples > 0 else None
+                    ),
+                    "GUIPruner_actual_retention_samples": int(sample_count),
+                    "GUIPruner_actual_history_retention_samples": int(history_samples),
+                }
+            )
     if rank == 0:
         if hasattr(dataset, 'summarize_state_packet_records'):
             try:

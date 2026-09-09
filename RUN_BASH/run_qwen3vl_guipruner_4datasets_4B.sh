@@ -12,7 +12,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6}"
 export SEED="${SEED:-42}"
 export PYTHONHASHSEED="${PYTHONHASHSEED:-42}"
 
@@ -20,21 +20,25 @@ MODEL="${MODEL:-Qwen3-VL-4B-Instruct-GUIPruner}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
-WORK_DIR="${WORK_DIR:-OUTPUT_GUIPRUNER/4B_hist4_lambda40_mu75}"
+WORK_DIR="${WORK_DIR:-OUTPUT_GUIPRUNER/4B_hist4_lambda40_mu752}"
 # DATASETS="${DATASETS:-AITW_all Mind2Web_test_task GUIOdyssey_high_task_split AndroidControl_Curated_High_Task_Improved}"
-# DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
+DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
 # DATASETS="${DATASETS:-AITW_all}"
-DATASETS="${DATASETS:-Mind2Web_test_task}"
+# DATASETS="${DATASETS:-AITW_all Mind2Web_test_task}"
 # DATASETS="${DATASETS:-GUIOdyssey_high_task_split}"
 
 # Paper hyperparameters, mirrored in the registered model configuration.
 export GUI_PRUNER_HISTORY_STEPS="${GUI_PRUNER_HISTORY_STEPS:-4}"
 export GUI_PRUNER_HISTORY_KEEP_RATIO="${GUI_PRUNER_HISTORY_KEEP_RATIO:-0.02360}"
-export GUI_PRUNER_TEMPORAL_DECAY="${GUI_PRUNER_TEMPORAL_DECAY:-0.20}"
+export GUI_PRUNER_TEMPORAL_DECAY="${GUI_PRUNER_TEMPORAL_DECAY:-0.350}"
 export GUI_PRUNER_CURRENT_KEEP_RATIO="${GUI_PRUNER_CURRENT_KEEP_RATIO:-0.75}"
-# Optional eta: history + current global retention. When set, it derives the
-# current SSP ratio and takes precedence over GUI_PRUNER_CURRENT_KEEP_RATIO.
-export GUI_PRUNER_OVERALL_KEEP_RATIO="${GUI_PRUNER_OVERALL_KEEP_RATIO:-0.35}"
+# Optional eta: history + current global retention. It is disabled by default,
+# so lambda and mu remain independent paper-style budgets.  When explicitly
+# set, eta derives the current SSP ratio and takes precedence over mu.
+export GUI_PRUNER_OVERALL_KEEP_RATIO="${GUI_PRUNER_OVERALL_KEEP_RATIO-0.35}"
+# Keep eta on feasible samples; otherwise saturate current-image SSP at 100%.
+# Set GUI_PRUNER_GLOBAL_BUDGET_POLICY=strict for per-sample exact failure.
+export GUI_PRUNER_GLOBAL_BUDGET_POLICY="${GUI_PRUNER_GLOBAL_BUDGET_POLICY:-clip}"
 export GUI_PRUNER_BACKGROUND_SALIENCY="${GUI_PRUNER_BACKGROUND_SALIENCY:-0.30}"
 export GUI_PRUNER_PRUNE_LAYER="${GUI_PRUNER_PRUNE_LAYER:-2}" # paper numbering, one-based
 
@@ -48,6 +52,8 @@ export MIND2WEB_HIS_NUM="${MIND2WEB_HIS_NUM:-${GUI_PRUNER_HISTORY_STEPS}}"
 
 # Explicitly disable every unrelated accelerator for an isolated comparison.
 export QWEN3VL_ENABLE_ROI_PRUNE=0
+export QWEN3VL_ENABLE_ATTN_PRUNE=0
+export QWEN3VL_USE_ATTN_PRUNE_MODEL=0
 export QWEN3VL_ENABLE_TEMPLATE_PREFILL=0
 export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE=0
 export AITW_STATE_PACKET_ENABLE=0
@@ -117,16 +123,18 @@ require_dataset_files() {
 
 mkdir -p "${WORK_DIR}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_FILE="${WORK_DIR}/run_output_${STAMP}_guipruner.log"
+
 
 for dataset in ${DATASETS}; do
   require_dataset_files "${dataset}"
   output_dir="${WORK_DIR}/${dataset}"
+  LOG_FILE="${WORK_DIR}/run_output_${STAMP}_${dataset}_guipruner.log"
   mkdir -p "${output_dir}"
   {
     echo "[GUIPruner-reproduction] unofficial reproduction"
     echo "[Run] model=${MODEL} dataset=${dataset} output=${output_dir}"
-    echo "[Run] history_steps=${GUI_PRUNER_HISTORY_STEPS} lambda=${GUI_PRUNER_HISTORY_KEEP_RATIO} gamma=${GUI_PRUNER_TEMPORAL_DECAY} mu=${GUI_PRUNER_CURRENT_KEEP_RATIO} overall_eta=${GUI_PRUNER_OVERALL_KEEP_RATIO:-disabled} rho=${GUI_PRUNER_BACKGROUND_SALIENCY} prune_layer_one_based=${GUI_PRUNER_PRUNE_LAYER}"
+    echo "[Run] history_steps=${GUI_PRUNER_HISTORY_STEPS} lambda=${GUI_PRUNER_HISTORY_KEEP_RATIO} gamma=${GUI_PRUNER_TEMPORAL_DECAY} mu=${GUI_PRUNER_CURRENT_KEEP_RATIO} overall_eta=${GUI_PRUNER_OVERALL_KEEP_RATIO:-disabled} global_budget_policy=${GUI_PRUNER_GLOBAL_BUDGET_POLICY} rho=${GUI_PRUNER_BACKGROUND_SALIENCY} prune_layer_one_based=${GUI_PRUNER_PRUNE_LAYER}"
+    echo "[Run] isolated_backbone: attn_prune=${QWEN3VL_ENABLE_ATTN_PRUNE} attn_prune_model=${QWEN3VL_USE_ATTN_PRUNE_MODEL} roi_prune=${QWEN3VL_ENABLE_ROI_PRUNE}"
     echo "[Run] sample_mode=${VLM_EVAL_SAMPLE_MODE} sample_tasks=${VLM_EVAL_SAMPLE_TASKS} sample_count=${VLM_EVAL_SAMPLE_COUNT}"
   } | tee -a "${LOG_FILE}"
   if [[ "${NPROC_PER_NODE}" == "1" ]]; then

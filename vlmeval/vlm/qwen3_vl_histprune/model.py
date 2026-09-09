@@ -34,6 +34,7 @@ class Qwen3VLHistPruneChat(Qwen3VLChat):
 
     def __init__(self, *args, **kwargs) -> None:
         self.histprune_config = HistPruneConfig.from_env()
+        self._histprune_episode_key = None
         kwargs["use_vllm"] = False
         # Reuse the repository's custom Qwen3 model only as a Qwen3-compatible
         # decoder implementation; its attention-pruning switch remains off.
@@ -52,7 +53,22 @@ class Qwen3VLHistPruneChat(Qwen3VLChat):
         self.model.config._histprune_visual_cache_enabled = self.histprune_config.visual_cache
         self.model.config._histprune_visual_cache_keys = keys
 
+    def reset_histprune_episode_cache(self) -> None:
+        """Call at an evaluation-episode boundary to prevent cross-task reuse."""
+        inner = getattr(self.model, "model", None)
+        if inner is not None:
+            inner._histprune_visual_cache = {}
+
     def generate_inner_transformers(self, message, dataset=None, **kwargs):
+        # Cache must never leak across evaluation episodes.  If the evaluator
+        # does not expose an episode id, reset conservatively every request.
+        meta = kwargs.get("sample_meta") if isinstance(kwargs.get("sample_meta"), dict) else {}
+        episode_key = next((str(meta[key]) for key in ("episode_id", "trajectory_id", "task_id") if meta.get(key) is not None), None)
+        if self.histprune_config.visual_cache and episode_key != self._histprune_episode_key:
+            self.reset_histprune_episode_cache()
+            self._histprune_episode_key = episode_key
+        elif self.histprune_config.visual_cache and episode_key is None:
+            self.reset_histprune_episode_cache()
         history_indices, current_index = history_and_current_indices(message)
         if len(history_indices) > self.histprune_config.max_history_frames:
             raise ValueError("HistPrune accepts at most four history screenshots; truncate the trajectory before inference.")
@@ -78,4 +94,3 @@ class Qwen3VLHistPruneChat(Qwen3VLChat):
         finally:
             # PIL references are per request; cache itself is explicitly episode-managed.
             self.model.config.text_config._histprune_history_images = []
-

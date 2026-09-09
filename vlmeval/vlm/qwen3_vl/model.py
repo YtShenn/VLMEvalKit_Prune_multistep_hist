@@ -1213,6 +1213,14 @@ def _roi_prune_generate_use_cache(model) -> bool:
 
 
 def _attn_prune_generate_use_cache(model) -> bool:
+    # HistPrune uses this custom Qwen3 decoder for its post-ViT sequence trim,
+    # but unlike legacy attention pruning it explicitly trims all prefill KV
+    # states. Do not infer its cache policy from the module filename.
+    try:
+        if bool(getattr(model.config.text_config, '_histprune_enabled', False)):
+            return True
+    except Exception:
+        pass
     attn_prune_model_active = bool(_env_flag('QWEN3VL_ENABLE_ATTN_PRUNE', '0') or _env_flag('QWEN3VL_USE_ATTN_PRUNE_MODEL', '0'))
     try:
         attn_prune_model_active = attn_prune_model_active or ('attn_prune' in type(model.model).__module__)

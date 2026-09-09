@@ -42,6 +42,33 @@ def _trim_prefill_cache(cache: Any, keep: torch.Tensor, layer_count: int) -> Non
             setattr(layer, name, tensor.index_select(2, keep.to(tensor.device)))
 
 
+def _trim_prefill_attention_mask(
+    attention_mask: torch.Tensor | None, keep: torch.Tensor, original_length: int
+) -> torch.Tensor | None:
+    """Apply the same token selection to Qwen3-VL's 2D or prepared 4D mask."""
+    if attention_mask is None:
+        return None
+    keep_on_mask = keep.to(attention_mask.device)
+    if attention_mask.ndim == 2:
+        if attention_mask.shape[1] != original_length:
+            raise RuntimeError("GUIPruner received a 2D prefill mask with an unexpected sequence length.")
+        return attention_mask.index_select(1, keep_on_mask)
+    if attention_mask.ndim == 4:
+        # Some Transformers/Qwen3-VL releases precompute the causal mask in
+        # the outer model before calling the text model.  Both query and key
+        # dimensions refer to the original prefill sequence and must shrink.
+        if attention_mask.shape[-2:] != (original_length, original_length):
+            raise RuntimeError(
+                "GUIPruner cannot safely trim a non-square prepared prefill attention mask; "
+                f"got {tuple(attention_mask.shape)} for sequence length {original_length}."
+            )
+        return attention_mask.index_select(-2, keep_on_mask).index_select(-1, keep_on_mask)
+    raise RuntimeError(
+        "GUIPruner supports only 2D padding masks or square 4D prepared prefill masks; "
+        f"got {attention_mask.ndim}D."
+    )
+
+
 def _capture_attention(layer: torch.nn.Module) -> None:
     original = layer.self_attn.forward
 
@@ -99,9 +126,20 @@ def init_guipruner(model: torch.nn.Module, config: GUIPrunerConfig) -> None:
         deepstack_visual_embeds=None,
         **kwargs,
     ):
+        # ``GenerationMixin`` creates an empty DynamicCache before its first
+        # forward call.  A non-None cache therefore does *not* by itself mean
+        # decoding: only a cache that already contains tokens is the decode
+        # path.  Treating an empty cache as decode silently bypasses SSP.
+        cache_length = 0
+        if past_key_values is not None:
+            try:
+                cache_length = int(past_key_values.get_seq_length())
+            except (AttributeError, TypeError, RuntimeError):
+                # Unknown cache objects cannot safely be altered in prefill.
+                cache_length = 1
         # Decode tokens must use the original implementation.  The outer patch
         # supplies position ids continued from the retained prefill sequence.
-        if past_key_values is not None or inputs_embeds is None or inputs_embeds.shape[0] != 1:
+        if cache_length > 0 or inputs_embeds is None or inputs_embeds.shape[0] != 1:
             return original_forward(
                 input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
                 past_key_values=past_key_values, inputs_embeds=inputs_embeds, use_cache=use_cache,
@@ -148,6 +186,7 @@ def init_guipruner(model: torch.nn.Module, config: GUIPrunerConfig) -> None:
         if visual_positions.numel() < current_n:
             raise RuntimeError("Current visual token count exceeds Qwen3-VL visual placeholder count.")
         current_positions = visual_positions[-current_n:]
+        history_after_tar_actual = int(visual_positions.numel() - current_n)
         image = getattr(model.config.text_config, "_vlmeval_current_vis_image_pil", None)
         if image is None:
             raise RuntimeError("GUIPruner needs the current PIL image cached by Qwen3-VL input preparation.")
@@ -157,20 +196,41 @@ def init_guipruner(model: torch.nn.Module, config: GUIPrunerConfig) -> None:
         # Aggregate layer-2 attention over heads and all query positions.
         scores = weights[0, :, :, current_positions].float().mean(dim=(0, 1))
         history_original = int(getattr(model.config.text_config, "_guipruner_history_original_visual_tokens", 0) or 0)
+        history_original_processor = int(
+            getattr(model.config.text_config, "_guipruner_history_original_processor_visual_tokens", 0) or 0
+        )
+        history_after_tar = int(
+            getattr(model.config.text_config, "_guipruner_history_visual_tokens_after_tar", 0) or 0
+        )
         if config.overall_keep_ratio is None:
             current_keep_ratio = config.current_keep_ratio
             budget_mode = "paper_separate"
         else:
+            # ``hidden`` is the actual Qwen3-VL decoder prompt after TAR.
+            # Replace just its TAR-history visual span by the same processor's
+            # original-history span to recover the no-pruning prompt baseline.
+            prompt_before_ssp = int(hidden.shape[1])
+            fixed_after_tar = prompt_before_ssp - current_n
+            baseline_prompt_tokens = prompt_before_ssp - history_after_tar_actual + history_original_processor
+            requested_current_tokens = (
+                float(config.overall_keep_ratio) * baseline_prompt_tokens - fixed_after_tar
+            )
+            global_budget_clamped = not (0.0 <= requested_current_tokens <= current_n)
             current_keep_ratio = resolve_current_keep_ratio(
                 history_original_tokens=history_original,
                 current_original_tokens=current_n,
                 history_keep_ratio=config.history_keep_ratio,
                 overall_keep_ratio=config.overall_keep_ratio,
+                history_tokens_after_tar=history_after_tar,
+                baseline_prompt_tokens=baseline_prompt_tokens,
+                fixed_prompt_tokens_after_tar=fixed_after_tar,
+                infeasible_policy=config.global_budget_policy,
             )
             budget_mode = "global_history_plus_current"
         selection = select_stratified(scores, fg, current_keep_ratio, config.background_saliency)
         retained_current = current_positions[selection.final]
-        keep_mask = torch.ones(hidden.shape[1], dtype=torch.bool, device=hidden.device)
+        original_length = int(hidden.shape[1])
+        keep_mask = torch.ones(original_length, dtype=torch.bool, device=hidden.device)
         keep_mask[current_positions] = False
         keep_mask[retained_current] = True
         keep = torch.where(keep_mask)[0]
@@ -178,13 +238,20 @@ def init_guipruner(model: torch.nn.Module, config: GUIPrunerConfig) -> None:
         hidden = hidden.index_select(1, keep)
         rope_position_ids = rope_position_ids.index_select(2, keep)
         text_position_ids = text_position_ids.index_select(1, keep) if text_position_ids is not None else None
-        raw_mask = attention_mask.index_select(1, keep) if attention_mask is not None else None
+        raw_mask = _trim_prefill_attention_mask(attention_mask, keep, original_length)
         visual_keep = visual_pos_masks.index_select(1, keep)
         if deepstack_visual_embeds is not None:
             visual_selected = keep_mask[visual_positions]
             deepstack_visual_embeds = [x.index_select(0, torch.where(visual_selected)[0].to(x.device)) for x in deepstack_visual_embeds]
+        # Layers after the pruning point have not run in this prefill yet.
+        # Although ``past_key_values`` now holds the trimmed KVs of layers 0
+        # and 1, passing that shared cache to mask construction makes recent
+        # Transformers infer ``1122 past + 1122 query`` for layer 2 and build
+        # a 2244-wide mask.  Construct this *prefill* mask with no past;
+        # still pass the real cache to each layer below so their KVs are saved
+        # for generation.
         causal = create_causal_mask(config=self.config, inputs_embeds=hidden, attention_mask=raw_mask,
-                                    past_key_values=past_key_values, position_ids=text_position_ids)
+                                    past_key_values=None, position_ids=text_position_ids)
         pos_emb = self.rotary_emb(hidden, rope_position_ids)
         for idx in range(layer_index + 1, len(self.layers)):
             hidden = self.layers[idx](hidden, attention_mask=causal, position_ids=text_position_ids,
@@ -198,8 +265,20 @@ def init_guipruner(model: torch.nn.Module, config: GUIPrunerConfig) -> None:
             "prune_layer_one_based": config.prune_layer,
             "budget_mode": budget_mode,
             "history_original_visual_tokens": history_original,
+            "history_original_processor_visual_tokens": history_original_processor,
+            "history_visual_tokens_after_tar": history_after_tar,
+            "history_visual_tokens_after_tar_actual": history_after_tar_actual,
+            "baseline_prompt_tokens": baseline_prompt_tokens if config.overall_keep_ratio is not None else None,
+            "fixed_prompt_tokens_after_tar": fixed_after_tar if config.overall_keep_ratio is not None else None,
+            "prompt_tokens_before_ssp": original_length,
+            "prompt_tokens_after_ssp": int(keep.numel()),
             "history_keep_ratio": config.history_keep_ratio,
             "overall_keep_ratio": config.overall_keep_ratio,
+            "global_budget_policy": config.global_budget_policy,
+            "global_budget_clamped": bool(global_budget_clamped) if config.overall_keep_ratio is not None else False,
+            "requested_current_visual_tokens": (
+                float(requested_current_tokens) if config.overall_keep_ratio is not None else None
+            ),
             "effective_current_keep_ratio": current_keep_ratio,
             "current_visual_tokens_before": int(current_n),
             "current_visual_tokens_after": int(selection.final.numel()),

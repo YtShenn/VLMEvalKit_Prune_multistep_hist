@@ -1601,6 +1601,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         attn_prune_token_meta: dict | None = None,
+        histprune_token_meta: dict | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple | BaseModelOutputWithPast:
         r"""
@@ -1654,6 +1655,25 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         )
 
         hidden_states = inputs_embeds
+
+        # HistPrune-GUI reproduction/adaptation for Qwen3-VL. This is inert
+        # unless the isolated HistPrune wrapper publishes its token metadata.
+        histprune_keep_mask = None
+        histprune_stats = None
+        histprune_drop_layer = -1
+        if bool(getattr(self.config, "_histprune_enabled", False)) and histprune_token_meta is not None and hidden_states.shape[0] == 1 and hidden_states.shape[1] > 1:
+            try:
+                from ..qwen3_vl_histprune.history import select_from_rank_map
+                hp_cfg = getattr(self.config, "_histprune_config")
+                histprune_keep_mask, histprune_stats = select_from_rank_map(
+                    histprune_token_meta["rank_map"], hp_cfg, histprune_token_meta.get("edge_masks")
+                )
+                histprune_drop_layer = int(hp_cfg.drop_layer)
+                histprune_stats["sequence_length_before"] = int(hidden_states.shape[1])
+                histprune_stats["sequence_length_after"] = int(hidden_states.shape[1])
+                histprune_stats["prune_applied"] = False
+            except Exception as exc:
+                raise RuntimeError(f"HistPrune setup failed; refusing unsafe pruning: {exc}") from exc
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -1745,6 +1765,38 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
 
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
+            # Physical sequence pruning before this decoder layer. Earlier KV
+            # states, M-RoPE indices and DeepStack tensors stay aligned.
+            if histprune_keep_mask is not None and layer_idx == histprune_drop_layer:
+                original_seq_len = int(hidden_states.shape[1])
+                keep_indices = torch.where(histprune_keep_mask[0].to(hidden_states.device))[0]
+                if int(keep_indices.numel()) != original_seq_len:
+                    visual_positions = torch.where(visual_pos_masks[0].bool())[0] if visual_pos_masks is not None else None
+                    if visual_positions is None:
+                        raise RuntimeError("HistPrune requires visual_pos_masks for DeepStack-safe sequence pruning")
+                    keep_visual_rel_idx = torch.where(histprune_keep_mask[0].index_select(0, visual_positions))[0]
+                    _attn_prune_past_key_values(past_key_values, keep_indices, layer_idx - 1, original_seq_len)
+                    hidden_states = hidden_states.index_select(1, keep_indices)
+                    dropped_tokens = original_seq_len - int(hidden_states.shape[1])
+                    setattr(self.config, "_histprune_cache_position_offset", int(getattr(self.config, "_histprune_cache_position_offset", 0)) + dropped_tokens)
+                    if text_position_ids is not None:
+                        text_position_ids = text_position_ids.index_select(1, keep_indices)
+                    position_ids = position_ids.index_select(2, keep_indices)
+                    visual_pos_masks = visual_pos_masks.index_select(1, keep_indices)
+                    if deepstack_visual_embeds is not None:
+                        deepstack_visual_embeds = [emb.index_select(0, keep_visual_rel_idx.to(emb.device)) for emb in deepstack_visual_embeds]
+                    raw_attention_mask = torch.ones((1, hidden_states.shape[1]), dtype=torch.bool, device=hidden_states.device)
+                    attention_mask = create_causal_mask(config=self.config, inputs_embeds=hidden_states,
+                                                        # This is still the same prefill pass, now with a
+                                                        # shorter sequence. Passing the already-trimmed
+                                                        # prefill cache here makes the mask builder count it
+                                                        # as an additional prefix (L_new + L_new). Decoder
+                                                        # layers still receive the real cache below.
+                                                        attention_mask=raw_attention_mask, past_key_values=None,
+                                                        position_ids=text_position_ids)
+                    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+                    histprune_stats.update({"sequence_length_before": original_seq_len,
+                                            "sequence_length_after": int(hidden_states.shape[1]), "prune_applied": True})
             attn_meta = None
             query_indices = None
             if need_attn and layer_idx in attn_layer_set and torch.is_tensor(current_visual_indices):
@@ -1954,6 +2006,26 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             sample_stats["prune_layer_to_finish_sec"] = float((prune_finish_time or t_forward1) - split_boundary_time)
         if int(sample_stats.get("visual_tokens_before", 0) or 0) > 0 or not getattr(self.config, "_attn_prune_last_stats", None):
             setattr(self.config, "_attn_prune_last_stats", sample_stats)
+        if histprune_stats is not None:
+            hist_h = int(histprune_stats["history_tokens"])
+            hist_k = int(histprune_stats["history_keep_budget"])
+            visual_after = int(visual_pos_masks.sum()) if visual_pos_masks is not None else 0
+            current_c = max(0, visual_after - hist_k)
+            text_t = max(0, int(hidden_states.shape[1]) - visual_after)
+            histprune_stats.update({
+                "mode": getattr(getattr(self.config, "_histprune_config", None), "mode", ""),
+                "drop_layer": histprune_drop_layer,
+                "history_keep_ratio_requested": getattr(getattr(self.config, "_histprune_config", None), "history_keep_ratio", None),
+                "current_visual_tokens": current_c,
+                "text_tokens": text_t,
+                "visual_keep_ratio": (hist_k + current_c) / max(1, hist_h + current_c),
+                "visual_prune_ratio": (hist_h - hist_k) / max(1, hist_h + current_c),
+                "prompt_keep_ratio": (text_t + hist_k + current_c) / max(1, text_t + hist_h + current_c),
+                "prompt_prune_ratio": (hist_h - hist_k) / max(1, text_t + hist_h + current_c),
+            })
+            setattr(self.config, "_histprune_last_stats", histprune_stats)
+            if histprune_stats.get("prune_applied") and os.getenv("HISTPRUNE_LOG_STATS", "0").strip().lower() in {"1", "true", "yes"}:
+                print("[HistPrune] " + json.dumps(histprune_stats, sort_keys=True), flush=True)
 
         runtime = dict(getattr(self.config, "_vlmeval_generate_timing_accum", {}) or {})
         runtime.setdefault("prefill_s", 0.0)
@@ -2631,6 +2703,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         config.text_config.spatial_merge_size = self.config.vision_config.spatial_merge_size
         self.language_model = Qwen3VLTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
+        # HistPrune-GUI optional episode-local ViT/DeepStack cache. The wrapper
+        # owns reset boundaries; ordinary Qwen3-VL calls never enable it.
+        self._histprune_visual_cache = {}
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -2936,6 +3011,44 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             The temporal, height and width of feature shape of each image in LLM.
         """
         pixel_values = pixel_values.type(self.visual.dtype)
+        cache_enabled = bool(getattr(self.config, "_histprune_visual_cache_enabled", False))
+        cache_keys = getattr(self.config, "_histprune_visual_cache_keys", None)
+        if cache_enabled and image_grid_thw is not None and isinstance(cache_keys, (list, tuple)) and len(cache_keys) == int(image_grid_thw.shape[0]):
+            split_in = [int(x) for x in image_grid_thw.prod(-1).tolist()]
+            split_out = [int(x) for x in (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()]
+            chunks = torch.split(pixel_values, split_in, dim=0)
+            entries, misses = [None] * len(cache_keys), []
+            for i, key in enumerate(cache_keys):
+                grid_cpu = image_grid_thw[i].detach().cpu()
+                entry = self._histprune_visual_cache.get(str(key)) if key else None
+                if entry is not None and torch.equal(entry["grid"], grid_cpu):
+                    entries[i] = entry
+                else:
+                    misses.append(i)
+            if misses:
+                miss_pixels = torch.cat([chunks[i] for i in misses], dim=0)
+                miss_grid = torch.stack([image_grid_thw[i] for i in misses])
+                miss_output = self.visual(miss_pixels, grid_thw=miss_grid, return_dict=True, **kwargs)
+                sizes = [split_out[i] for i in misses]
+                image_parts = torch.split(miss_output.pooler_output, sizes)
+                deep_parts = [torch.split(layer, sizes) for layer in miss_output.deepstack_features]
+                for local, index in enumerate(misses):
+                    entry = {"grid": image_grid_thw[index].detach().cpu().clone(),
+                             "image": image_parts[local].detach(),
+                             "deep": [parts[local].detach() for parts in deep_parts]}
+                    if cache_keys[index]:
+                        self._histprune_visual_cache[str(cache_keys[index])] = entry
+                    entries[index] = entry
+            if all(entry is not None for entry in entries):
+                result = BaseModelOutputWithDeepstackFeatures()
+                result.pooler_output = tuple(entry["image"] for entry in entries)
+                result.deepstack_features = [torch.cat([entry["deep"][layer] for entry in entries], dim=0)
+                                             for layer in range(len(entries[0]["deep"]))]
+                self.config.text_config._histprune_cache_stats = {
+                    "hits": len(cache_keys) - len(misses), "misses": len(misses),
+                    "entries": len(self._histprune_visual_cache),
+                }
+                return result
         vision_output: BaseModelOutputWithDeepstackFeatures = self.visual(
             pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs
         )
@@ -3116,6 +3229,17 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             deepstack_visual_embeds = deepstack_video_embeds
 
         attn_prune_token_meta = self._attn_prune_current_image_meta(input_ids, image_mask, image_grid_thw)
+        histprune_token_meta = None
+        if bool(getattr(self.config.text_config, "_histprune_enabled", False)):
+            try:
+                from ..qwen3_vl_histprune.history import build_token_meta
+                histprune_token_meta = build_token_meta(
+                    input_ids, image_mask, image_grid_thw, self.config.vision_config.spatial_merge_size,
+                    getattr(self.config.text_config, "_histprune_config"),
+                    getattr(self.config.text_config, "_histprune_history_images", [])
+                )
+            except Exception as exc:
+                raise RuntimeError(f"HistPrune cannot establish safe history token alignment: {exc}") from exc
 
         if position_ids is None:
             position_ids = self.compute_3d_position_ids(
@@ -3137,6 +3261,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
             attn_prune_token_meta=attn_prune_token_meta,
+            histprune_token_meta=histprune_token_meta,
             **kwargs,
         )
 

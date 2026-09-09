@@ -20,11 +20,11 @@ MODEL="${MODEL:-Qwen3-VL-4B-Instruct-GUIPruner}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-7}"
-WORK_DIR="${WORK_DIR:-OUTPUT_GUIPRUNER/4B_hist4_lambda40_mu75}"
+WORK_DIR="${WORK_DIR:-OUTPUT_GUIPRUNER/4B_hist4_lambda40_mu752}"
 # DATASETS="${DATASETS:-AITW_all Mind2Web_test_task GUIOdyssey_high_task_split AndroidControl_Curated_High_Task_Improved}"
-DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
+# DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
 # DATASETS="${DATASETS:-AITW_all}"
-# DATASETS="${DATASETS:-AITW_all Mind2Web_test_task}"
+DATASETS="${DATASETS:-Mind2Web_test_task}"
 # DATASETS="${DATASETS:-GUIOdyssey_high_task_split}"
 
 # Paper hyperparameters, mirrored in the registered model configuration.
@@ -35,7 +35,7 @@ export GUI_PRUNER_CURRENT_KEEP_RATIO="${GUI_PRUNER_CURRENT_KEEP_RATIO:-0.75}"
 # Optional eta: history + current global retention. It is disabled by default,
 # so lambda and mu remain independent paper-style budgets.  When explicitly
 # set, eta derives the current SSP ratio and takes precedence over mu.
-export GUI_PRUNER_OVERALL_KEEP_RATIO="${GUI_PRUNER_OVERALL_KEEP_RATIO-0.35}"
+export GUI_PRUNER_OVERALL_KEEP_RATIO="${GUI_PRUNER_OVERALL_KEEP_RATIO-0.4}"
 # Keep eta on feasible samples; otherwise saturate current-image SSP at 100%.
 # Set GUI_PRUNER_GLOBAL_BUDGET_POLICY=strict for per-sample exact failure.
 export GUI_PRUNER_GLOBAL_BUDGET_POLICY="${GUI_PRUNER_GLOBAL_BUDGET_POLICY:-clip}"

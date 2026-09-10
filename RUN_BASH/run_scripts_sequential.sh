@@ -37,9 +37,13 @@ DEFAULT_SCRIPTS=(
     # "RUN_BASH/run_qwen3_vl_stlite_4B_android.sh"
     # "RUN_BASH/run_qwen3_vl_stlite_4B_mind2web.sh"
     # "RUN_BASH/run_qwen3_vl_stlite_4B_guiodyssey.sh"
+    "RUN_BASH/run_qwen3vl_histprune_android.sh"
+    "RUN_BASH/run_qwen3vl_histprune_aitw.sh"
+    "RUN_BASH/run_qwen3vl_histprune_mind2web.sh"
     "RUN_BASH/run_qwen3vl_guipruner_android.sh"
     "RUN_BASH/run_qwen3vl_guipruner_aitw.sh"
     "RUN_BASH/run_qwen3vl_guipruner_mind2web.sh"
+    "RUN_BASH/run_qwen3vl_histprune_odyssey.sh"
     "RUN_BASH/run_qwen3vl_guipruner_odyssey.sh"
 
 )

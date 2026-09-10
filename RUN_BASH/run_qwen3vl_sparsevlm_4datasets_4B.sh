@@ -4,11 +4,11 @@ set -euo pipefail
 # Isolated SparseVLM four-dataset baseline. Override DATASETS for a subset.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6}"
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct-SparseVLM}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-7}"
 WORK_DIR="${WORK_DIR:-OUTPUT_SPARSEVLM/4B_keep${SPARSEVLM_RETAIN_RATIO:-0.5}}"
 # DATASETS="${DATASETS:-AITW_all Mind2Web_test_task GUIOdyssey_high_task_split AndroidControl_Curated_High_Task_Improved}"
 DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"

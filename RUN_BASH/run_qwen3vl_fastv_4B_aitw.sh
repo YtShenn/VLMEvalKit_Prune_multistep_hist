@@ -13,13 +13,16 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-7}"
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct-FastV}"
-DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
+# DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
+DATASETS="${DATASETS:-AITW_all}"
+# DATASETS="${DATASETS:-AITW_all Mind2Web_test_task}"
+# DATASETS="${DATASETS:-GUIOdyssey_high_task_split}"
 WORK_DIR="${WORK_DIR:-OUTPUT_FASTV/4B_hist4_k${FASTV_K:-2}_r${FASTV_R:-0.5}}"
 
 # Official FastV controls. R is the discard ratio over all five images.
 export FASTV_ENABLED="${FASTV_ENABLED:-1}"
 export FASTV_K="${FASTV_K:-2}"
-export FASTV_R="${FASTV_R:-0.35}"
+export FASTV_R="${FASTV_R:-0.45}"
 # Per-sample FastV JSON diagnostics are noisy in full evaluation. Enable only
 # when investigating a run: FASTV_DEBUG=1 bash ...
 export FASTV_DEBUG="${FASTV_DEBUG:-0}"
@@ -59,12 +62,12 @@ export VLM_EVAL_SAMPLE_COUNT="${VLM_EVAL_SAMPLE_COUNT:-20}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
 # Dataset directories. Every value can be overridden in the launching shell.
-export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_annots}"
-export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_images}"
+export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/public/ytshen/aitw_data/aitw_annots}"
+export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/public/ytshen/aitw_data/aitw_images}"
 export AITW_SPLIT="${AITW_SPLIT:-test}"
 export AITW_WITH_NO_HISTORY="${AITW_WITH_NO_HISTORY:-0}"
 export AITW_SEMANTIC_ACTION_PROMPT="${AITW_SEMANTIC_ACTION_PROMPT:-0}"
-export MIND2WEB_DATA_ROOT="${MIND2WEB_DATA_ROOT:-/mnt/storage2/Datasets/Mind2Web}"
+export MIND2WEB_DATA_ROOT="${MIND2WEB_DATA_ROOT:-/public/ytshen/Mind2Web}"
 export MIND2WEB_ANN_ROOT="${MIND2WEB_ANN_ROOT:-${MIND2WEB_DATA_ROOT}/mind2web_annots}"
 if [[ -z "${MIND2WEB_IMAGE_ROOT:-}" && -d "${MIND2WEB_DATA_ROOT}/mind2web_images/ming2web_images" ]]; then
   export MIND2WEB_IMAGE_ROOT="${MIND2WEB_DATA_ROOT}/mind2web_images/ming2web_images"
@@ -75,8 +78,8 @@ export MIND2WEB_WITH_NO_HISTORY="${MIND2WEB_WITH_NO_HISTORY:-0}"
 export MIND2WEB_STRICT_OUTPUT_PROMPT="${MIND2WEB_STRICT_OUTPUT_PROMPT:-1}"
 export DATA_ROOT="${DATA_ROOT:-/mnt/storage2/users/ytshen_data/GUIOdyssey}"
 export ANDROID_CONTROL_CURATED_EVAL_MODE="${ANDROID_CONTROL_CURATED_EVAL_MODE:-official}"
-export ANDROID_CONTROL_CURATED_ROOT="${ANDROID_CONTROL_CURATED_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated}"
-export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated/images}"
+export ANDROID_CONTROL_CURATED_ROOT="${ANDROID_CONTROL_CURATED_ROOT:-/public/ytshen/AndroidControl_Curated}"
+export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-/public/ytshen/AndroidControl_Curated/images}"
 
 require_dataset_files() {
   local dataset="$1"

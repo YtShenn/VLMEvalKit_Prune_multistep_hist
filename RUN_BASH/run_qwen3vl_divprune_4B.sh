@@ -1,30 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Faithful FastV with four old->new history screenshots plus the current one.
-# Example: DATASETS='AndroidControl_Curated_High_Task_Improved' CUDA_VISIBLE_DEVICES=0 bash RUN_BASH/run_qwen3vl_fastv_4B.sh
+# Faithful DivPrune: all four old->new history screenshots AND the current
+# screenshot form one visual candidate pool before Qwen3-VL decoder layer 0.
+# Example: DATASETS=AndroidControl_Curated_High_Task_Improved NPROC_PER_NODE=1 \
+#   bash RUN_BASH/run_qwen3vl_divprune_4B.sh
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export SEED="${SEED:-42}"
 export PYTHONHASHSEED="${PYTHONHASHSEED:-42}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-7}"
-MODEL="${MODEL:-Qwen3-VL-4B-Instruct-FastV}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+MODEL="${MODEL:-Qwen3-VL-4B-Instruct-DivPrune}"
 DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
-WORK_DIR="${WORK_DIR:-OUTPUT_FASTV/4B_hist4_k${FASTV_K:-2}_r${FASTV_R:-0.5}}"
 
-# Official FastV controls. R is the discard ratio over all five images.
-export FASTV_ENABLED="${FASTV_ENABLED:-1}"
-export FASTV_K="${FASTV_K:-2}"
-export FASTV_R="${FASTV_R:-0.35}"
-# Per-sample FastV JSON diagnostics are noisy in full evaluation. Enable only
-# when investigating a run: FASTV_DEBUG=1 bash ...
-export FASTV_DEBUG="${FASTV_DEBUG:-0}"
+export DIVPRUNE_ENABLED="${DIVPRUNE_ENABLED:-1}"
+export DIVPRUNE_KEEP_RATIO="${DIVPRUNE_KEEP_RATIO:-0.098}"
+export DIVPRUNE_SCOPE="${DIVPRUNE_SCOPE:-global_all_visual}"
+export DIVPRUNE_DEBUG="${DIVPRUNE_DEBUG:-0}"
+WORK_DIR="${WORK_DIR:-OUTPUT_DIVPRUNE/4B_hist4_keep${DIVPRUNE_KEEP_RATIO}}"
 
-# Four-history-step prompt construction.
+# Preserve the complete four-step history context. DivPrune only reduces the
+# visual token representation after the vision projector; no screenshots or
+# history text are removed.
 export GUI_ODYSSEY_USE_HISTORY_SCREENSHOTS="${GUI_ODYSSEY_USE_HISTORY_SCREENSHOTS:-1}"
 export GUI_ODYSSEY_MAX_HISTORY_IMAGES="${GUI_ODYSSEY_MAX_HISTORY_IMAGES:-4}"
 export ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS="${ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS:-1}"
@@ -32,33 +33,36 @@ export ANDROID_CONTROL_MAX_HISTORY_IMAGES="${ANDROID_CONTROL_MAX_HISTORY_IMAGES:
 export AITW_HIS_NUM="${AITW_HIS_NUM:-4}"
 export MIND2WEB_HIS_NUM="${MIND2WEB_HIS_NUM:-4}"
 
-# FastV is isolated from the project's other accelerators.
+# Keep this baseline isolated from unrelated pruning/decoding accelerators.
 export QWEN3VL_ENABLE_ATTN_PRUNE=0
 export QWEN3VL_ENABLE_ROI_PRUNE=0
 export QWEN3VL_ENABLE_TEMPLATE_PREFILL=0
 export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE=0
-export AITW_STATE_PACKET_ENABLE=0
-export MIND2WEB_STATE_PACKET_ENABLE=0
+# AndroidControl prompts use 0--1000 coordinates, while its official
+# evaluator uses absolute pixels on the original current screenshot. The
+# model's dataset-gated postprocessor performs this conversion only for
+# AndroidControl, so these flags do not alter AITW/Mind2Web/GUIOdyssey.
 export QWEN3VL_ANDROID_DENORM_ON_INFER="${QWEN3VL_ANDROID_DENORM_ON_INFER:-1}"
 export QWEN3VL_ANDROID_DENORM_BASE="${QWEN3VL_ANDROID_DENORM_BASE:-1000}"
-
-# Runtime timing and FLOPs profiling. Set PROFILE_FLOPS=0 for throughput-only.
-export VLM_TIMING="${VLM_TIMING:-1}"
-export VLM_TIMING_VERBOSE="${VLM_TIMING_VERBOSE:-1}"
-export VLM_TIMING_SYNC="${VLM_TIMING_SYNC:-0}"
-export VLM_STAGE_TIMING="${VLM_STAGE_TIMING:-1}"
-export VLM_STAGE_TIMING_DEVICE="${VLM_STAGE_TIMING_DEVICE:-auto}"
-export VLM_STAGE_TIMING_SYNC="${VLM_STAGE_TIMING_SYNC:-0}"
+# Keep every comparison backend on the ordinary four-history-image input
+# protocol. Otherwise a caller's AndroidControl state-packet setting can leak
+# into AITW or Mind2Web and make the baseline inputs incomparable.
+export AITW_STATE_PACKET_ENABLE=0
+export MIND2WEB_STATE_PACKET_ENABLE=0
 export QWEN3VL_RUNTIME_TRACKING="${QWEN3VL_RUNTIME_TRACKING:-1}"
 export QWEN3VL_PROFILE_FLOPS="${QWEN3VL_PROFILE_FLOPS:-1}"
+export VLM_TIMING="${VLM_TIMING:-1}"
+export VLM_TIMING_VERBOSE="${VLM_TIMING_VERBOSE:-1}"
 
-# Default small task subset; set VLM_EVAL_SAMPLE_MODE=off for a full run.
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-off}"
+# Task-level small-sample mode. Keep it off for a full benchmark; a compact
+# smoke run can use e.g. VLM_EVAL_SAMPLE_MODE=task VLM_EVAL_SAMPLE_TASKS=5
+# VLM_EVAL_SAMPLE_COUNT=20. The evaluator owns the exact sampling semantics.
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-5}"
 export VLM_EVAL_SAMPLE_COUNT="${VLM_EVAL_SAMPLE_COUNT:-20}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
-# Dataset directories. Every value can be overridden in the launching shell.
+# Dataset locations. Each value may be overridden by the launching shell.
 export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_annots}"
 export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_images}"
 export AITW_SPLIT="${AITW_SPLIT:-test}"
@@ -90,21 +94,15 @@ require_dataset_files() {
 }
 
 mkdir -p "${WORK_DIR}"
-STAMP="$(date +%Y%m%d_%H%M%S)"
 for dataset in ${DATASETS}; do
   require_dataset_files "${dataset}"
   output_dir="${WORK_DIR}/${dataset}"
-  log_file="${WORK_DIR}/run_output_${STAMP}_${dataset}_fastv.log"
   mkdir -p "${output_dir}"
-  {
-    echo "[FastV] model=${MODEL} dataset=${dataset} output=${output_dir}"
-    echo "[FastV] history_frames=4 k=${FASTV_K} discard_ratio=${FASTV_R} enabled=${FASTV_ENABLED}"
-    echo "[Timing] stage=${VLM_STAGE_TIMING} runtime_tracking=${QWEN3VL_RUNTIME_TRACKING} profile_flops=${QWEN3VL_PROFILE_FLOPS} sync=${VLM_TIMING_SYNC}"
-    echo "[Sample] mode=${VLM_EVAL_SAMPLE_MODE} tasks=${VLM_EVAL_SAMPLE_TASKS} count=${VLM_EVAL_SAMPLE_COUNT}"
-  } | tee -a "${log_file}"
+  echo "[DivPrune] dataset=${dataset} keep_ratio=${DIVPRUNE_KEEP_RATIO} scope=${DIVPRUNE_SCOPE} history_frames=4"
+  echo "[Sample] mode=${VLM_EVAL_SAMPLE_MODE} tasks=${VLM_EVAL_SAMPLE_TASKS} count=${VLM_EVAL_SAMPLE_COUNT} seed=${VLM_EVAL_SAMPLE_SEED}"
   if [[ "${NPROC_PER_NODE}" == "1" ]]; then
-    "${PYTHON_BIN}" run.py --data "${dataset}" --model "${MODEL}" --work-dir "${output_dir}" --mode all 2>&1 | tee -a "${log_file}"
+    "${PYTHON_BIN}" run.py --data "${dataset}" --model "${MODEL}" --work-dir "${output_dir}" --mode all
   else
-    "${TORCHRUN_BIN}" --standalone --nproc_per_node="${NPROC_PER_NODE}" run.py --data "${dataset}" --model "${MODEL}" --work-dir "${output_dir}" --mode all 2>&1 | tee -a "${log_file}"
+    "${TORCHRUN_BIN}" --standalone --nproc_per_node="${NPROC_PER_NODE}" run.py --data "${dataset}" --model "${MODEL}" --work-dir "${output_dir}" --mode all
   fi
 done

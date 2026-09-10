@@ -123,6 +123,21 @@ class TestFlops(unittest.TestCase):
         self.assertLess(result["prefill_split_llm_flops"], result["prefill_full_length_llm_flops_replaced"])
         self.assertAlmostEqual(result["e2e_flops"], result["vision_flops"] + result["llm_flops"] + result["lm_head_flops"])
 
+    def test_measured_lm_head_is_not_corrected_twice(self):
+        cfg = SimpleNamespace(
+            hidden_size=64, intermediate_size=128, num_attention_heads=4,
+            num_key_value_heads=4, head_dim=16, num_hidden_layers=8, vocab_size=256,
+        )
+        model = SimpleNamespace(config=SimpleNamespace(text_config=cfg))
+        actual_post_ssp_head = 123456.0
+        result = correct_split_prefill_flops(
+            model,
+            {"vision_flops": 100.0, "llm_flops": 1e9, "lm_head_flops": actual_post_ssp_head,
+             "lm_head_measured": True},
+            prompt_tokens_before_ssp=100, prompt_tokens_after_ssp=40, prune_layer_one_based=2,
+        )
+        self.assertEqual(result["lm_head_flops"], actual_post_ssp_head)
+
 
 class TestHistoryIdentification(unittest.TestCase):
     def test_explicit_current_label_beats_order_fallback(self):

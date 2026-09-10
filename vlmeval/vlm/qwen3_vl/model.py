@@ -458,6 +458,32 @@ def _estimate_visual_tokens(image_grid_thw=None, video_grid_thw=None) -> int:
     return int(_grid_token_count(image_grid_thw) + _grid_token_count(video_grid_thw))
 
 
+def _vision_attention_segment_lengths(image_grid_thw=None, video_grid_thw=None) -> list[int]:
+    """Return the per-frame vision-attention lengths used by Qwen3-VL.
+
+    Qwen3-VL builds ``cu_seqlens`` by repeating each grid's H*W length T
+    times.  Images and video frames therefore do not attend across one
+    another.  Collapsing all grids into one length incorrectly turns the
+    attention term from sum(n_i**2) into sum(n_i)**2.
+    """
+    lengths = []
+    for grid_thw in (image_grid_thw, video_grid_thw):
+        if grid_thw is None:
+            continue
+        try:
+            data = grid_thw.detach().cpu().tolist() if isinstance(grid_thw, torch.Tensor) else grid_thw
+            rows = data if data and isinstance(data[0], (list, tuple)) else [data]
+            for row in rows:
+                if row is None or len(row) < 3:
+                    continue
+                frames, height, width = (int(row[0]), int(row[1]), int(row[2]))
+                if frames > 0 and height > 0 and width > 0:
+                    lengths.extend([height * width] * frames)
+        except Exception:
+            continue
+    return lengths
+
+
 def _estimate_llm_forward_flops(model, q_len: int, kv_len: int, num_layers: int | None = None) -> float:
     cfg = getattr(model, 'config', None)
     text_cfg = getattr(cfg, 'text_config', cfg)
@@ -491,8 +517,13 @@ def _estimate_lm_head_flops(model, q_len: int) -> float:
     return float(2.0 * q_len * hidden * vocab)
 
 
-def _estimate_vision_forward_flops(model, visual_tokens: int) -> float:
-    if visual_tokens <= 0:
+def _estimate_vision_forward_flops(model, visual_tokens: int | list[int]) -> float:
+    """Analytical vision FLOPs using Qwen3-VL's segmented attention layout."""
+    if isinstance(visual_tokens, int):
+        segment_lengths = [int(visual_tokens)] if visual_tokens > 0 else []
+    else:
+        segment_lengths = [int(n) for n in visual_tokens if int(n) > 0]
+    if not segment_lengths:
         return 0.0
     cfg = getattr(model, 'config', None)
     vision_cfg = getattr(cfg, 'vision_config', None)
@@ -509,9 +540,13 @@ def _estimate_vision_forward_flops(model, visual_tokens: int) -> float:
     head_dim = hidden // max(heads, 1) if heads > 0 else 0
     if min(hidden, inter, layers, heads, head_dim) <= 0:
         return 0.0
-    attn_linear = 8.0 * visual_tokens * hidden * hidden
-    attn_kernel = 4.0 * heads * visual_tokens * visual_tokens * head_dim
-    mlp = 4.0 * visual_tokens * hidden * inter
+    total_tokens = sum(segment_lengths)
+    attn_linear = 8.0 * total_tokens * hidden * hidden
+    # Vision attention receives cu_seqlens, so each image/video frame is an
+    # independent attention sequence.  Only this quadratic component is
+    # segmented; projections and MLPs remain linear in total tokens.
+    attn_kernel = 4.0 * heads * sum(n * n for n in segment_lengths) * head_dim
+    mlp = 4.0 * total_tokens * hidden * inter
     return float(layers) * float(attn_linear + attn_kernel + mlp)
 
 
@@ -556,6 +591,46 @@ def _sparsevlm_tracking_stats(model) -> dict:
         return dict(getattr(cfg, '_sparsevlm_last_stats', {}) or {})
     except Exception:
         return {}
+
+
+def _divprune_tracking_stats(model) -> dict:
+    """Read the pre-decoder, Layer-0 DivPrune audit."""
+    try:
+        cfg = model.model.language_model.config
+        return dict(getattr(cfg, '_divprune_last_stats', {}) or {})
+    except Exception:
+        return {}
+
+
+def _histprune_tracking_stats(model) -> dict:
+    """Read the decoder-side HistPrune audit for the current prefill."""
+    try:
+        cfg = model.model.language_model.config
+        return dict(getattr(cfg, '_histprune_last_stats', {}) or {})
+    except Exception:
+        return {}
+
+
+def _estimate_histprune_prefill_flops(model, stats: dict, default_seq_len: int) -> float:
+    """Count full layers before HistPrune and shortened layers after it."""
+    text_cfg = getattr(getattr(model, 'config', None), 'text_config', None)
+    layers = int(getattr(text_cfg, 'num_hidden_layers', 0) or 0)
+    before = int(stats.get('sequence_length_before', default_seq_len) or default_seq_len)
+    after = int(stats.get('sequence_length_after', before) or before)
+    drop_layer = int(stats.get('drop_layer', -1) or -1)
+    if (
+        not bool(stats.get('prune_applied', False))
+        or layers <= 0
+        or before <= 0
+        or after <= 0
+        or after > before
+        or not 0 <= drop_layer <= layers
+    ):
+        return _estimate_llm_forward_flops(model, q_len=default_seq_len, kv_len=default_seq_len)
+    return float(
+        _estimate_llm_forward_flops(model, q_len=before, kv_len=before, num_layers=drop_layer)
+        + _estimate_llm_forward_flops(model, q_len=after, kv_len=after, num_layers=layers - drop_layer)
+    )
 
 
 def _estimate_sparsevlm_prefill_flops(model, stats: dict, default_seq_len: int) -> float:
@@ -609,9 +684,12 @@ def _patch_qwen3vl_runtime_tracking(model) -> None:
 
 
 class _RuntimeTrackingHooks:
-    def __init__(self, model, llm_module: torch.nn.Module | None, *, visual_tokens: int, prompt_seq_tokens: int, use_cuda_events: bool, sync_cuda: bool) -> None:
+    def __init__(self, model, llm_module: torch.nn.Module | None, lm_head_module: torch.nn.Module | None = None, *, visual_tokens: int,
+                 visual_attention_segments: list[int] | None = None, prompt_seq_tokens: int,
+                 use_cuda_events: bool, sync_cuda: bool) -> None:
         self.model = model
         self.llm_module = llm_module
+        self.lm_head_module = lm_head_module
         self.visual_tokens = int(visual_tokens or 0)
         self.prompt_seq_tokens = int(prompt_seq_tokens or 0)
         self.use_cuda_events = bool(use_cuda_events) and torch.cuda.is_available()
@@ -627,9 +705,12 @@ class _RuntimeTrackingHooks:
         self.seq_tokens_after = int(prompt_seq_tokens or 0)
         self.visual_tokens_before = int(visual_tokens or 0)
         self.visual_tokens_after = int(visual_tokens or 0)
-        self.vision_flops = _estimate_vision_forward_flops(model, self.visual_tokens)
+        self.vision_flops = _estimate_vision_forward_flops(
+            model, visual_attention_segments if visual_attention_segments is not None else self.visual_tokens
+        )
         self.llm_flops = 0.0
         self.lm_head_flops = 0.0
+        self._lm_head_hook_attached = False
         self._pending_prefill_events = []
         self._pending_decode_events = []
 
@@ -678,6 +759,8 @@ class _RuntimeTrackingHooks:
         guikv_stats = _guikv_tracking_stats(self.model)
         fastv_stats = _fastv_tracking_stats(self.model)
         sparsevlm_stats = _sparsevlm_tracking_stats(self.model)
+        histprune_stats = _histprune_tracking_stats(self.model)
+        divprune_stats = _divprune_tracking_stats(self.model)
         prumerge_stats = _prumerge_tracking_stats(self.model)
         guikv_actual_kv_len = int(guikv_stats.get('actual_kv_seq_len', 0) or 0)
         if is_prefill or guikv_actual_kv_len <= 0:
@@ -686,8 +769,18 @@ class _RuntimeTrackingHooks:
             kv_len = max(int(q_len), guikv_actual_kv_len)
         fastv_applied = bool(is_prefill and fastv_stats.get('prune_applied', False))
         sparsevlm_applied = bool(is_prefill and sparsevlm_stats.get('prune_applied', False))
+        histprune_applied = bool(is_prefill and histprune_stats.get('prune_applied', False))
+        divprune_applied = bool(is_prefill and divprune_stats.get('prune_applied', False))
         prumerge_applied = bool(is_prefill and prumerge_stats.get('prune_applied', False))
-        if prumerge_applied:
+        if histprune_applied:
+            self.llm_flops += _estimate_histprune_prefill_flops(self.model, histprune_stats, q_len)
+        elif divprune_applied:
+            # DivPrune trims before layer 0, so every decoder layer sees this
+            # actual reduced prefill length. Vision FLOPs remain separately
+            # accounted for by this hook.
+            after = int(divprune_stats.get('sequence_tokens_after', q_len) or q_len)
+            self.llm_flops += _estimate_llm_forward_flops(self.model, q_len=after, kv_len=after)
+        elif prumerge_applied:
             # PruMerge rewrites the visual sequence before decoder layer 0,
             # so every decoder layer sees the reduced prefill length.
             after = int(prumerge_stats.get('seq_tokens_after', q_len) or q_len)
@@ -709,22 +802,40 @@ class _RuntimeTrackingHooks:
             self.llm_flops += _estimate_sparsevlm_prefill_flops(self.model, sparsevlm_stats, q_len)
         else:
             self.llm_flops += _estimate_llm_forward_flops(self.model, q_len=int(q_len), kv_len=int(kv_len))
-        self.lm_head_flops += _estimate_lm_head_flops(self.model, q_len=max(1, int(q_len)))
+        # The outer conditional-generation model may pass logits_to_keep=1,
+        # especially for batched static template tokens. In that case the
+        # actual lm_head only receives the last hidden state. Its hook below
+        # records the true length; retain the old estimate only as a fallback.
+        if not self._lm_head_hook_attached:
+            self.lm_head_flops += _estimate_lm_head_flops(self.model, q_len=max(1, int(q_len)))
         if is_prefill:
             self.prefill_seen = True
             if q_len > 0:
                 self.seq_tokens_before = int(
-                    prumerge_stats.get('seq_tokens_before', q_len) if prumerge_applied
+                    histprune_stats.get('sequence_length_before', q_len) if histprune_applied
+                    else divprune_stats.get('sequence_tokens_before', q_len) if divprune_applied
+                    else prumerge_stats.get('seq_tokens_before', q_len) if prumerge_applied
                     else fastv_stats.get('seq_tokens_before', q_len) if fastv_applied
                     else sparsevlm_stats.get('seq_tokens_before', q_len) if sparsevlm_applied else q_len
                 )
                 self.seq_tokens_after = int(
-                    prumerge_stats.get('seq_tokens_after', q_len) if prumerge_applied
+                    histprune_stats.get('sequence_length_after', q_len) if histprune_applied
+                    else divprune_stats.get('sequence_tokens_after', q_len) if divprune_applied
+                    else prumerge_stats.get('seq_tokens_after', q_len) if prumerge_applied
                     else fastv_stats.get('seq_tokens_after', q_len)
                     if fastv_applied else sparsevlm_stats.get('seq_tokens_after', q_len)
                     if sparsevlm_applied else guikv_stats.get('compressed_seq_len', 0) or q_len
                 )
-            if prumerge_applied:
+            if histprune_applied:
+                history_before = int(histprune_stats.get('history_tokens', 0) or 0)
+                history_after = int(sum(histprune_stats.get('actual', []) or []))
+                current_visual = int(histprune_stats.get('current_visual_tokens', 0) or 0)
+                self.visual_tokens_before = history_before + current_visual
+                self.visual_tokens_after = history_after + current_visual
+            elif divprune_applied:
+                self.visual_tokens_before = int(divprune_stats.get('visual_tokens_before', self.visual_tokens_before) or 0)
+                self.visual_tokens_after = int(divprune_stats.get('visual_tokens_after', self.visual_tokens_after) or 0)
+            elif prumerge_applied:
                 self.visual_tokens_before = int(prumerge_stats.get('visual_tokens_before', self.visual_tokens_before) or 0)
                 self.visual_tokens_after = int(prumerge_stats.get('visual_tokens_after', self.visual_tokens_after) or 0)
             if fastv_applied:
@@ -767,6 +878,14 @@ class _RuntimeTrackingHooks:
             return
         self._handles.append(self.llm_module.register_forward_pre_hook(self._pre_hook, with_kwargs=True))
         self._handles.append(self.llm_module.register_forward_hook(self._post_hook, with_kwargs=True))
+        if self.lm_head_module is not None:
+            def lm_head_hook(_module, args, _kwargs, _output):
+                if not args or not torch.is_tensor(args[0]) or args[0].ndim < 2:
+                    return
+                self.lm_head_flops += _estimate_lm_head_flops(self.model, q_len=int(args[0].shape[-2]))
+
+            self._handles.append(self.lm_head_module.register_forward_hook(lm_head_hook, with_kwargs=True))
+            self._lm_head_hook_attached = True
 
     def finalize(self):
         try:
@@ -813,6 +932,10 @@ class _RuntimeTrackingHooks:
             'vision_flops': float(self.vision_flops),
             'llm_flops': float(self.llm_flops),
             'lm_head_flops': float(self.lm_head_flops),
+            # Consumers that analytically replace prefill decoder terms (for
+            # example GUIPruner) must not replace lm_head again: this value
+            # comes from the actual tensor passed to the output projection.
+            'lm_head_measured': bool(self._lm_head_hook_attached),
             'e2e_flops': float(e2e),
             'forward_steps': int(self.forward_steps),
         }
@@ -916,6 +1039,15 @@ def _configure_roi_prune_context(model, dataset: str | None, message: list[dict]
     cfg._vlmeval_generate_timing_accum = {}
     cfg._vlmeval_generate_timing_last = {}
     cfg._vlmeval_generate_forward_index = 0
+    # The custom Qwen3 decoder owns a distinct text-config instance.  Reset
+    # its per-generation counter as well; otherwise a completed sample can
+    # make the next sample look like a decode forward and suppress a prefill
+    # only method such as PruMerge.
+    try:
+        inner_cfg = model.model.language_model.config
+        inner_cfg._vlmeval_generate_forward_index = 0
+    except Exception:
+        pass
     cfg._vlmeval_current_actual_prediction = ''
     cfg._attn_prune_pending_prune_visualizations = []
     cfg._roi_prune_last_stats = {}
@@ -1322,14 +1454,17 @@ def _roi_prune_generate_use_cache(model) -> bool:
 
 
 def _attn_prune_generate_use_cache(model) -> bool:
-    # HistPrune and FastV use this custom Qwen3 decoder for post-ViT sequence
-    # trimming, and both explicitly trim all prefill KV states. They must keep
-    # the cache enabled: treating FastV as legacy AttnPrune based on the module
-    # filename makes every decode step recompute the whole 2k+ token prompt.
+    # These custom Qwen3 backends physically make their sequence surgery on
+    # the multimodal prefill. They must keep cache enabled: treating them as
+    # legacy AttnPrune based on the module filename makes every decode step
+    # recompute the whole long visual prompt. DivPrune is Layer-0, before any
+    # decoder KV state exists, so its reduced prefill cache is safe to reuse.
     try:
         if bool(
             getattr(model.config.text_config, '_histprune_enabled', False)
             or getattr(model.config.text_config, '_fastv_enabled', False)
+            or getattr(model.config.text_config, '_divprune_enabled', False)
+            or getattr(model.config.text_config, '_divprune_config', None) is not None
             or getattr(model.config.text_config, '_prumerge_enabled', False)
             or getattr(model.config.text_config, '_prumerge_config', None) is not None
         ):
@@ -1456,11 +1591,14 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
         # Qwen3VL-PruMerge is a separate wrapper but uses this custom decoder
         # for its DeepStack-safe, prefill-only physical sequence compression.
         self.use_prumerge = bool(kwargs.pop('prumerge', False))
+        # DivPrune is a separate Layer-0 selector. It shares only the custom
+        # decoder's tested sequence/cache surgery, never FastV scoring.
+        self.use_divprune = bool(kwargs.pop('divprune', False))
         # FastV deliberately uses the same isolated custom decoder only for
         # its cache/DeepStack-safe physical sequence surgery. Its scoring and
         # configuration remain independent of AttnPrune.
         self.use_fastv = bool(kwargs.pop('fastv', False))
-        self.use_attn_prune = bool(kwargs.pop('use_attn_prune', False) or kwargs.pop('attn_prune', False) or self.use_histprune or self.use_fastv or self.use_prumerge)
+        self.use_attn_prune = bool(kwargs.pop('use_attn_prune', False) or kwargs.pop('attn_prune', False) or self.use_histprune or self.use_fastv or self.use_prumerge or self.use_divprune)
         self.fps = kwargs.pop('fps', 2)
         self.nframe = kwargs.pop('nframe', 128)
         self.FRAME_FACTOR = 2
@@ -1556,7 +1694,7 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             # HistPrune physically trims the prefill cache and therefore needs
             # normal generation caching. Existing AttnPrune keeps its legacy
             # cache-off default unchanged.
-            if _use_qwen3vl_attn_prune_model(self.use_attn_prune) and not self.use_histprune and not self.use_fastv and not self.use_prumerge and not _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0'):
+            if _use_qwen3vl_attn_prune_model(self.use_attn_prune) and not self.use_histprune and not self.use_fastv and not self.use_prumerge and not self.use_divprune and not _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0'):
                 try:
                     self.model.config.use_cache = False
                 except Exception:
@@ -1872,11 +2010,20 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                         image_grid_thw=getattr(inputs, 'image_grid_thw', None) if not isinstance(inputs, dict) else inputs.get('image_grid_thw'),
                         video_grid_thw=getattr(inputs, 'video_grid_thw', None) if not isinstance(inputs, dict) else inputs.get('video_grid_thw'),
                     )
+                    visual_attention_segments = _vision_attention_segment_lengths(
+                        image_grid_thw=getattr(inputs, 'image_grid_thw', None) if not isinstance(inputs, dict) else inputs.get('image_grid_thw'),
+                        video_grid_thw=getattr(inputs, 'video_grid_thw', None) if not isinstance(inputs, dict) else inputs.get('video_grid_thw'),
+                    )
                     _, llm_m, _, _ = _pick_vision_and_llm_modules(self.model)
+                    lm_head_m = getattr(self.model, 'lm_head', None)
+                    if not isinstance(lm_head_m, torch.nn.Module):
+                        lm_head_m = None
                     runtime_tracker = _RuntimeTrackingHooks(
                         self.model,
                         llm_m,
+                        lm_head_module=lm_head_m,
                         visual_tokens=visual_tokens,
+                        visual_attention_segments=visual_attention_segments,
                         prompt_seq_tokens=prompt_seq_tokens,
                         use_cuda_events=use_cuda_events,
                         sync_cuda=sync_cuda,
@@ -1939,13 +2086,62 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 if runtime_tracker is not None:
                     try:
                         guikv_stats = _guikv_tracking_stats(self.model)
-                        runtime_tracker.seq_tokens_before = int(prompt_seq_tokens or runtime_tracker.seq_tokens_before)
+                        histprune_stats = _histprune_tracking_stats(self.model)
+                        divprune_stats = _divprune_tracking_stats(self.model)
+                        prumerge_stats = _prumerge_tracking_stats(self.model)
+                        histprune_applied = bool(histprune_stats.get('prune_applied', False))
+                        prumerge_applied = bool(prumerge_stats.get('prune_applied', False))
+                        divprune_applied = bool(divprune_stats.get('prune_applied', False))
+                        runtime_tracker.seq_tokens_before = int(
+                            histprune_stats.get('sequence_length_before', prompt_seq_tokens or runtime_tracker.seq_tokens_before)
+                            if histprune_applied else divprune_stats.get('sequence_tokens_before', prompt_seq_tokens or runtime_tracker.seq_tokens_before)
+                            if divprune_applied else prumerge_stats.get('seq_tokens_before', prompt_seq_tokens or runtime_tracker.seq_tokens_before)
+                            if prumerge_applied else prompt_seq_tokens or runtime_tracker.seq_tokens_before
+                        )
                         guikv_after = int(
                             guikv_stats.get('actual_kv_seq_len', 0)
                             or guikv_stats.get('compressed_seq_len', 0)
                             or 0
                         )
-                        if guikv_after > 0:
+                        if histprune_applied:
+                            runtime_tracker.seq_tokens_after = int(
+                                histprune_stats.get('sequence_length_after', runtime_tracker.seq_tokens_after)
+                                or runtime_tracker.seq_tokens_after
+                            ) + int(decode_tokens or 0)
+                            history_before = int(histprune_stats.get('history_tokens', 0) or 0)
+                            history_after = int(sum(histprune_stats.get('actual', []) or []))
+                            current_visual = int(histprune_stats.get('current_visual_tokens', 0) or 0)
+                            runtime_tracker.visual_tokens_before = history_before + current_visual
+                            runtime_tracker.visual_tokens_after = history_after + current_visual
+                        elif divprune_applied:
+                            runtime_tracker.seq_tokens_after = int(
+                                divprune_stats.get('sequence_tokens_after', runtime_tracker.seq_tokens_after)
+                                or runtime_tracker.seq_tokens_after
+                            ) + int(decode_tokens or 0)
+                            runtime_tracker.visual_tokens_before = int(
+                                divprune_stats.get('visual_tokens_before', runtime_tracker.visual_tokens_before) or 0
+                            )
+                            runtime_tracker.visual_tokens_after = int(
+                                divprune_stats.get('visual_tokens_after', runtime_tracker.visual_tokens_after) or 0
+                            )
+                        elif prumerge_applied:
+                            # The prefill KV cache really has the shortened
+                            # sequence.  Do not restore the original prompt
+                            # length with ``max(...)`` below; only generated
+                            # tokens extend this cache.
+                            runtime_tracker.seq_tokens_after = int(
+                                prumerge_stats.get('seq_tokens_after', runtime_tracker.seq_tokens_after)
+                                or runtime_tracker.seq_tokens_after
+                            ) + int(decode_tokens or 0)
+                            runtime_tracker.visual_tokens_before = int(
+                                prumerge_stats.get('visual_tokens_before', runtime_tracker.visual_tokens_before)
+                                or 0
+                            )
+                            runtime_tracker.visual_tokens_after = int(
+                                prumerge_stats.get('visual_tokens_after', runtime_tracker.visual_tokens_after)
+                                or 0
+                            )
+                        elif guikv_after > 0:
                             runtime_tracker.seq_tokens_after = int(guikv_after)
                         else:
                             runtime_tracker.seq_tokens_after = int(
@@ -1964,6 +2160,8 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                         runtime_dict = runtime_tracker.to_runtime_dict()
                         runtime_dict['prompt_seq_tokens'] = int(prompt_seq_tokens or runtime_dict.get('prompt_seq_tokens', 0) or 0)
                         runtime_dict['decode_tokens'] = int(decode_tokens or runtime_dict.get('decode_tokens', 0) or 0)
+                        if divprune_stats:
+                            runtime_dict['divprune'] = divprune_stats
                         if guikv_after > 0:
                             runtime_dict['guikv_compressed_kv_tokens'] = int(guikv_after)
                         if guikv_stats:

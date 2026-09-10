@@ -42,6 +42,7 @@ from .qwen3_vl_stlite import Qwen3VLSTLiteChat
 from .qwen3_vl_guipruner import Qwen3VLGUIPrunerChat
 from .qwen3_vl_histprune import Qwen3VLHistPruneChat
 from .qwen3_vl_fastv import Qwen3VLFastVChat
+from .qwen3_vl_divprune import Qwen3VLDivPruneChat
 from .qwen3_vl_sparsevlm import Qwen3VLSparseVLMChat
 from .qwen3_vl_prumerge import Qwen3VLPruMergeChat
 # from .qwen3_vl_prune import Qwen3VLChat

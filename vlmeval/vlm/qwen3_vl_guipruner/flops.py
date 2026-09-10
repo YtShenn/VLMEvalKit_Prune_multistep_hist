@@ -60,8 +60,10 @@ def correct_split_prefill_flops(
     """Replace full-length prefill estimates with GUIPruner's split execution.
 
     ``generic_flops`` is the repository analytical runtime result.  It already
-    observes decode using the physically trimmed cache, so only the prefill
-    decoder and prefill LM-head terms are replaced.
+    observes decode using the physically trimmed cache.  The prefill decoder
+    term is always replaced.  Older trackers estimated LM-head work from the
+    input sequence length and require the same replacement; the current
+    tracker hooks the actual LM-head input, which is already post-SSP.
     """
     cfg = _text_config(model)
     layer_total = int(getattr(cfg, "num_hidden_layers", 0) or 0)
@@ -82,7 +84,12 @@ def correct_split_prefill_flops(
     full_prefill_head = lm_head_flops(model, token_count=before)
     split_prefill_head = lm_head_flops(model, token_count=after)
     corrected_llm = max(0.0, generic_llm - full_prefill_llm + split_prefill_llm)
-    corrected_head = max(0.0, generic_head - full_prefill_head + split_prefill_head)
+    lm_head_measured = bool(generic_flops.get("lm_head_measured", False))
+    corrected_head = (
+        generic_head
+        if lm_head_measured
+        else max(0.0, generic_head - full_prefill_head + split_prefill_head)
+    )
     corrected_e2e = vision + corrected_llm + corrected_head
     return {
         "vision_flops": vision,
@@ -90,6 +97,7 @@ def correct_split_prefill_flops(
         "lm_head_flops": corrected_head,
         "e2e_flops": corrected_e2e,
         "forward_steps": int(generic_flops.get("forward_steps", 0) or 0),
+        "lm_head_measured": lm_head_measured,
         "estimation": "GUIPruner-reproduction analytical split-prefill; vision/decode from common runtime tracker",
         "prefill_full_length_llm_flops_replaced": full_prefill_llm,
         "prefill_split_llm_flops": split_prefill_llm,

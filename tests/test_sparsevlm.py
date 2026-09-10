@@ -4,7 +4,13 @@ import unittest
 from types import SimpleNamespace
 import torch
 from vlmeval.vlm.qwen3_vl_sparsevlm.token import image_blocks, physical_keep_indices, retain_indices, select_raters, select_scope
-from vlmeval.vlm.qwen3_vl.model import _estimate_llm_forward_flops, _estimate_sparsevlm_prefill_flops
+from vlmeval.vlm.qwen3_vl.model import (
+    _estimate_histprune_prefill_flops,
+    _estimate_llm_forward_flops,
+    _estimate_sparsevlm_prefill_flops,
+    _estimate_vision_forward_flops,
+    _vision_attention_segment_lengths,
+)
 
 class TestSparseVLM(unittest.TestCase):
     def test_non_contiguous_image_blocks_and_scopes(self):
@@ -50,5 +56,31 @@ class TestSparseVLM(unittest.TestCase):
             + _estimate_llm_forward_flops(model, 25, 25, num_layers=3)
         )
         self.assertEqual(_estimate_sparsevlm_prefill_flops(model, stats, 100), expected)
+
+    def test_histprune_flops_counts_trim_before_the_drop_layer(self):
+        cfg = SimpleNamespace(hidden_size=64, intermediate_size=128, num_attention_heads=4,
+                              num_key_value_heads=4, head_dim=16, num_hidden_layers=8, vocab_size=256)
+        model = SimpleNamespace(config=SimpleNamespace(text_config=cfg))
+        stats = {
+            "prune_applied": True,
+            "drop_layer": 3,
+            "sequence_length_before": 100,
+            "sequence_length_after": 40,
+        }
+        expected = (
+            _estimate_llm_forward_flops(model, 100, 100, num_layers=3)
+            + _estimate_llm_forward_flops(model, 40, 40, num_layers=5)
+        )
+        self.assertEqual(_estimate_histprune_prefill_flops(model, stats, 100), expected)
+
+    def test_vision_attention_uses_per_grid_chunks(self):
+        vision_cfg = SimpleNamespace(hidden_size=64, intermediate_size=128, num_heads=4, depth=2)
+        model = SimpleNamespace(config=SimpleNamespace(vision_config=vision_cfg))
+        grid = torch.tensor([[1, 2, 3], [2, 1, 4]])
+        chunks = _vision_attention_segment_lengths(image_grid_thw=grid)
+        self.assertEqual(chunks, [6, 4, 4])
+        segmented = _estimate_vision_forward_flops(model, chunks)
+        collapsed = _estimate_vision_forward_flops(model, sum(chunks))
+        self.assertLess(segmented, collapsed)
 
 if __name__ == "__main__": unittest.main()

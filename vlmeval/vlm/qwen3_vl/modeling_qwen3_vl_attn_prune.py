@@ -1603,6 +1603,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         attn_prune_token_meta: dict | None = None,
         histprune_token_meta: dict | None = None,
         fastv_token_meta: dict | None = None,
+        divprune_token_meta: dict | None = None,
         sparsevlm_token_meta: dict | None = None,
         prumerge_token_meta: dict | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
@@ -1649,6 +1650,69 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         else:
             text_position_ids = None
 
+        # Faithful DivPrune: projected visual embeddings are selected once
+        # before decoder layer 0.  This is intentionally independent from
+        # FastV/attention pruning and preserves non-visual sequence entries.
+        divprune_cfg = getattr(self.config, "_divprune_config", None)
+        divprune_enabled = bool(
+            getattr(self.config, "_divprune_enabled", False)
+            and bool(getattr(divprune_cfg, "enabled", False))
+            and divprune_token_meta is not None
+            and is_prefill_forward
+            and not self.training
+            and inputs_embeds.shape[0] == 1
+            and visual_pos_masks is not None
+        )
+        if divprune_enabled:
+            stats = {
+                "enabled": True,
+                "scope": str(getattr(divprune_cfg, "scope", "global_all_visual")),
+                "keep_ratio_requested": float(getattr(divprune_cfg, "keep_ratio", 1.0)),
+                "drop_layer": 0,
+                "selection_algorithm": "max_min_cosine_diversity",
+                "prune_applied": False,
+            }
+            try:
+                visual_positions = torch.where(visual_pos_masks[0].bool())[0]
+                kept_visual = divprune_token_meta["kept_visual"].to(inputs_embeds.device, dtype=torch.long)
+                if kept_visual.numel() > visual_positions.numel() or not torch.isin(kept_visual, visual_positions).all():
+                    raise ValueError("invalid DivPrune visual keep positions")
+                keep_mask = torch.ones(inputs_embeds.shape[1], dtype=torch.bool, device=inputs_embeds.device)
+                keep_mask[visual_positions] = False
+                keep_mask[kept_visual] = True
+                keep_indices = torch.where(keep_mask)[0]
+                original_length = int(inputs_embeds.shape[1])
+                reduced_inputs = inputs_embeds.index_select(1, keep_indices)
+                reduced_visual_mask = visual_pos_masks.index_select(1, keep_indices)
+                keep_visual_rel = torch.where(keep_mask.index_select(0, visual_positions))[0]
+                if deepstack_visual_embeds is not None:
+                    reduced_deepstack = [feature.index_select(0, keep_visual_rel.to(feature.device)) for feature in deepstack_visual_embeds]
+                else:
+                    reduced_deepstack = None
+                # Commit after every potentially failing operation. M-RoPE and
+                # textual position ids use the identical physical positions.
+                inputs_embeds = reduced_inputs
+                visual_pos_masks = reduced_visual_mask
+                deepstack_visual_embeds = reduced_deepstack
+                if text_position_ids is not None:
+                    text_position_ids = text_position_ids.index_select(1, keep_indices)
+                position_ids = position_ids.index_select(2, keep_indices)
+                raw_attention_mask = torch.ones((1, inputs_embeds.shape[1]), dtype=torch.bool, device=inputs_embeds.device)
+                stats.update({
+                    "reason": "applied",
+                    "visual_tokens_before": int(visual_positions.numel()),
+                    "visual_tokens_after": int(kept_visual.numel()),
+                    "visual_tokens_pruned": int(visual_positions.numel() - kept_visual.numel()),
+                    "sequence_tokens_before": original_length,
+                    "sequence_tokens_after": int(inputs_embeds.shape[1]),
+                    "per_image_tokens_before": list(divprune_token_meta.get("per_image_before", [])),
+                    "per_image_tokens_after": list(divprune_token_meta.get("per_image_after", [])),
+                    "prune_applied": int(inputs_embeds.shape[1]) < original_length,
+                })
+            except Exception as exc:
+                stats.update({"reason": f"compression_failed:{type(exc).__name__}"})
+            setattr(self.config, "_divprune_last_stats", stats)
+
         # PruMerge compression occurs once, before decoder layer 0.  This is
         # earlier than FastV and leaves the prefill cache, M-RoPE positions,
         # visual mask and every DeepStack feature tensor in the same reduced
@@ -1658,7 +1722,6 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             getattr(self.config, "_prumerge_enabled", False)
             and prumerge_cfg is not None
             and prumerge_token_meta is not None
-            and is_prefill_forward
             and not self.training
             and inputs_embeds.shape[0] == 1
             and visual_pos_masks is not None
@@ -3472,6 +3535,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         attn_prune_token_meta = self._attn_prune_current_image_meta(input_ids, image_mask, image_grid_thw)
         histprune_token_meta = None
         fastv_token_meta = None
+        divprune_token_meta = None
         sparsevlm_token_meta = None
         prumerge_token_meta = None
         # `Qwen3VLModel` and `Qwen3VLTextModel` can receive copied config
@@ -3489,6 +3553,31 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             # current screenshot, even when their grids differ.
             from ..qwen3_vl_fastv.token import build_token_meta as build_fastv_token_meta
             fastv_token_meta = build_fastv_token_meta(visual_pos_masks)
+        divprune_cfg = getattr(self.config.text_config, "_divprune_config", None)
+        divprune_enabled = bool(getattr(self.config.text_config, "_divprune_enabled", False) and divprune_cfg is not None)
+        self.language_model.config._divprune_enabled = divprune_enabled
+        self.language_model.config._divprune_config = divprune_cfg
+        if divprune_enabled:
+            try:
+                from ..qwen3_vl_divprune.token import build_token_meta as build_divprune_token_meta
+                divprune_token_meta = build_divprune_token_meta(
+                    inputs_embeds, visual_pos_masks, image_grid_thw,
+                    self.config.vision_config.spatial_merge_size,
+                    float(divprune_cfg.keep_ratio), str(divprune_cfg.scope),
+                )
+                if divprune_token_meta is None:
+                    self.config.text_config._divprune_last_stats = {
+                        "enabled": True, "prune_applied": False,
+                        "reason": "unsafe_image_layout_or_non_single_batch",
+                    }
+            except Exception as exc:
+                # Fail closed: a malformed visual layout remains an ordinary
+                # unpruned Qwen prefill rather than risking sequence mismatch.
+                divprune_token_meta = None
+                self.config.text_config._divprune_last_stats = {
+                    "enabled": True, "prune_applied": False,
+                    "reason": f"plan_build_failed:{type(exc).__name__}",
+                }
         sparse_cfg = getattr(self.config.text_config, "_sparsevlm_config", None)
         sparse_enabled = bool(getattr(self.config.text_config, "_sparsevlm_enabled", False) and sparse_cfg is not None)
         if sparse_enabled:
@@ -3526,15 +3615,20 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # remain per contiguous visual block, preventing any cross-image,
         # cross-video, or cross-history aggregation.
         prumerge_cfg = getattr(self.config.text_config, "_prumerge_config", None)
-        # HF `generate` can supply an empty DynamicCache on its first prefill
-        # call. Treat that equivalently to None; otherwise PruMerge silently
-        # builds no plan and the FLOPs reporter measures the full baseline.
-        prumerge_prefill = past_key_values is None
-        if past_key_values is not None:
-            try:
-                prumerge_prefill = int(past_key_values.get_seq_length()) == 0
-            except Exception:
-                prumerge_prefill = False
+        # Do not use ``pixel_values is not None`` as the prefill sentinel here.
+        # In the custom Qwen generation path, image features can already have
+        # been materialized before this forward receives its kwargs, so pixel
+        # tensors are absent even on the multimodal prefill.  That made the
+        # PruMerge wrapper silently run as an uncompressed baseline.
+        #
+        # ``visual_pos_masks`` is constructed from the *current forward's*
+        # input ids / embeddings.  It is non-empty exactly for the multimodal
+        # prefill, whereas decode forwards contain only generated text tokens.
+        # This remains valid when HF allocates an empty cache before prefill.
+        prumerge_prefill = bool(
+            visual_pos_masks is not None
+            and bool(torch.any(visual_pos_masks).item())
+        )
         prumerge_enabled = bool(
             getattr(self.config.text_config, "_prumerge_enabled", False)
             and prumerge_cfg is not None
@@ -3597,16 +3691,23 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                 }
         self.language_model.config._prumerge_enabled = prumerge_enabled
         self.language_model.config._prumerge_config = prumerge_cfg
-        if bool(getattr(self.config.text_config, "_histprune_enabled", False)):
+        histprune_enabled = bool(getattr(self.config.text_config, "_histprune_enabled", False))
+        histprune_cfg = getattr(self.config.text_config, "_histprune_config", None)
+        if histprune_enabled:
             try:
                 from ..qwen3_vl_histprune.history import build_token_meta
                 histprune_token_meta = build_token_meta(
                     input_ids, image_mask, image_grid_thw, self.config.vision_config.spatial_merge_size,
-                    getattr(self.config.text_config, "_histprune_config"),
+                    histprune_cfg,
                     getattr(self.config.text_config, "_histprune_history_images", [])
                 )
             except Exception as exc:
                 raise RuntimeError(f"HistPrune cannot establish safe history token alignment: {exc}") from exc
+        # The physical token surgery lives in Qwen3VLTextModel, which owns a
+        # separate config instance.  Without this propagation HistPrune only
+        # built metadata at the outer model and silently executed full length.
+        self.language_model.config._histprune_enabled = bool(histprune_enabled and histprune_token_meta is not None)
+        self.language_model.config._histprune_config = histprune_cfg
 
         if position_ids is None:
             position_ids = self.compute_3d_position_ids(
@@ -3630,6 +3731,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             attn_prune_token_meta=attn_prune_token_meta,
             histprune_token_meta=histprune_token_meta,
             fastv_token_meta=fastv_token_meta,
+            divprune_token_meta=divprune_token_meta,
             sparsevlm_token_meta=sparsevlm_token_meta,
             prumerge_token_meta=prumerge_token_meta,
             **kwargs,
@@ -3639,6 +3741,14 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             inner_stats = getattr(self.language_model.config, "_prumerge_last_stats", None)
             if isinstance(inner_stats, dict):
                 self.config.text_config._prumerge_last_stats = dict(inner_stats)
+        if divprune_cfg is not None:
+            inner_stats = getattr(self.language_model.config, "_divprune_last_stats", None)
+            if isinstance(inner_stats, dict):
+                self.config.text_config._divprune_last_stats = dict(inner_stats)
+        if histprune_cfg is not None:
+            inner_stats = getattr(self.language_model.config, "_histprune_last_stats", None)
+            if isinstance(inner_stats, dict):
+                self.config.text_config._histprune_last_stats = dict(inner_stats)
 
         return Qwen3VLModelOutputWithPast(
             **outputs,
@@ -3948,113 +4058,4 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             image_mask = input_ids == image_token_id
             video_mask = input_ids == video_token_id
 
-        vision_first_mask = torch.roll(vision_start_mask, shifts=1, dims=1)
-        image_nums = torch.sum(vision_first_mask & image_mask, dim=1)
-        video_nums = torch.sum(vision_first_mask & video_mask, dim=1)
-
-        return image_nums, video_nums
-
-    def _expand_inputs_for_generation(
-        self,
-        expand_size: int = 1,
-        is_encoder_decoder: bool = False,
-        input_ids: torch.LongTensor | None = None,
-        **model_kwargs,
-    ) -> tuple[torch.LongTensor, dict[str, Any]]:
-        # Overwritten -- Qwen3VL use timestamps and remove second_per_grid_ts
-        # Support for expanding tensors without a batch size dimension
-        # e.g., pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
-        # pixel_values.shape[0] is sum(seqlen_images for samples)
-        # image_grid_thw.shape[0] is sum(num_images for samples)
-
-        if expand_size == 1:
-            return input_ids, model_kwargs
-
-        visual_keys = ["pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"]
-
-        def _expand_dict_for_generation_visual(dict_to_expand):
-            image_grid_thw = model_kwargs.get("image_grid_thw", None)
-            video_grid_thw = model_kwargs.get("video_grid_thw", None)
-            image_nums, video_nums = self._get_image_nums_and_video_nums(
-                input_ids, inputs_embeds=model_kwargs.get("inputs_embeds", None)
-            )
-
-            # video_nums: (batch_size,)
-            # since video_nums is the number of videos in the input dependent on the input_ids(vision_start),
-            # but qwen3vl append vision_start to each frame of each video, so we need to recover the real video_nums according to video_grid_thw
-            if video_grid_thw is not None:
-                cumulative_frame_counts = torch.cumsum(video_grid_thw[:, 0], dim=0)
-                cumulative_token_video_counts = torch.cumsum(video_nums, dim=0)
-                # Find video boundaries in cumulative_frame_counts
-                video_boundary_indices = torch.searchsorted(cumulative_frame_counts, cumulative_token_video_counts)
-                # example: video_boundary_indices = [3, 5] means video_nums = [4, 2]
-                video_nums = torch.diff(torch.cat([-video_boundary_indices.new_ones(1), video_boundary_indices]))
-
-            def _repeat_interleave_samples(x, lengths, repeat_times):
-                samples = torch.split(x, lengths)
-                repeat_args = [repeat_times] + [1] * (x.dim() - 1)
-                result = torch.cat([sample.repeat(*repeat_args) for sample in samples], dim=0)
-                return result
-
-            for key in dict_to_expand:
-                if key == "pixel_values":
-                    # split images into samples
-                    samples = torch.split(image_grid_thw, list(image_nums))
-                    # compute the sequence length of images for each sample
-                    lengths = [torch.prod(sample, dim=1).sum() for sample in samples]
-                    dict_to_expand[key] = _repeat_interleave_samples(
-                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
-                    )
-                elif key == "image_grid_thw":
-                    # get the num of images for each sample
-                    lengths = list(image_nums)
-                    dict_to_expand[key] = _repeat_interleave_samples(
-                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
-                    )
-                elif key == "pixel_values_videos":
-                    samples = torch.split(video_grid_thw, list(video_nums))
-                    lengths = [torch.prod(sample, dim=1).sum() for sample in samples]
-                    dict_to_expand[key] = _repeat_interleave_samples(
-                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
-                    )
-                elif key == "video_grid_thw":
-                    lengths = list(video_nums)
-                    dict_to_expand[key] = _repeat_interleave_samples(
-                        dict_to_expand[key], lengths=lengths, repeat_times=expand_size
-                    )
-            return dict_to_expand
-
-        def _expand_dict_for_generation(dict_to_expand):
-            for key in dict_to_expand:
-                if key == "position_ids" and dict_to_expand[key].ndim == 3:
-                    dict_to_expand[key] = dict_to_expand[key].repeat_interleave(expand_size, dim=1)
-                elif (
-                    dict_to_expand[key] is not None
-                    and isinstance(dict_to_expand[key], torch.Tensor)
-                    and key not in visual_keys
-                ):
-                    dict_to_expand[key] = dict_to_expand[key].repeat_interleave(expand_size, dim=0)
-            return dict_to_expand
-
-        model_kwargs = _expand_dict_for_generation_visual(model_kwargs)
-
-        if input_ids is not None:
-            input_ids = input_ids.repeat_interleave(expand_size, dim=0)
-
-        model_kwargs = _expand_dict_for_generation(model_kwargs)
-
-        if is_encoder_decoder:
-            if model_kwargs.get("encoder_outputs") is None:
-                raise ValueError("If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined.")
-            model_kwargs["encoder_outputs"] = _expand_dict_for_generation(model_kwargs["encoder_outputs"])
-
-        return input_ids, model_kwargs
-
-
-__all__ = [
-    "Qwen3VLVisionModel",
-    "Qwen3VLForConditionalGeneration",
-    "Qwen3VLModel",
-    "Qwen3VLPreTrainedModel",
-    "Qwen3VLTextModel",
-]
+        vision_first_mask = torch.r

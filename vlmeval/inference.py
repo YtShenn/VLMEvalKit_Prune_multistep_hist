@@ -489,6 +489,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     stlite_sample_stats = []
     guipruner_sample_stats = []
     histprune_sample_stats = []
+    prumerge_sample_stats = []
     processed_count = 0
     online_correct = 0
     online_total = 0
@@ -569,6 +570,9 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         histprune_stats = getattr(model, "_histprune_last_sample_stats", None)
         if isinstance(histprune_stats, dict):
             histprune_sample_stats.append(dict(histprune_stats))
+        prumerge_stats = getattr(model, "_prumerge_last_sample_stats", None)
+        if isinstance(prumerge_stats, dict):
+            prumerge_sample_stats.append(dict(prumerge_stats))
         if timing_enabled:
             if timing_sync and torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -1281,6 +1285,40 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                     "HistPrune_mode": str(os.getenv("HISTPRUNE_MODE", "random")),
                 }
             )
+    if prumerge_sample_stats or (world_size > 1 and dist.is_available() and dist.is_initialized()):
+        # Token-weighted aggregate, including safe no-op fallbacks so a run
+        # can distinguish unsupported multimodal layouts from compression.
+        local = [0.0] * 5
+        for record in prumerge_sample_stats:
+            before = float(record.get("visual_tokens_before", 0) or 0)
+            after = float(record.get("visual_tokens_after", before) or before)
+            if before <= 0:
+                continue
+            local[0] += before
+            local[1] += after
+            local[2] += float(bool(record.get("prune_applied", False)))
+            local[3] += float(bool(record.get("fallback", False)))
+            local[4] += 1.0
+        aggregate = torch.tensor(
+            local,
+            device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
+            dtype=torch.float64,
+        )
+        if world_size > 1 and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(aggregate, op=dist.ReduceOp.SUM)
+        before_total, after_total, applied_count, fallback_count, sample_count = aggregate.tolist()
+        if rank == 0 and sample_count > 0:
+            retention = after_total / before_total if before_total > 0 else 1.0
+            summary.update({
+                "PruMerge_visual_tokens_before_total": float(before_total),
+                "PruMerge_visual_tokens_after_total": float(after_total),
+                "PruMerge_visual_retention_rate_global": float(retention),
+                "PruMerge_visual_pruning_rate_global": float(1.0 - retention),
+                "PruMerge_applied_samples": int(applied_count),
+                "PruMerge_fallback_samples": int(fallback_count),
+                "PruMerge_samples": int(sample_count),
+                "PruMerge_variant": str(os.getenv("QWEN3VL_PRUMERGE_VARIANT", "prumerge")),
+            })
     if rank == 0:
         if hasattr(dataset, 'summarize_state_packet_records'):
             try:

@@ -15,6 +15,19 @@ class Qwen3VLFastVChat(Qwen3VLChat):
         super().__init__(*args, **kwargs)
         if not hasattr(self, "model"):
             raise RuntimeError("FastV requires the transformers Qwen3-VL backend.")
-        cfg = self.model.config.text_config
-        cfg._fastv_enabled = self.fastv_config.enabled
-        cfg._fastv_config = self.fastv_config
+        # Qwen3VLTextModel is constructed with `_from_config`, so its config
+        # is a distinct object from `model.config.text_config`. Publish to the
+        # outer config (for visual metadata construction) and inner decoder
+        # config (for the layer-K FastV operation).
+        core = getattr(self.model, "model", None)
+        inner = getattr(core, "language_model", None)
+        configs = [
+            getattr(self.model.config, "text_config", None),
+            getattr(core, "config", None),
+            getattr(getattr(core, "config", None), "text_config", None),
+            getattr(inner, "config", None),
+        ]
+        for cfg in configs:
+            if cfg is not None:
+                cfg._fastv_enabled = self.fastv_config.enabled
+                cfg._fastv_config = self.fastv_config

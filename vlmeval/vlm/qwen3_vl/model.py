@@ -458,14 +458,14 @@ def _estimate_visual_tokens(image_grid_thw=None, video_grid_thw=None) -> int:
     return int(_grid_token_count(image_grid_thw) + _grid_token_count(video_grid_thw))
 
 
-def _estimate_llm_forward_flops(model, q_len: int, kv_len: int) -> float:
+def _estimate_llm_forward_flops(model, q_len: int, kv_len: int, num_layers: int | None = None) -> float:
     cfg = getattr(model, 'config', None)
     text_cfg = getattr(cfg, 'text_config', cfg)
     if text_cfg is None:
         return 0.0
     hidden = int(getattr(text_cfg, 'hidden_size', 0) or 0)
     inter = int(getattr(text_cfg, 'intermediate_size', 0) or 0)
-    layers = int(getattr(text_cfg, 'num_hidden_layers', 0) or 0)
+    layers = int(num_layers if num_layers is not None else getattr(text_cfg, 'num_hidden_layers', 0) or 0)
     heads = int(getattr(text_cfg, 'num_attention_heads', 0) or 0)
     kv_heads = int(getattr(text_cfg, 'num_key_value_heads', heads) or heads)
     head_dim = int(getattr(text_cfg, 'head_dim', hidden // max(heads, 1)) or 0)
@@ -537,6 +537,69 @@ def _guikv_tracking_stats(model) -> dict:
             except Exception:
                 pass
     return out
+
+
+def _fastv_tracking_stats(model) -> dict:
+    """Read decoder-side FastV state after its layer-K physical pruning."""
+    try:
+        cfg = model.model.language_model.config
+        stats = dict(getattr(cfg, '_fastv_last_stats', {}) or {})
+        return stats
+    except Exception:
+        return {}
+
+
+def _sparsevlm_tracking_stats(model) -> dict:
+    """Read the actual, per-layer SparseVLM trim audit from the decoder."""
+    try:
+        cfg = model.model.language_model.config
+        return dict(getattr(cfg, '_sparsevlm_last_stats', {}) or {})
+    except Exception:
+        return {}
+
+
+def _estimate_sparsevlm_prefill_flops(model, stats: dict, default_seq_len: int) -> float:
+    """Count each decoder-layer span at its sequence length at execution time.
+
+    A SparseVLM trim happens *after* the listed decoder layer.  Thus that
+    layer belongs to the pre-trim span and only following layers see the
+    shortened sequence.  Invalid/incomplete audit records safely fall back to
+    the full-length estimate rather than reporting an invented speedup.
+    """
+    text_cfg = getattr(getattr(model, 'config', None), 'text_config', None)
+    total_layers = int(getattr(text_cfg, 'num_hidden_layers', 0) or 0)
+    before = int(stats.get('seq_tokens_before', default_seq_len) or default_seq_len)
+    records = stats.get('layer_prunes', [])
+    if total_layers <= 0 or before <= 0 or not isinstance(records, list):
+        return _estimate_llm_forward_flops(model, q_len=default_seq_len, kv_len=default_seq_len)
+    out, next_layer, seq_len = 0.0, 0, before
+    try:
+        ordered = sorted(records, key=lambda x: int(x['layer_idx']))
+        for record in ordered:
+            layer_idx = int(record['layer_idx'])
+            rec_before = int(record['seq_tokens_before'])
+            rec_after = int(record['seq_tokens_after'])
+            if layer_idx < next_layer or layer_idx >= total_layers or rec_before != seq_len or rec_after <= 0 or rec_after > rec_before:
+                raise ValueError('invalid SparseVLM layer audit')
+            out += _estimate_llm_forward_flops(
+                model, q_len=seq_len, kv_len=seq_len, num_layers=layer_idx - next_layer + 1
+            )
+            next_layer, seq_len = layer_idx + 1, rec_after
+        out += _estimate_llm_forward_flops(
+            model, q_len=seq_len, kv_len=seq_len, num_layers=total_layers - next_layer
+        )
+        return float(out)
+    except (KeyError, TypeError, ValueError):
+        return _estimate_llm_forward_flops(model, q_len=default_seq_len, kv_len=default_seq_len)
+
+
+def _prumerge_tracking_stats(model) -> dict:
+    """Read Qwen3VL-PruMerge prefill compression metadata, if active."""
+    try:
+        cfg = model.model.language_model.config
+        return dict(getattr(cfg, '_prumerge_last_stats', {}) or {})
+    except Exception:
+        return {}
 
 
 def _patch_qwen3vl_runtime_tracking(model) -> None:
@@ -613,18 +676,63 @@ class _RuntimeTrackingHooks:
             elapsed = float(time.perf_counter() - start_obj)
         self.forward_steps += 1
         guikv_stats = _guikv_tracking_stats(self.model)
+        fastv_stats = _fastv_tracking_stats(self.model)
+        sparsevlm_stats = _sparsevlm_tracking_stats(self.model)
+        prumerge_stats = _prumerge_tracking_stats(self.model)
         guikv_actual_kv_len = int(guikv_stats.get('actual_kv_seq_len', 0) or 0)
         if is_prefill or guikv_actual_kv_len <= 0:
             kv_len = max(int(q_len), int(cache_len + q_len))
         else:
             kv_len = max(int(q_len), guikv_actual_kv_len)
-        self.llm_flops += _estimate_llm_forward_flops(self.model, q_len=int(q_len), kv_len=int(kv_len))
+        fastv_applied = bool(is_prefill and fastv_stats.get('prune_applied', False))
+        sparsevlm_applied = bool(is_prefill and sparsevlm_stats.get('prune_applied', False))
+        prumerge_applied = bool(is_prefill and prumerge_stats.get('prune_applied', False))
+        if prumerge_applied:
+            # PruMerge rewrites the visual sequence before decoder layer 0,
+            # so every decoder layer sees the reduced prefill length.
+            after = int(prumerge_stats.get('seq_tokens_after', q_len) or q_len)
+            self.llm_flops += _estimate_llm_forward_flops(self.model, q_len=after, kv_len=after)
+        elif fastv_applied:
+            # FastV executes layers [0, K) at the unpruned length and layers
+            # [K, N) at the physically shortened length. Counting the outer
+            # forward as one full-length N-layer pass was the source of the
+            # previous, invalid FastV FLOPs report.
+            before = int(fastv_stats.get('seq_tokens_before', q_len) or q_len)
+            after = int(fastv_stats.get('seq_tokens_after', before) or before)
+            k = max(0, int(fastv_stats.get('k', 0) or 0))
+            text_cfg = getattr(getattr(self.model, 'config', None), 'text_config', None)
+            layers = int(getattr(text_cfg, 'num_hidden_layers', 0) or 0)
+            k = min(k, layers)
+            self.llm_flops += _estimate_llm_forward_flops(self.model, q_len=before, kv_len=before, num_layers=k)
+            self.llm_flops += _estimate_llm_forward_flops(self.model, q_len=after, kv_len=after, num_layers=layers - k)
+        elif sparsevlm_applied:
+            self.llm_flops += _estimate_sparsevlm_prefill_flops(self.model, sparsevlm_stats, q_len)
+        else:
+            self.llm_flops += _estimate_llm_forward_flops(self.model, q_len=int(q_len), kv_len=int(kv_len))
         self.lm_head_flops += _estimate_lm_head_flops(self.model, q_len=max(1, int(q_len)))
         if is_prefill:
             self.prefill_seen = True
             if q_len > 0:
-                self.seq_tokens_before = int(q_len)
-                self.seq_tokens_after = int(guikv_stats.get('compressed_seq_len', 0) or q_len)
+                self.seq_tokens_before = int(
+                    prumerge_stats.get('seq_tokens_before', q_len) if prumerge_applied
+                    else fastv_stats.get('seq_tokens_before', q_len) if fastv_applied
+                    else sparsevlm_stats.get('seq_tokens_before', q_len) if sparsevlm_applied else q_len
+                )
+                self.seq_tokens_after = int(
+                    prumerge_stats.get('seq_tokens_after', q_len) if prumerge_applied
+                    else fastv_stats.get('seq_tokens_after', q_len)
+                    if fastv_applied else sparsevlm_stats.get('seq_tokens_after', q_len)
+                    if sparsevlm_applied else guikv_stats.get('compressed_seq_len', 0) or q_len
+                )
+            if prumerge_applied:
+                self.visual_tokens_before = int(prumerge_stats.get('visual_tokens_before', self.visual_tokens_before) or 0)
+                self.visual_tokens_after = int(prumerge_stats.get('visual_tokens_after', self.visual_tokens_after) or 0)
+            if fastv_applied:
+                self.visual_tokens_before = int(fastv_stats.get('visual_tokens_before', self.visual_tokens_before) or 0)
+                self.visual_tokens_after = int(fastv_stats.get('visual_tokens_after', self.visual_tokens_after) or 0)
+            if sparsevlm_applied:
+                self.visual_tokens_before = int(sparsevlm_stats.get('total_visual_tokens_before', self.visual_tokens_before) or 0)
+                self.visual_tokens_after = int(sparsevlm_stats.get('total_visual_tokens_after', self.visual_tokens_after) or 0)
             if guikv_stats.get('visual_tokens_before') is not None:
                 self.visual_tokens_before = int(guikv_stats.get('visual_tokens_before', self.visual_tokens_before) or 0)
             if guikv_stats.get('visual_tokens_after') is not None:
@@ -677,6 +785,7 @@ class _RuntimeTrackingHooks:
             self._handles = []
 
     def to_runtime_dict(self) -> dict:
+        prumerge_stats = _prumerge_tracking_stats(self.model)
         return {
             'prefill_s': float(self.prefill_s),
             'decode_s': float(self.decode_s),
@@ -685,8 +794,8 @@ class _RuntimeTrackingHooks:
             'prefill_split_to_prune_start_s': 0.0,
             'prune_layer_to_prefill_end_s': 0.0,
             'split_layer_to_prefill_end_without_prune_s': 0.0,
-            'prune_selection_s': 0.0,
-            'prune_op_s': 0.0,
+            'prune_selection_s': float(prumerge_stats.get('selection_sec', 0.0) or 0.0),
+            'prune_op_s': float(prumerge_stats.get('merge_sec', 0.0) or 0.0),
             'prune_layer_to_finish_s': 0.0,
             'seq_tokens_before': int(self.seq_tokens_before),
             'seq_tokens_after': int(self.seq_tokens_after),
@@ -1213,11 +1322,17 @@ def _roi_prune_generate_use_cache(model) -> bool:
 
 
 def _attn_prune_generate_use_cache(model) -> bool:
-    # HistPrune uses this custom Qwen3 decoder for its post-ViT sequence trim,
-    # but unlike legacy attention pruning it explicitly trims all prefill KV
-    # states. Do not infer its cache policy from the module filename.
+    # HistPrune and FastV use this custom Qwen3 decoder for post-ViT sequence
+    # trimming, and both explicitly trim all prefill KV states. They must keep
+    # the cache enabled: treating FastV as legacy AttnPrune based on the module
+    # filename makes every decode step recompute the whole 2k+ token prompt.
     try:
-        if bool(getattr(model.config.text_config, '_histprune_enabled', False)):
+        if bool(
+            getattr(model.config.text_config, '_histprune_enabled', False)
+            or getattr(model.config.text_config, '_fastv_enabled', False)
+            or getattr(model.config.text_config, '_prumerge_enabled', False)
+            or getattr(model.config.text_config, '_prumerge_config', None) is not None
+        ):
             return True
     except Exception:
         pass
@@ -1338,11 +1453,14 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
         self.verbose = verbose
         self.post_process = post_process
         self.use_histprune = bool(kwargs.pop('histprune', False))
+        # Qwen3VL-PruMerge is a separate wrapper but uses this custom decoder
+        # for its DeepStack-safe, prefill-only physical sequence compression.
+        self.use_prumerge = bool(kwargs.pop('prumerge', False))
         # FastV deliberately uses the same isolated custom decoder only for
         # its cache/DeepStack-safe physical sequence surgery. Its scoring and
         # configuration remain independent of AttnPrune.
         self.use_fastv = bool(kwargs.pop('fastv', False))
-        self.use_attn_prune = bool(kwargs.pop('use_attn_prune', False) or kwargs.pop('attn_prune', False) or self.use_histprune or self.use_fastv)
+        self.use_attn_prune = bool(kwargs.pop('use_attn_prune', False) or kwargs.pop('attn_prune', False) or self.use_histprune or self.use_fastv or self.use_prumerge)
         self.fps = kwargs.pop('fps', 2)
         self.nframe = kwargs.pop('nframe', 128)
         self.FRAME_FACTOR = 2
@@ -1438,7 +1556,7 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             # HistPrune physically trims the prefill cache and therefore needs
             # normal generation caching. Existing AttnPrune keeps its legacy
             # cache-off default unchanged.
-            if _use_qwen3vl_attn_prune_model(self.use_attn_prune) and not self.use_histprune and not self.use_fastv and not _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0'):
+            if _use_qwen3vl_attn_prune_model(self.use_attn_prune) and not self.use_histprune and not self.use_fastv and not self.use_prumerge and not _env_flag('QWEN3VL_ATTN_PRUNE_USE_CACHE', '0'):
                 try:
                     self.model.config.use_cache = False
                 except Exception:

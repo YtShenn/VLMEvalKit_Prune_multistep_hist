@@ -1603,6 +1603,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         attn_prune_token_meta: dict | None = None,
         histprune_token_meta: dict | None = None,
         fastv_token_meta: dict | None = None,
+        sparsevlm_token_meta: dict | None = None,
+        prumerge_token_meta: dict | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple | BaseModelOutputWithPast:
         r"""
@@ -1614,6 +1616,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             hidden states. It's from the paper DeepStack(https://arxiv.org/abs/2406.04334).
         attn_prune_token_meta (`dict`, *optional*):
             Runtime metadata for selecting the current image token block used by attention-based pruning.
+        prumerge_token_meta (`dict`, *optional*):
+            Per-visual-block Qwen3VL-PruMerge-inspired selection and aggregation plans.
         """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
@@ -1644,13 +1648,90 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             position_ids = position_ids[1:]
         else:
             text_position_ids = None
+
+        # PruMerge compression occurs once, before decoder layer 0.  This is
+        # earlier than FastV and leaves the prefill cache, M-RoPE positions,
+        # visual mask and every DeepStack feature tensor in the same reduced
+        # order.  It is deliberately a no-op for decoding/cache forwards.
+        prumerge_cfg = getattr(self.config, "_prumerge_config", None)
+        prumerge_enabled = bool(
+            getattr(self.config, "_prumerge_enabled", False)
+            and prumerge_cfg is not None
+            and prumerge_token_meta is not None
+            and is_prefill_forward
+            and not self.training
+            and inputs_embeds.shape[0] == 1
+            and visual_pos_masks is not None
+        )
+        if prumerge_enabled:
+            try:
+                from ..qwen3_vl_prumerge.token import aggregate_visual_blocks
+                selection_start = time.perf_counter()
+                blocks = list(prumerge_token_meta["blocks"])
+                lengths = [int(x) for x in prumerge_token_meta["lengths"]]
+                plans = list(prumerge_token_meta["plans"])
+                visual_positions = torch.where(visual_pos_masks[0].bool())[0]
+                if not blocks or sum(lengths) != int(visual_positions.numel()):
+                    raise ValueError("visual block metadata is inconsistent")
+                # The selected physical positions remain sorted, so text and
+                # image/video interleaving are preserved exactly.
+                kept_blocks = []
+                for block, plan in zip(blocks, plans):
+                    block = block.to(inputs_embeds.device, dtype=torch.long)
+                    kept_blocks.append(block if plan is None else block.index_select(0, plan.keep.to(block.device)))
+                kept_visual_positions = torch.cat(kept_blocks) if kept_blocks else visual_positions.new_empty((0,))
+                keep_mask = torch.ones(inputs_embeds.shape[1], dtype=torch.bool, device=inputs_embeds.device)
+                keep_mask[visual_positions] = False
+                keep_mask[kept_visual_positions] = True
+                keep_indices = torch.where(keep_mask)[0]
+                original_length = int(inputs_embeds.shape[1])
+                main_visual = inputs_embeds[0].index_select(0, visual_positions)
+                merged_visual = aggregate_visual_blocks(main_visual, lengths, plans)
+                merged_deepstack = (
+                    [aggregate_visual_blocks(feature, lengths, plans) for feature in deepstack_visual_embeds]
+                    if deepstack_visual_embeds is not None else None
+                )
+                merge_start = time.perf_counter()
+                reduced_inputs = inputs_embeds.index_select(1, keep_indices)
+                reduced_visual_mask = visual_pos_masks.index_select(1, keep_indices)
+                reduced_visual_positions = torch.where(reduced_visual_mask[0].bool())[0]
+                if int(reduced_visual_positions.numel()) != int(merged_visual.shape[0]):
+                    raise ValueError("reduced visual positions and merged features differ")
+                reduced_inputs[0, reduced_visual_positions] = merged_visual.to(reduced_inputs.dtype)
+                # Commit only after all potentially failing aggregation work.
+                inputs_embeds = reduced_inputs
+                visual_pos_masks = reduced_visual_mask
+                if text_position_ids is not None:
+                    text_position_ids = text_position_ids.index_select(1, keep_indices)
+                position_ids = position_ids.index_select(2, keep_indices)
+                deepstack_visual_embeds = merged_deepstack
+                raw_attention_mask = torch.ones(
+                    (1, inputs_embeds.shape[1]), dtype=torch.bool, device=inputs_embeds.device
+                )
+                stats = dict(getattr(self.config, "_prumerge_last_stats", {}) or {})
+                stats.update({
+                    "prune_applied": int(inputs_embeds.shape[1]) < original_length,
+                    "fallback": False, "reason": "applied",
+                    "seq_tokens_before": original_length,
+                    "seq_tokens_after": int(inputs_embeds.shape[1]),
+                    "visual_tokens_before": int(visual_positions.numel()),
+                    "visual_tokens_after": int(reduced_visual_positions.numel()),
+                    "selection_sec": float(merge_start - selection_start),
+                    "merge_sec": float(time.perf_counter() - merge_start),
+                })
+                setattr(self.config, "_prumerge_last_stats", stats)
+            except Exception as exc:
+                stats = dict(getattr(self.config, "_prumerge_last_stats", {}) or {})
+                stats.update({"prune_applied": False, "fallback": True,
+                              "reason": f"compression_failed:{type(exc).__name__}"})
+                setattr(self.config, "_prumerge_last_stats", stats)
         if is_prefill_forward:
             setattr(self.config, "_attn_prune_cache_position_offset", 0)
 
         attention_mask = create_causal_mask(
             config=self.config,
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+            attention_mask=raw_attention_mask,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
@@ -1702,6 +1783,10 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         fastv_stats = {
             "prune_applied": False,
             "enabled": bool(fastv_enabled),
+            "config_enabled": bool(getattr(fastv_cfg, "enabled", False)),
+            "token_meta_available": fastv_token_meta is not None,
+            "is_prefill": bool(is_prefill_forward),
+            "batch_size": int(hidden_states.shape[0]),
             "k": fastv_k,
             "r": fastv_r,
             "score_source": "previous_layer_last_query_head_mean",
@@ -1715,11 +1800,23 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        sparse_cfg = getattr(self.config, "_sparsevlm_config", None)
+        sparse_enabled = bool(
+            getattr(self.config, "_sparsevlm_enabled", False)
+            and sparse_cfg is not None
+            and sparsevlm_token_meta is not None
+            and hidden_states.shape[0] == 1
+            and hidden_states.shape[1] > 1
+            and is_prefill_forward
+            and not self.training
+        )
         prune_layer_set = _attn_prune_parse_layers(
             getattr(self.config, "_attn_prune_layers", None),
             env_name="QWEN3VL_ATTN_PRUNE_LAYERS",
         )
-        keep_ratio = _attn_prune_keep_ratio()
+        if sparse_enabled:
+            prune_layer_set = set(int(x) for x in sparse_cfg.layers)
+        keep_ratio = float(sparse_cfg.retain_ratio) if sparse_enabled else _attn_prune_keep_ratio()
         vis_enabled = _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_VIS", "0")
         stats_enabled = _attn_prune_env_flag("QWEN3VL_ATTN_PRUNE_STATS", "0")
         conf_enabled = _attn_conf_enabled()
@@ -1732,11 +1829,11 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         if not vis_layer_set and (vis_enabled or stats_enabled):
             vis_layer_set = set(prune_layer_set)
         prune_enabled = (
-            _attn_prune_env_flag("QWEN3VL_ENABLE_ATTN_PRUNE", "0")
+            (sparse_enabled or _attn_prune_env_flag("QWEN3VL_ENABLE_ATTN_PRUNE", "0"))
             and bool(prune_layer_set)
             and keep_ratio < 1.0
             and visual_pos_masks is not None
-            and attn_prune_token_meta is not None
+            and (sparsevlm_token_meta is not None if sparse_enabled else attn_prune_token_meta is not None)
             and hidden_states.shape[1] > 1
             and not self.training
         )
@@ -1749,24 +1846,32 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             (prune_enabled or vis_enabled or stats_enabled or conf_enabled)
             and bool(attn_layer_set)
             and visual_pos_masks is not None
-            and attn_prune_token_meta is not None
+            and (sparsevlm_token_meta is not None if sparse_enabled else attn_prune_token_meta is not None)
             and hidden_states.shape[1] > 1
             and not self.training
         )
         current_visual_indices = None
         current_visual_index_map = None
         attn_query_indices = None
-        if attn_prune_token_meta is not None:
-            current_visual_indices = attn_prune_token_meta.get("current_visual_indices")
+        active_token_meta = sparsevlm_token_meta if sparse_enabled else attn_prune_token_meta
+        if active_token_meta is not None:
+            current_visual_indices = active_token_meta.get("visual_indices" if sparse_enabled else "current_visual_indices")
             if torch.is_tensor(current_visual_indices):
                 current_visual_indices = current_visual_indices.to(hidden_states.device, dtype=torch.long)
                 current_visual_index_map = torch.arange(
                     int(current_visual_indices.numel()), device=hidden_states.device, dtype=torch.long
                 )
-            attn_query_indices = attn_prune_token_meta.get("attn_query_indices")
+                if sparse_enabled:
+                    original_rel = active_token_meta.get("selected_image_rel")
+                    if isinstance(original_rel, list) and len(original_rel) == int(current_visual_indices.numel()):
+                        current_visual_index_map = torch.tensor(original_rel, device=hidden_states.device, dtype=torch.long)
+            attn_query_indices = active_token_meta.get("rater_indices" if sparse_enabled else "attn_query_indices")
             if torch.is_tensor(attn_query_indices):
                 attn_query_indices = attn_query_indices.to(hidden_states.device, dtype=torch.long)
         sample_stats = {
+            "implementation": "SparseVLM" if sparse_enabled else "AttnPrune",
+            "scope": str(getattr(sparse_cfg, "scope", "")) if sparse_enabled else "current",
+            "version": str(getattr(sparse_cfg, "version", "")) if sparse_enabled else "",
             "prune_applied": False,
             "layers": sorted(int(x) for x in prune_layer_set),
             "prune_layers": sorted(int(x) for x in prune_layer_set),
@@ -1795,6 +1900,9 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             "safety_keep_text_dense_tokens": 0,
             "selected_top4_grids": [],
             "layer_stats": [],
+            # Each record is emitted after its decoder layer has run, then
+            # the shortened sequence is consumed by subsequent layers.
+            "layer_prunes": [],
         }
         t_forward0 = time.perf_counter()
         split_boundary_time = None
@@ -1844,7 +1952,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     "visual_indices": fastv_visual_indices,
                 }
             if need_attn and layer_idx in attn_layer_set and torch.is_tensor(current_visual_indices):
-                query_indices = self._attn_prune_query_indices(
+                query_indices = attn_query_indices if sparse_enabled else self._attn_prune_query_indices(
                     visual_pos_masks=visual_pos_masks,
                     current_visual_indices=current_visual_indices,
                     attn_query_indices=attn_query_indices,
@@ -2087,6 +2195,15 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     "prune_op_sec": float(sample_stats.get("prune_op_sec", 0.0) + (prune_finish_time - t_prune0)),
                 }
             )
+            if sparse_enabled:
+                sample_stats["layer_prunes"].append(
+                    {
+                        "layer_idx": int(layer_idx),
+                        "seq_tokens_before": int(original_seq_len),
+                        "seq_tokens_after": int(hidden_states.shape[1]),
+                        "visual_tokens_after": int(current_visual_indices.numel()),
+                    }
+                )
             if should_emit_debug and prune_vis_enabled:
                 self._attn_prune_queue_pruned_heatmap(
                     weights=full_weights,
@@ -2107,6 +2224,26 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             sample_stats["prune_layer_to_finish_sec"] = float((prune_finish_time or t_forward1) - split_boundary_time)
         if int(sample_stats.get("visual_tokens_before", 0) or 0) > 0 or not getattr(self.config, "_attn_prune_last_stats", None):
             setattr(self.config, "_attn_prune_last_stats", sample_stats)
+        if sparse_enabled:
+            # The original position map survives every physical trim, making
+            # the audit valid for heterogeneous/non-contiguous image blocks.
+            blocks = sparsevlm_token_meta.get("image_blocks", [])
+            kept = set(_attn_prune_tensor_to_list(current_visual_index_map)) if torch.is_tensor(current_visual_index_map) else set()
+            before = [int(len(x)) for x in blocks]
+            selectable = set(int(x) for x in sparsevlm_token_meta.get("selected_image_rel", []))
+            after = [sum((int(i) in kept) if int(i) in selectable else True for i in block)
+                     for block in sparsevlm_token_meta.get("image_rel_blocks", [])]
+            sample_stats.update({
+                "image_tokens_before": before,
+                "image_tokens_after": after,
+                "total_visual_tokens_before": int(sum(before)),
+                "total_visual_tokens_after": int(sum(after)),
+                "history_images": max(0, len(before) - 1),
+                "total_visual_retention": float(sum(after) / max(1, sum(before))),
+            })
+            setattr(self.config, "_sparsevlm_last_stats", sample_stats)
+            if bool(getattr(sparse_cfg, "debug", False)):
+                print("[SparseVLM] " + json.dumps(sample_stats, sort_keys=True), flush=True)
         if histprune_stats is not None:
             hist_h = int(histprune_stats["history_tokens"])
             hist_k = int(histprune_stats["history_keep_budget"])
@@ -3335,12 +3472,131 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         attn_prune_token_meta = self._attn_prune_current_image_meta(input_ids, image_mask, image_grid_thw)
         histprune_token_meta = None
         fastv_token_meta = None
+        sparsevlm_token_meta = None
+        prumerge_token_meta = None
+        # `Qwen3VLModel` and `Qwen3VLTextModel` can receive copied config
+        # objects through HF loading/generation. Refresh the decoder's runtime
+        # flags from this model's config at every forward, before metadata is
+        # built, so FastV cannot silently fall back to disabled.
+        fastv_outer_cfg = getattr(self.config.text_config, "_fastv_config", None)
+        fastv_outer_enabled = bool(getattr(self.config.text_config, "_fastv_enabled", False))
+        if fastv_outer_cfg is not None:
+            self.language_model.config._fastv_enabled = fastv_outer_enabled
+            self.language_model.config._fastv_config = fastv_outer_cfg
         if bool(getattr(self.config.text_config, "_fastv_enabled", False)):
             # `visual_pos_masks` is built after Qwen has expanded all image
             # placeholders, so it naturally represents every history and the
             # current screenshot, even when their grids differ.
             from ..qwen3_vl_fastv.token import build_token_meta as build_fastv_token_meta
             fastv_token_meta = build_fastv_token_meta(visual_pos_masks)
+        sparse_cfg = getattr(self.config.text_config, "_sparsevlm_config", None)
+        sparse_enabled = bool(getattr(self.config.text_config, "_sparsevlm_enabled", False) and sparse_cfg is not None)
+        if sparse_enabled:
+            # Build from the expanded placeholder mask, not a contiguous span:
+            # this remains correct for heterogeneous history grids and text
+            # inserted between images.
+            from ..qwen3_vl_sparsevlm.token import image_blocks, select_scope, select_raters
+            blocks = image_blocks(visual_pos_masks, image_grid_thw, self.config.vision_config.spatial_merge_size)
+            if blocks is not None and len(blocks) <= int(sparse_cfg.max_history_frames) + 1:
+                visual_indices = select_scope(blocks, sparse_cfg.scope)
+                all_visual = torch.where(visual_pos_masks[0].bool())[0] if visual_pos_masks is not None else visual_indices
+                text_indices = torch.where(~visual_pos_masks[0].bool())[0] if visual_pos_masks is not None else visual_indices.new_empty((0,))
+                # §3.2 raters are calculated before decoder layer 0.
+                raters = select_raters(inputs_embeds, all_visual, text_indices)
+                flat = torch.cat(blocks) if blocks else visual_indices.new_empty((0,))
+                selected_rel = torch.searchsorted(flat, visual_indices).detach().cpu().tolist() if visual_indices.numel() else []
+                rel_blocks = []
+                for block in blocks:
+                    rel_blocks.append(torch.searchsorted(flat, block).detach().cpu().tolist())
+                sparsevlm_token_meta = {
+                    "visual_indices": visual_indices,
+                    "rater_indices": raters,
+                    "image_blocks": blocks,
+                    "image_rel_blocks": rel_blocks,
+                    "selected_image_rel": selected_rel,
+                }
+            else:
+                # Fail closed: unsupported batch/layout simply runs unpruned.
+                self.config.text_config._sparsevlm_last_stats = {"prune_applied": False, "reason": "unsafe_image_layout_or_history_limit"}
+            self.language_model.config._sparsevlm_enabled = sparse_enabled
+            self.language_model.config._sparsevlm_config = sparse_cfg
+        # PruMerge is intentionally evaluated on the post-merger Qwen visual
+        # features. Unlike LLaVA/CLIP, Qwen3-VL exposes no CLS token, so the
+        # isolated helper uses a global visual query for IQR saliency.  Plans
+        # remain per contiguous visual block, preventing any cross-image,
+        # cross-video, or cross-history aggregation.
+        prumerge_cfg = getattr(self.config.text_config, "_prumerge_config", None)
+        # HF `generate` can supply an empty DynamicCache on its first prefill
+        # call. Treat that equivalently to None; otherwise PruMerge silently
+        # builds no plan and the FLOPs reporter measures the full baseline.
+        prumerge_prefill = past_key_values is None
+        if past_key_values is not None:
+            try:
+                prumerge_prefill = int(past_key_values.get_seq_length()) == 0
+            except Exception:
+                prumerge_prefill = False
+        prumerge_enabled = bool(
+            getattr(self.config.text_config, "_prumerge_enabled", False)
+            and prumerge_cfg is not None
+            and visual_pos_masks is not None
+            and inputs_embeds.shape[0] == 1
+            and prumerge_prefill
+        )
+        if prumerge_enabled:
+            try:
+                from ..qwen3_vl_prumerge.token import (
+                    contiguous_visual_blocks, make_merge_plan, plans_metadata,
+                    scope_block_indices,
+                )
+                blocks = contiguous_visual_blocks(visual_pos_masks)
+                if blocks is None or not blocks:
+                    self.config.text_config._prumerge_last_stats = {
+                        "implementation": "Qwen3VL-PruMerge-inspired", "prune_applied": False,
+                        "fallback": True, "reason": "visual_blocks_unavailable",
+                    }
+                elif len(blocks) > int(prumerge_cfg.max_history_steps) + 1:
+                    self.config.text_config._prumerge_last_stats = {
+                        "implementation": "Qwen3VL-PruMerge-inspired", "prune_applied": False,
+                        "fallback": True, "reason": "history_limit_exceeded",
+                    }
+                else:
+                    visual_values = inputs_embeds[0].index_select(0, torch.cat(blocks))
+                    lengths = [int(block.numel()) for block in blocks]
+                    selected_blocks = scope_block_indices(len(blocks), prumerge_cfg.scope)
+                    plans = []
+                    offset = 0
+                    for block_index, length in enumerate(lengths):
+                        current = visual_values[offset:offset + length]
+                        plan = None
+                        if block_index in selected_blocks and length > 1:
+                            plan = make_merge_plan(
+                                current, min_keep=prumerge_cfg.min_keep_tokens,
+                                max_keep=prumerge_cfg.max_keep_tokens,
+                                iqr_multiplier=prumerge_cfg.iqr_multiplier,
+                                variant=prumerge_cfg.variant,
+                                similarity_temperature=prumerge_cfg.similarity_temperature,
+                            )
+                        plans.append(plan)
+                        offset += length
+                    prumerge_token_meta = {"blocks": blocks, "lengths": lengths, "plans": plans}
+                    records = plans_metadata(plans, lengths)
+                    self.config.text_config._prumerge_last_stats = {
+                        "implementation": "Qwen3VL-PruMerge-inspired",
+                        "variant": prumerge_cfg.variant, "scope": prumerge_cfg.scope,
+                        "prune_applied": False, "fallback": False, "reason": "ready",
+                        "visual_tokens_before": int(sum(lengths)),
+                        "visual_tokens_after": int(sum(record["tokens_after"] for record in records)),
+                        "block_stats": records, "selection_sec": 0.0, "merge_sec": 0.0,
+                    }
+            except Exception as exc:
+                # This is an experimental baseline: malformed heterogeneous
+                # metadata must fail closed to ordinary Qwen inference.
+                self.config.text_config._prumerge_last_stats = {
+                    "implementation": "Qwen3VL-PruMerge-inspired", "prune_applied": False,
+                    "fallback": True, "reason": f"plan_build_failed:{type(exc).__name__}",
+                }
+        self.language_model.config._prumerge_enabled = prumerge_enabled
+        self.language_model.config._prumerge_config = prumerge_cfg
         if bool(getattr(self.config.text_config, "_histprune_enabled", False)):
             try:
                 from ..qwen3_vl_histprune.history import build_token_meta
@@ -3374,8 +3630,15 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             attn_prune_token_meta=attn_prune_token_meta,
             histprune_token_meta=histprune_token_meta,
             fastv_token_meta=fastv_token_meta,
+            sparsevlm_token_meta=sparsevlm_token_meta,
+            prumerge_token_meta=prumerge_token_meta,
             **kwargs,
         )
+
+        if prumerge_cfg is not None:
+            inner_stats = getattr(self.language_model.config, "_prumerge_last_stats", None)
+            if isinstance(inner_stats, dict):
+                self.config.text_config._prumerge_last_stats = dict(inner_stats)
 
         return Qwen3VLModelOutputWithPast(
             **outputs,

@@ -19,6 +19,7 @@ class PruMergeConfig:
     max_keep_tokens: int = 128
     iqr_multiplier: float = 1.5
     similarity_temperature: float = 1.0
+    retain_ratio: float | None = None
     max_history_steps: int = 4
     scope: str = "all"
     debug: bool = False
@@ -31,6 +32,8 @@ class PruMergeConfig:
             iqr = float(os.getenv("QWEN3VL_PRUMERGE_IQR_MULTIPLIER", "1.5"))
             temperature = float(os.getenv("QWEN3VL_PRUMERGE_SIMILARITY_TEMPERATURE", "1.0"))
             history = int(os.getenv("QWEN3VL_PRUMERGE_MAX_HISTORY_STEPS", "4"))
+            raw_retain_ratio = os.getenv("QWEN3VL_PRUMERGE_RETAIN_RATIO", "").strip()
+            retain_ratio = float(raw_retain_ratio) if raw_retain_ratio else None
         except ValueError as exc:
             raise ValueError("QWEN3VL_PRUMERGE numeric options are invalid") from exc
         variant = os.getenv("QWEN3VL_PRUMERGE_VARIANT", "prumerge").strip().lower()
@@ -43,12 +46,15 @@ class PruMergeConfig:
             raise ValueError("QWEN3VL_PRUMERGE keep bounds must satisfy 1 <= min <= max")
         if iqr < 0.0 or temperature <= 0.0:
             raise ValueError("QWEN3VL_PRUMERGE_IQR_MULTIPLIER must be non-negative and temperature positive")
+        if retain_ratio is not None and not 0.0 < retain_ratio <= 1.0:
+            raise ValueError("QWEN3VL_PRUMERGE_RETAIN_RATIO must be in (0, 1]")
         if not 0 <= history <= 4:
             raise ValueError("QWEN3VL_PRUMERGE_MAX_HISTORY_STEPS must be in [0, 4]")
         return cls(
             enabled=_flag("QWEN3VL_PRUMERGE_ENABLED", "0"), variant=variant,
             min_keep_tokens=min_keep, max_keep_tokens=max_keep,
             iqr_multiplier=iqr, similarity_temperature=temperature,
+            retain_ratio=retain_ratio,
             max_history_steps=history, scope=scope,
             debug=_flag("QWEN3VL_PRUMERGE_DEBUG", "0"),
         )

@@ -47,7 +47,7 @@ TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 # DATA="Mind2Web_test_task"
 # WORK_DIR="OUTPUT_GUIKV/outputs_mind2web_guikv_4B"
 DATA="AITW_all"
-WORK_DIR="OUTPUT_GUIKV/outputs_aitw_all_guikv_4B"
+WORK_DIR="OUTPUT_GUIKV/outputs_aitw_all_guikv_4B_flops2"
 
 export GUIKV_HISTORY_STEPS="${GUIKV_HISTORY_STEPS:-4}"
 export GUIKV_TOTAL_KEEP_RATIO="${GUIKV_TOTAL_KEEP_RATIO:-0.45}"

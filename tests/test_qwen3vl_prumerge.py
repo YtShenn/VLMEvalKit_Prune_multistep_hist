@@ -45,6 +45,15 @@ def test_plus_adds_only_valid_uniform_supplements():
     assert plus.keep.numel() <= 4
 
 
+def test_explicit_retain_ratio_overrides_adaptive_keep_bounds():
+    features = torch.arange(30, dtype=torch.float32).reshape(10, 3)
+    plan = make_merge_plan(
+        features, min_keep=1, max_keep=2, iqr_multiplier=1.5,
+        variant="prumerge_plus", retain_ratio=0.4,
+    )
+    assert plan.keep.numel() == 4
+
+
 def test_blocks_never_mix_features_or_deepstack():
     features = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]])
     plans = [make_merge_plan(features[:2], min_keep=1, max_keep=1, iqr_multiplier=0.0, variant="prumerge"), None]

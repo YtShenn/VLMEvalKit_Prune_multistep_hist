@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Isolated SparseVLM four-dataset baseline. Override DATASETS for a subset.
+# Shared SparseVLM runner for the four dataset-specific entry points below.
+# Override DATASETS to run a custom subset.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6}"
@@ -9,9 +10,8 @@ MODEL="${MODEL:-Qwen3-VL-4B-Instruct-SparseVLM}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-7}"
-WORK_DIR="${WORK_DIR:-OUTPUT_SPARSEVLM/4B_keep${SPARSEVLM_RETAIN_RATIO:-0.5}}"
-# DATASETS="${DATASETS:-AITW_all Mind2Web_test_task GUIOdyssey_high_task_split AndroidControl_Curated_High_Task_Improved}"
-DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
+WORK_DIR="${WORK_DIR:-OUTPUT_SPARSEVLM/4B_keep${SPARSEVLM_RETAIN_RATIO:-0.7}}"
+DATASETS="${DATASETS:-AITW_all Mind2Web_test_task GUIOdyssey_high_task_split AndroidControl_Curated_High_Task_Improved}"
 
 export SPARSEVLM_ENABLED="${SPARSEVLM_ENABLED:-1}"
 export SPARSEVLM_LAYERS="${SPARSEVLM_LAYERS:-3,6,15}"
@@ -44,19 +44,24 @@ export QWEN3VL_ANDROID_DENORM_BASE="${QWEN3VL_ANDROID_DENORM_BASE:-1000}"
 export QWEN3VL_ATTN_PRUNE_USE_CACHE=1
 export VLM_TIMING="${VLM_TIMING:-1}"
 export QWEN3VL_RUNTIME_TRACKING="${QWEN3VL_RUNTIME_TRACKING:-1}"
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-off}"
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-5}"
 export VLM_EVAL_SAMPLE_COUNT="${VLM_EVAL_SAMPLE_COUNT:-20}"
 
-export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_annots}"
-export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_images}"
+export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/public/ytshen/aitw_data/aitw_annots}"
+export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/public/ytshen/aitw_data/aitw_images}"
 export AITW_SPLIT="${AITW_SPLIT:-test}"
-export MIND2WEB_DATA_ROOT="${MIND2WEB_DATA_ROOT:-/mnt/storage2/Datasets/Mind2Web}"
+export MIND2WEB_DATA_ROOT="${MIND2WEB_DATA_ROOT:-/public/ytshen/Mind2Web}"
 export MIND2WEB_ANN_ROOT="${MIND2WEB_ANN_ROOT:-${MIND2WEB_DATA_ROOT}/mind2web_annots}"
-export MIND2WEB_IMAGE_ROOT="${MIND2WEB_IMAGE_ROOT:-${MIND2WEB_DATA_ROOT}/mind2web_images}"
-export DATA_ROOT="${DATA_ROOT:-/mnt/storage2/users/ytshen_data/GUIOdyssey}"
-export ANDROID_CONTROL_CURATED_ROOT="${ANDROID_CONTROL_CURATED_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated}"
-export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated/images}"
+if [[ -z "${MIND2WEB_IMAGE_ROOT:-}" && -d "${MIND2WEB_DATA_ROOT}/mind2web_images/ming2web_images" ]]; then
+  export MIND2WEB_IMAGE_ROOT="${MIND2WEB_DATA_ROOT}/mind2web_images/ming2web_images"
+else
+  export MIND2WEB_IMAGE_ROOT="${MIND2WEB_IMAGE_ROOT:-${MIND2WEB_DATA_ROOT}/mind2web_images}"
+fi
+export DATA_ROOT="${DATA_ROOT:-/public/ljkang/datasets/GUIOdyssey}"
+export ANDROID_CONTROL_CURATED_EVAL_MODE="${ANDROID_CONTROL_CURATED_EVAL_MODE:-official}"
+export ANDROID_CONTROL_CURATED_ROOT="${ANDROID_CONTROL_CURATED_ROOT:-/public/ytshen/AndroidControl_Curated}"
+export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-/public/ytshen/AndroidControl_Curated/images}"
 
 mkdir -p "${WORK_DIR}"; stamp="$(date +%Y%m%d_%H%M%S)"
 for dataset in ${DATASETS}; do

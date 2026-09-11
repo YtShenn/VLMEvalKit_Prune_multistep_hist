@@ -27,7 +27,7 @@ TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 # DATA="Mind2Web_test_task" 
 # WORK_DIR="OUTPUT_STLITE/outputs_mind2web_stlite_4B_ratio20"
 DATA="AITW_all" 
-WORK_DIR="OUTPUT_STLITE/outputs_aitw_stlite_4B"
+WORK_DIR="OUTPUT_STLITE/outputs_aitw_stlite_4B_flops2"
 
 
 export GUI_ODYSSEY_ROOT="${GUI_ODYSSEY_ROOT:-/public/ljkang/datasets/GUIOdyssey}"

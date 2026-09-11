@@ -95,14 +95,19 @@ def uniform_extra_indices(length: int, selected: torch.Tensor, count: int) -> to
 
 
 def make_merge_plan(features: torch.Tensor, *, min_keep: int, max_keep: int, iqr_multiplier: float,
-                    variant: str, similarity_temperature: float = 1.0) -> MergePlan:
+                    variant: str, similarity_temperature: float = 1.0,
+                    retain_ratio: float | None = None) -> MergePlan:
     """Build a selection and similarity-based aggregation partition for one block."""
     if features.ndim != 2:
         raise ValueError("features must have shape [tokens, hidden]")
     n = int(features.shape[0])
     scores = visual_saliency(features)
-    keep = select_iqr(scores, min_keep, max_keep, iqr_multiplier)
-    if variant == "prumerge_plus" and keep.numel() < min(n, max_keep):
+    if retain_ratio is None:
+        keep = select_iqr(scores, min_keep, max_keep, iqr_multiplier)
+    else:
+        keep_count = min(n, max(1, int(math.ceil(n * float(retain_ratio)))))
+        keep = torch.topk(scores.float(), k=keep_count).indices.sort().values
+    if retain_ratio is None and variant == "prumerge_plus" and keep.numel() < min(n, max_keep):
         extra_budget = min(int(keep.numel()), min(n, max_keep) - int(keep.numel()))
         keep = torch.cat((keep, uniform_extra_indices(n, keep, extra_budget))).unique(sorted=True)
     if not keep.numel():

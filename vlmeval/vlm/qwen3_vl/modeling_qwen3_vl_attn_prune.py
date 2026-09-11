@@ -3669,6 +3669,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                                 iqr_multiplier=prumerge_cfg.iqr_multiplier,
                                 variant=prumerge_cfg.variant,
                                 similarity_temperature=prumerge_cfg.similarity_temperature,
+                                retain_ratio=prumerge_cfg.retain_ratio,
                             )
                         plans.append(plan)
                         offset += length
@@ -3677,6 +3678,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                     self.config.text_config._prumerge_last_stats = {
                         "implementation": "Qwen3VL-PruMerge-inspired",
                         "variant": prumerge_cfg.variant, "scope": prumerge_cfg.scope,
+                        "retain_ratio_requested": prumerge_cfg.retain_ratio,
                         "prune_applied": False, "fallback": False, "reason": "ready",
                         "visual_tokens_before": int(sum(lengths)),
                         "visual_tokens_after": int(sum(record["tokens_after"] for record in records)),

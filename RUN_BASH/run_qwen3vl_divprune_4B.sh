@@ -8,14 +8,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6}"
 export SEED="${SEED:-42}"
 export PYTHONHASHSEED="${PYTHONHASHSEED:-42}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-7}"
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct-DivPrune}"
-DATASETS="${DATASETS:-AndroidControl_Curated_High_Task_Improved}"
+DATASETS="${DATASETS:-AITW_all Mind2Web_test_task GUIOdyssey_high_task_split AndroidControl_Curated_High_Task_Improved}"
 
 export DIVPRUNE_ENABLED="${DIVPRUNE_ENABLED:-1}"
 export DIVPRUNE_KEEP_RATIO="${DIVPRUNE_KEEP_RATIO:-0.098}"
@@ -57,18 +57,18 @@ export VLM_TIMING_VERBOSE="${VLM_TIMING_VERBOSE:-1}"
 # Task-level small-sample mode. Keep it off for a full benchmark; a compact
 # smoke run can use e.g. VLM_EVAL_SAMPLE_MODE=task VLM_EVAL_SAMPLE_TASKS=5
 # VLM_EVAL_SAMPLE_COUNT=20. The evaluator owns the exact sampling semantics.
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-all}"
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-5}"
 export VLM_EVAL_SAMPLE_COUNT="${VLM_EVAL_SAMPLE_COUNT:-20}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
 # Dataset locations. Each value may be overridden by the launching shell.
-export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_annots}"
-export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/mnt/storage2/Datasets/aitw_data/aitw_images}"
+export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/public/ytshen/aitw_data/aitw_annots}"
+export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/public/ytshen/aitw_data/aitw_images}"
 export AITW_SPLIT="${AITW_SPLIT:-test}"
 export AITW_WITH_NO_HISTORY="${AITW_WITH_NO_HISTORY:-0}"
 export AITW_SEMANTIC_ACTION_PROMPT="${AITW_SEMANTIC_ACTION_PROMPT:-0}"
-export MIND2WEB_DATA_ROOT="${MIND2WEB_DATA_ROOT:-/mnt/storage2/Datasets/Mind2Web}"
+export MIND2WEB_DATA_ROOT="${MIND2WEB_DATA_ROOT:-/public/ytshen/Mind2Web}"
 export MIND2WEB_ANN_ROOT="${MIND2WEB_ANN_ROOT:-${MIND2WEB_DATA_ROOT}/mind2web_annots}"
 if [[ -z "${MIND2WEB_IMAGE_ROOT:-}" && -d "${MIND2WEB_DATA_ROOT}/mind2web_images/ming2web_images" ]]; then
   export MIND2WEB_IMAGE_ROOT="${MIND2WEB_DATA_ROOT}/mind2web_images/ming2web_images"
@@ -77,10 +77,10 @@ else
 fi
 export MIND2WEB_WITH_NO_HISTORY="${MIND2WEB_WITH_NO_HISTORY:-0}"
 export MIND2WEB_STRICT_OUTPUT_PROMPT="${MIND2WEB_STRICT_OUTPUT_PROMPT:-1}"
-export DATA_ROOT="${DATA_ROOT:-/mnt/storage2/users/ytshen_data/GUIOdyssey}"
+export DATA_ROOT="${DATA_ROOT:-/public/ljkang/datasets/GUIOdyssey}"
 export ANDROID_CONTROL_CURATED_EVAL_MODE="${ANDROID_CONTROL_CURATED_EVAL_MODE:-official}"
-export ANDROID_CONTROL_CURATED_ROOT="${ANDROID_CONTROL_CURATED_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated}"
-export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-/mnt/storage2/users/ytshen_data/AndroidControl_Curated/images}"
+export ANDROID_CONTROL_CURATED_ROOT="${ANDROID_CONTROL_CURATED_ROOT:-/public/ytshen/AndroidControl_Curated}"
+export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:-/public/ytshen/AndroidControl_Curated/images}"
 
 require_dataset_files() {
   local dataset="$1"

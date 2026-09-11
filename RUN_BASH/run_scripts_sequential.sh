@@ -45,9 +45,28 @@ DEFAULT_SCRIPTS=(
     # "RUN_BASH/run_qwen3vl_guipruner_mind2web.sh"
     # "RUN_BASH/run_qwen3vl_histprune_odyssey.sh"
     # "RUN_BASH/run_qwen3vl_guipruner_odyssey.sh"
-    "RUN_BASH/run_qwen3vl_fastv_4B_android.sh"
+    # "RUN_BASH/run_qwen3vl_fastv_4B_android.sh"
+    # "RUN_BASH/run_qwen3vl_fastv_4B_aitw.sh"
+    # "RUN_BASH/run_qwen3vl_fastv_4B_mind2web.sh"
+    "RUN_BASH/run_android_control_history_baseline_hist4_no_hist.sh"
+    "RUN_BASH/run_qwen3vl_sparsevlm_android_4B.sh"
+    "RUN_BASH/run_qwen3vl_sparsevlm_aitw_4B.sh"
+    "RUN_BASH/run_qwen3vl_sparsevlm_mind2web_4B.sh"
+    "RUN_BASH/run_qwen3vl_prumerge_android_4B.sh"
+    "RUN_BASH/run_qwen3vl_prumerge_aitw_4B.sh"
+    "RUN_BASH/run_qwen3vl_prumerge_mind2web_4B.sh"
+    "RUN_BASH/run_qwen3vl_divprune_android_4B.sh"
+    "RUN_BASH/run_qwen3vl_divprune_aitw_4B.sh"
+    "RUN_BASH/run_qwen3vl_divprune_mind2web_4B.sh"
+
+    # 测试一下之前的flops影响大不大
+    "RUN_BASH/run_qwen3vl_guikv_4B_aitw.sh"
+    "RUN_BASH/run_qwen3_vl_stlite_4B_aitw.sh"
+    "RUN_BASH/run_qwen3vl_histprune_aitw.sh"
+    "RUN_BASH/run_qwen3vl_guipruner_aitw.sh"
     "RUN_BASH/run_qwen3vl_fastv_4B_aitw.sh"
-    "RUN_BASH/run_qwen3vl_fastv_4B_mind2web.sh"
+
+
 
 )
 

@@ -12,7 +12,12 @@ from .official_eval import (
     evaluate_android_control_records_official,
     use_official_android_control_eval,
 )
-from .state_packet import build_state_packet, state_packet_debug_enabled, state_packet_enabled
+from .state_packet import (
+    build_state_packet,
+    history_ablation_mode,
+    state_packet_debug_enabled,
+    state_packet_enabled,
+)
 from ..utils.current_delta_packet import DeltaPacketConfig, build_current_delta_packet
 
 
@@ -25,6 +30,25 @@ Instruction:
 Observe screenshot(s) carefully and propose the most possible element in screenshot1 with bbox_2d[x1, y1, x2, y2] and action_type that can make screenshot1 finish the following Task.
 
 Task: {Question}. Past_Actions: {past_actions}.
+
+Output_format:
+<answer>{{"bbox_2d": [x1, y1, x2, y2], "action_type": ACTION_TYPE}}</answer>
+
+NOTES:
+- Output inside <answer> tag should always in JSON FORMAT.
+- [x1, y1, x2, y2] should be absolute screen coordinates.
+- ACTION_TYPE includes: "click", "long_press", "swipe:up", "swipe:down", "swipe:left", "swipe:right", "input_text: some text", "wait", "navigate_back", "navigate_home", "open_app:app_name".
+- ONLY "click" and "long_press" need bbox_2d; others only need ACTION_TYPE.
+""".strip()
+
+
+# Used only by the strict ``none`` ablation.  Keeping it separate rather than
+# formatting ``Past_Actions: None`` ensures no history-specific text is sent.
+PROMPT_TEMPLATE_NO_HISTORY = """
+Instruction:
+Observe screenshot(s) carefully and propose the most possible element in screenshot1 with bbox_2d[x1, y1, x2, y2] and action_type that can make screenshot1 finish the following Task.
+
+Task: {Question}.
 
 Output_format:
 <answer>{{"bbox_2d": [x1, y1, x2, y2], "action_type": ACTION_TYPE}}</answer>
@@ -345,6 +369,10 @@ class AndroidControlCurated(ImageBaseDataset):
         self.meta_only = True
         self.skip_noimg = skip_noimg
         self.img_root = self._resolve_image_root()
+        # Opt-in ablations.  ``legacy`` preserves the old flag semantics and
+        # prompt construction exactly; the other modes are intentionally
+        # self-contained so an experiment cannot accidentally retain images.
+        self.history_ablation_mode = history_ablation_mode()
         self.include_history_screenshots = (
             _env_flag("ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS", "0")
             if include_history_screenshots is None
@@ -353,6 +381,12 @@ class AndroidControlCurated(ImageBaseDataset):
         self.sequential_order = _sequential_order_enabled()
         self.history_keep_prompt_template = _keep_prompt_template_enabled()
         self.use_history_state_packet = state_packet_enabled()
+        if self.history_ablation_mode in {"none", "text"}:
+            self.include_history_screenshots = False
+        elif self.history_ablation_mode in {"thumbnail", "roi"}:
+            # These modes specifically request compressed history images.
+            self.include_history_screenshots = True
+            self.use_history_state_packet = True
         self.use_current_delta_packet = _current_delta_packet_enabled()
         self._state_packet_records = []
         self._current_delta_packet_records = []
@@ -953,6 +987,7 @@ class AndroidControlCurated(ImageBaseDataset):
         )
         print(f"[AndroidControlDebug] history_images={history_image_paths}", flush=True)
         print(f"[AndroidControlDebug] history_text={history_text}", flush=True)
+        print(f"[AndroidControlDebug] history_ablation_mode={self.history_ablation_mode}", flush=True)
         if self.use_history_state_packet:
             print("[AndroidControlDebug] history_state_packet_enabled=1", flush=True)
         print("[AndroidControlDebug] prompt_begin", flush=True)
@@ -977,12 +1012,19 @@ class AndroidControlCurated(ImageBaseDataset):
         history_action_packets = self._resolve_history_action_packets(line)
         history = self._format_history_actions(history_action_texts)
         if not self.include_history_screenshots:
-            prompt = PROMPT_TEMPLATE.format(Question=instruction, past_actions=str(line.get("history", "")))
+            # In ``none`` mode this must not fall back to the annotation's
+            # serialized ``history`` field: that field contains past actions.
+            if self.history_ablation_mode == "none":
+                past_actions = ""
+                prompt = PROMPT_TEMPLATE_NO_HISTORY.format(Question=instruction)
+            else:
+                past_actions = str(line.get("history", ""))
+                prompt = PROMPT_TEMPLATE.format(Question=instruction, past_actions=past_actions)
             self._maybe_debug_print_prompt(
                 line=line,
                 current_image_path=current_image_path,
                 history_image_paths=[],
-                history_text=str(line.get("history", "")),
+                history_text=past_actions,
                 prompt=prompt,
             )
             return [dict(type="image", value=current_image_path), dict(type="text", value=prompt)]

@@ -31,6 +31,33 @@ def state_packet_enabled() -> bool:
     return _env_flag("ANDROID_CONTROL_STATE_PACKET_ENABLE", "0")
 
 
+def history_ablation_mode() -> str:
+    """Return the opt-in history ablation mode.
+
+    ``legacy`` deliberately remains the default so existing launch scripts keep
+    their exact prompt/image protocol.  The visual modes are interpreted by
+    both the dataset prompt builder and this packet builder.
+    """
+    mode = os.environ.get("ANDROID_CONTROL_HISTORY_ABLATION_MODE", "legacy").strip().lower()
+    aliases = {"": "legacy", "default": "legacy", "full": "legacy", "none": "none", "text": "text",
+               "thumbnail": "thumbnail", "thumb": "thumbnail", "roi": "roi"}
+    return aliases.get(mode, "legacy")
+
+
+def state_packet_image_mode() -> str:
+    """Select which images a history state packet exposes.
+
+    The ablation switch takes precedence.  The packet-specific switch is
+    intentionally optional, allowing controlled packet experiments without
+    changing the prompt-level history policy.
+    """
+    ablation_mode = history_ablation_mode()
+    if ablation_mode in {"thumbnail", "roi"}:
+        return ablation_mode
+    mode = os.environ.get("ANDROID_CONTROL_STATE_PACKET_IMAGE_MODE", "both").strip().lower()
+    return {"thumb": "thumbnail", "thumbnail": "thumbnail", "roi": "roi"}.get(mode, "both")
+
+
 def state_packet_debug_enabled() -> bool:
     return _env_flag("ANDROID_CONTROL_STATE_PACKET_DEBUG", "0")
 
@@ -261,7 +288,14 @@ def build_state_packet(
     )
 
     total_s = time.perf_counter() - t0
-    packet_tokens = int(thumb_img.estimated_tokens + roi_img.estimated_tokens)
+    image_mode = state_packet_image_mode()
+    if image_mode == "thumbnail":
+        packet_images = [thumb_img]
+    elif image_mode == "roi":
+        packet_images = [roi_img]
+    else:
+        packet_images = [thumb_img, roi_img]
+    packet_tokens = int(sum(item.estimated_tokens for item in packet_images))
     debug_enabled = state_packet_debug_enabled()
     meta = {
         "sample_index": str(sample_index),
@@ -271,6 +305,7 @@ def build_state_packet(
         "action_type": str(action_packet.get("gt_action", "") or ""),
         "original_estimated_tokens": int(orig_tokens),
         "packet_estimated_tokens": int(packet_tokens),
+        "packet_image_mode": image_mode,
         "thumbnail_estimated_tokens": int(thumb_img.estimated_tokens),
         "roi_estimated_tokens": int(roi_img.estimated_tokens),
         "open_image_s": float(open_s),
@@ -305,4 +340,4 @@ def build_state_packet(
             f"open_s={open_s:.6f} thumb_s={thumb_s:.6f} roi_s={roi_s:.6f} total_s={total_s:.6f}",
             flush=True,
         )
-    return [thumb_img, roi_img], meta
+    return packet_images, meta

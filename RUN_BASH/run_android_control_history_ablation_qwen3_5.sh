@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
@@ -28,7 +28,7 @@ export QWEN3VL_ENABLE_ROI_PRUNE=0
 export QWEN3VL_ROI_PRUNE_USE_CACHE="${QWEN3VL_ROI_PRUNE_USE_CACHE:-1}"
 export QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE="${QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE:-1}"
 
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-off}"
 export VLM_EVAL_SAMPLE_TASKS="20" #"${VLM_EVAL_SAMPLE_TASKS:-50}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
@@ -38,8 +38,8 @@ DATASET_LIST=(
     "AndroidControl_Curated_High_Task_Improved"
 )
 # DATASETS=("${DATASETS:-AndroidControl_Curated_High_Point AndroidControl_Curated_High_Task_Improved}")
-PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/qwen3_5/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/conda/envs/qwen3_5/bin/torchrun}"
 TS="$(date +%Y%m%d_%H%M%S)"
 
 run_one() {
@@ -49,7 +49,7 @@ run_one() {
   local max_history="$4"
   local keep_prompt="$5"
   local port="$6"
-  local work_dir="OUTPUT/ablation_android_control_${tag}_20task_node5_0806_offcial_eval"
+  local work_dir="OUTPUT_ABLATION_HIST/ablation_android_control_${tag}_0911"
   local log_file="run_output_${TS}_android_control_ablation_${tag}_qwen3_5.log"
 
   export ANDROID_CONTROL_USE_HISTORY_SCREENSHOTS="${use_history}"
@@ -72,7 +72,7 @@ run_one() {
     echo "[Ablation] sample_seed=${VLM_EVAL_SAMPLE_SEED}"
   } | tee -a "${log_file}"
 
-  "${TORCHRUN_BIN}" --standalone --nproc_per_node=1 --master_port="${port}" run.py \
+  "${TORCHRUN_BIN}" --standalone --nproc_per_node=7 --master_port="${port}" run.py \
     --data "${dataset_name}" \
     --model "${MODEL}" \
     --work-dir "${work_dir}/${dataset_name}" \

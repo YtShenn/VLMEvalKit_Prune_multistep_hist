@@ -17,7 +17,7 @@ export QWEN3VL_MAX_NEW_TOKENS="${QWEN3VL_MAX_NEW_TOKENS:-256}"
 
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct-STLite}"
 DATA="${DATA:-AndroidControl_Curated_High_Task_Improved}"
-WORK_DIR="${WORK_DIR:-OUTPUT_STLITE/outputs_android_stlite_4B_ratio35_official}"
+WORK_DIR="${WORK_DIR:-OUTPUT_STLITE/outputs_android_stlite_4B_ratio35_official_flops2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-7}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"

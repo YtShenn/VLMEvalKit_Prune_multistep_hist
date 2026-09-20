@@ -26,8 +26,8 @@ export MIND2WEB_STATE_PACKET_ROI_SHORT_SIDE_RATIO="${MIND2WEB_STATE_PACKET_ROI_S
 export MIND2WEB_STATE_PACKET_ROI_MIN_SIDE_PX="${MIND2WEB_STATE_PACKET_ROI_MIN_SIDE_PX:-160}"
 
 export TAG="${TAG:-hist4_state_packet_fast_decode}"
-# export PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-# export TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+# export PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/qwen3_5/bin/python}"
+# export TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/conda/envs/qwen3_5/bin/torchrun}"
 
 bash RUN_BASH/run_mind2web_4B.sh
 

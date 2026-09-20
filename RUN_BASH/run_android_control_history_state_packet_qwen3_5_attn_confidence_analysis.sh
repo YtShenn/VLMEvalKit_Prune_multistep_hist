@@ -75,8 +75,8 @@ MODEL="${MODEL:-Qwen3-VL-4B-Instruct-AttnPrune}"
 DATASET_LIST=(
     "AndroidControl_Curated_High_Task_Improved"
 )
-PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/qwen3_5/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/conda/envs/qwen3_5/bin/torchrun}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
 TS="$(date +%Y%m%d_%H%M%S)"
 TAG="${TAG:-hist4_keep_system_prompt_state_packet_attn_conf_observe_layers${QWEN3VL_ATTN_CONF_LAYERS//,/}_0830_high_all}"

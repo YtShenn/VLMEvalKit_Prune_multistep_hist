@@ -5,5 +5,5 @@ set -euo pipefail
 # GUI-Odyssey annotations with history length four before running.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export DATASETS="${DATASETS:-GUIOdyssey_high_task_split}"
-export WORK_DIR="${WORK_DIR:-OUTPUT_HISTPRUNE/4B_gui_odyssey}"
+export WORK_DIR="${WORK_DIR:-OUTPUT_HISTPRUNE/4B_gui_odyssey_flops2}"
 exec bash "${ROOT_DIR}/RUN_BASH/run_qwen3vl_histprune_4datasets_4B.sh"

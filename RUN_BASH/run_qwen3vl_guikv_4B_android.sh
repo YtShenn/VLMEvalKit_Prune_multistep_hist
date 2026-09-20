@@ -17,7 +17,7 @@ export QWEN3VL_ANDROID_DENORM_BASE="${QWEN3VL_ANDROID_DENORM_BASE:-1000}"
 
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct-GUIKV}"
 DATA="${DATA:-AndroidControl_Curated_High_Task_Improved}"
-WORK_DIR="${WORK_DIR:-OUTPUT_GUIKV/outputs_android_guikv_4B}"
+WORK_DIR="${WORK_DIR:-OUTPUT_GUIKV/outputs_android_guikv_4B_flops2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-7}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"

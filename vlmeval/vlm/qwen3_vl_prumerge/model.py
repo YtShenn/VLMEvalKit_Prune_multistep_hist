@@ -64,21 +64,59 @@ class Qwen3VLPruMergeChat(Qwen3VLChat):
         self._publish()
 
     def _publish(self) -> None:
-        outer = getattr(self.model.config, "text_config", None)
-        inner = getattr(getattr(self.model, "model", None), "language_model", None)
-        for cfg in (outer, getattr(inner, "config", None)):
-            if cfg is not None:
-                cfg._prumerge_enabled = bool(self.prumerge_config.enabled)
-                cfg._prumerge_config = self.prumerge_config
+        """Publish runtime flags to every config object used during generate.
+
+        Transformers may keep distinct config references on the conditional
+        generation wrapper, its multimodal ``model`` child, and the text
+        decoder. Publishing only to the wrapper and decoder is insufficient
+        when generation has copied/rebound the multimodal config: that path
+        used to make PruMerge silently behave like the uncompressed baseline.
+        """
+        multimodal = getattr(self.model, "model", None)
+        decoder = getattr(multimodal, "language_model", None)
+        candidates = (
+            getattr(self.model, "config", None),
+            getattr(getattr(self.model, "config", None), "text_config", None),
+            getattr(multimodal, "config", None),
+            getattr(getattr(multimodal, "config", None), "text_config", None),
+            getattr(decoder, "config", None),
+        )
+        seen = set()
+        for cfg in candidates:
+            if cfg is None or id(cfg) in seen:
+                continue
+            seen.add(id(cfg))
+            cfg._prumerge_enabled = bool(self.prumerge_config.enabled)
+            cfg._prumerge_config = self.prumerge_config
 
     def generate_inner_transformers(self, message, dataset=None, **kwargs):
         limited_message = truncate_history_steps(list(message), self.prumerge_config.max_history_steps)
         self._publish()
         self._prumerge_last_sample_stats = None
+        for cfg in (
+            getattr(getattr(self.model, "config", None), "text_config", None),
+            getattr(getattr(getattr(self.model, "model", None), "config", None), "text_config", None),
+            getattr(getattr(getattr(self.model, "model", None), "language_model", None), "config", None),
+        ):
+            if cfg is not None:
+                setattr(cfg, "_prumerge_last_stats", None)
+                setattr(cfg, "_prumerge_token_meta", None)
         try:
             return super().generate_inner_transformers(limited_message, dataset=dataset, **kwargs)
         finally:
-            cfg = getattr(self.model.config, "text_config", None)
-            stats = getattr(cfg, "_prumerge_last_stats", None) if cfg is not None else None
-            if isinstance(stats, dict):
-                self._prumerge_last_sample_stats = deepcopy(stats)
+            # Prefer the multimodal config where the prefill plan is built,
+            # then fall back to the decoder config where it is applied.
+            multimodal = getattr(self.model, "model", None)
+            decoder = getattr(multimodal, "language_model", None)
+            candidates = (
+                getattr(getattr(self.model, "config", None), "text_config", None),
+                getattr(getattr(multimodal, "config", None), "text_config", None),
+                getattr(decoder, "config", None),
+            )
+            for cfg in candidates:
+                stats = getattr(cfg, "_prumerge_last_stats", None) if cfg is not None else None
+                if isinstance(stats, dict):
+                    self._prumerge_last_sample_stats = deepcopy(stats)
+                    break
+            if self.prumerge_config.debug:
+                print(f"[PruMergeDebug] final_stats={self._prumerge_last_sample_stats}", flush=True)

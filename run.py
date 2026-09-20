@@ -271,6 +271,10 @@ def main():
     else:
         assert len(args.data), '--data should be a list of data files'
 
+    # Phase/timing telemetry belongs to one run. A fresh invocation must not
+    # restore records from an earlier run that used the same work directory.
+    os.environ["VLM_RESTORE_TELEMETRY"] = "1" if args.reuse else "0"
+
     if RANK == 0:
         if not args.reuse:
             logger.warning('--reuse is not set, will not reuse previous (before one day) temporary files')

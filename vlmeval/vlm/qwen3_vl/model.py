@@ -728,12 +728,10 @@ class _RuntimeTrackingHooks:
             inputs_embeds = args[4]
         q_len = _extract_seq_len(input_ids=input_ids, inputs_embeds=inputs_embeds)
         cache_len = _extract_cache_len(past_key_values)
-        is_prefill = _is_prefill_step_runtime(
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-        )
+        # Cache metadata is unreliable here: upstream generate can retain a
+        # zero-based cache_position or recreate its cache every decode step.
+        # The first text-model forward is prefill; all later forwards decode.
+        is_prefill = not self.prefill_seen
         if self.use_cuda_events:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
@@ -1405,15 +1403,14 @@ def _populate_generate_timing_fallback(
     template_meta = dict(template_meta or {})
     total_s = float(stage_record.get('total_s', 0.0) or 0.0)
     vision_s = float(stage_record.get('vision_s', 0.0) or 0.0)
-    llm_s = max(0.0, float(stage_record.get('llm_s', total_s - vision_s) or 0.0))
     decode_tokens = max(0, int(decode_tokens or 0))
     runtime.update(
         {
             'vision_s': vision_s,
-            'prefill_s': llm_s,
+            'prefill_s': 0.0,  # Stage timing cannot split prefill from decode.
             'decode_s': 0.0,
             'decode_steps': decode_tokens,
-            'prefill_before_prune_layer_s': llm_s,
+            'prefill_before_prune_layer_s': 0.0,
             'prefill_split_to_prune_start_s': 0.0,
             'prune_layer_to_prefill_end_s': 0.0,
             'split_layer_to_prefill_end_without_prune_s': 0.0,
@@ -1424,7 +1421,8 @@ def _populate_generate_timing_fallback(
             'prompt_seq_tokens': int(prompt_seq_tokens or 0),
             'decode_tokens': decode_tokens,
             'timing_fallback': True,
-            'timing_fallback_reason': 'non_timing_model_or_missing_forward_stats',
+            'timing_source': 'stage_only_no_phase_split',
+            'timing_fallback_reason': 'phase_timing_unavailable; llm_s_is_not_prefill',
             'template_prefill_enabled': bool(template_meta.get('template_prefill_enabled', False)),
             'template_prefill_fallback_reason': template_meta.get('template_prefill_fallback_reason'),
             'template_static_token_count': int(template_meta.get('template_static_token_count', 0) or 0),
@@ -2002,7 +2000,10 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
             prompt_seq_tokens = 0
             decode_tokens = 0
             runtime_tracking_enabled = (
-                _env_flag('QWEN3VL_RUNTIME_TRACKING', '0')
+                # Timing summaries require phase-level LLM hooks; stage timing
+                # alone only exposes the combined LLM duration.
+                (_env_flag('QWEN3VL_RUNTIME_TRACKING', '0')
+                 or _env_flag('VLM_TIMING', '0') or stage_timing)
                 and not _use_qwen3vl_timing_model()
             )
             runtime_tracker = None

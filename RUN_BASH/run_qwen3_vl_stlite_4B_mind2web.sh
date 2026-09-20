@@ -25,7 +25,7 @@ TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 # DATA="GUIOdyssey_high_random_split" 
 # WORK_DIR="OUTPUT_STLITE/outputs_guiodyssey_stlite_4B_ratio20"
 DATA="Mind2Web_test_task" 
-WORK_DIR="OUTPUT_STLITE/outputs_mind2web_stlite_4B"
+WORK_DIR="OUTPUT_STLITE/outputs_mind2web_stlite_4B_flops2"
 # DATA="AITW_all" 
 # WORK_DIR="OUTPUT_STLITE/outputs_aitw_stlite_4B_ratio20"
 

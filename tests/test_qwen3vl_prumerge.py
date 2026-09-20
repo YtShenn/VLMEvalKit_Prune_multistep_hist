@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
-from vlmeval.vlm.qwen3_vl_prumerge.model import truncate_history_steps
+from vlmeval.vlm.qwen3_vl_prumerge.config import PruMergeConfig
+from vlmeval.vlm.qwen3_vl_prumerge.model import Qwen3VLPruMergeChat, truncate_history_steps
 from vlmeval.vlm.qwen3_vl_prumerge.token import (
     aggregate_features,
     aggregate_visual_blocks,
@@ -101,3 +104,23 @@ def test_scope_isolated():
     assert scope_block_indices(3, "current") == {2}
     assert scope_block_indices(3, "history") == {0, 1}
     assert scope_block_indices(3, "all") == {0, 1, 2}
+
+
+def test_publish_reaches_wrapper_multimodal_and_decoder_configs():
+    # Generation may use different config instances at these three levels.
+    wrapper_cfg = SimpleNamespace()
+    multimodal_cfg = SimpleNamespace()
+    decoder_cfg = SimpleNamespace()
+    chat = object.__new__(Qwen3VLPruMergeChat)
+    chat.prumerge_config = PruMergeConfig(enabled=True, retain_ratio=0.4)
+    chat.model = SimpleNamespace(
+        config=SimpleNamespace(text_config=wrapper_cfg),
+        model=SimpleNamespace(
+            config=SimpleNamespace(text_config=multimodal_cfg),
+            language_model=SimpleNamespace(config=decoder_cfg),
+        ),
+    )
+    chat._publish()
+    for cfg in (wrapper_cfg, multimodal_cfg, decoder_cfg):
+        assert cfg._prumerge_enabled is True
+        assert cfg._prumerge_config is chat.prumerge_config

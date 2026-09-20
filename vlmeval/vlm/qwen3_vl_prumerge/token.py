@@ -30,7 +30,8 @@ def contiguous_visual_blocks(visual_mask: torch.Tensor | None) -> list[torch.Ten
     if not pos.numel():
         return []
     split = torch.where(pos[1:] != pos[:-1] + 1)[0] + 1
-    return list(torch.tensor_split(pos, split))
+    # PyTorch requires tensor_split index tensors on CPU for CUDA inputs.
+    return list(torch.tensor_split(pos, split.cpu()))
 
 
 def scope_block_indices(num_blocks: int, scope: str) -> set[int]:

@@ -1718,6 +1718,11 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         # visual mask and every DeepStack feature tensor in the same reduced
         # order.  It is deliberately a no-op for decoding/cache forwards.
         prumerge_cfg = getattr(self.config, "_prumerge_config", None)
+        # Some generation wrappers filter experimental forward kwargs. The
+        # outer multimodal model publishes this plan on the decoder config as
+        # a prefill-only fallback transport.
+        if prumerge_token_meta is None:
+            prumerge_token_meta = getattr(self.config, "_prumerge_token_meta", None)
         prumerge_enabled = bool(
             getattr(self.config, "_prumerge_enabled", False)
             and prumerge_cfg is not None
@@ -1726,6 +1731,17 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             and inputs_embeds.shape[0] == 1
             and visual_pos_masks is not None
         )
+        if getattr(prumerge_cfg, "debug", False):
+            visual_count = int(visual_pos_masks.sum().item()) if visual_pos_masks is not None else 0
+            print(
+                "[PruMergeDecoderDebug] "
+                f"enabled_flag={int(bool(getattr(self.config, '_prumerge_enabled', False)))} "
+                f"meta_present={int(prumerge_token_meta is not None)} "
+                f"visual_mask_present={int(visual_pos_masks is not None)} "
+                f"visual_tokens={visual_count} batch={int(inputs_embeds.shape[0])} "
+                f"training={int(self.training)} active={int(prumerge_enabled)}",
+                flush=True,
+            )
         if prumerge_enabled:
             try:
                 from ..qwen3_vl_prumerge.token import aggregate_visual_blocks
@@ -1783,11 +1799,15 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     "merge_sec": float(time.perf_counter() - merge_start),
                 })
                 setattr(self.config, "_prumerge_last_stats", stats)
+                if getattr(prumerge_cfg, "debug", False):
+                    print(f"[PruMergeDecoderDebug] applied_stats={stats}", flush=True)
             except Exception as exc:
                 stats = dict(getattr(self.config, "_prumerge_last_stats", {}) or {})
                 stats.update({"prune_applied": False, "fallback": True,
                               "reason": f"compression_failed:{type(exc).__name__}"})
                 setattr(self.config, "_prumerge_last_stats", stats)
+                if getattr(prumerge_cfg, "debug", False):
+                    print(f"[PruMergeDecoderDebug] failed={type(exc).__name__}: {exc}", flush=True)
         if is_prefill_forward:
             setattr(self.config, "_attn_prune_cache_position_offset", 0)
 
@@ -3636,6 +3656,23 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             and inputs_embeds.shape[0] == 1
             and prumerge_prefill
         )
+        if getattr(prumerge_cfg, "debug", False):
+            visual_count = int(visual_pos_masks.sum().item()) if visual_pos_masks is not None else 0
+            print(
+                "[PruMergeDebug] "
+                f"outer_enabled={int(bool(getattr(self.config.text_config, '_prumerge_enabled', False)))} "
+                f"config_present={int(prumerge_cfg is not None)} "
+                f"visual_mask_present={int(visual_pos_masks is not None)} "
+                f"visual_tokens={visual_count} batch={int(inputs_embeds.shape[0])} "
+                f"prefill={int(prumerge_prefill)} active={int(prumerge_enabled)}",
+                flush=True,
+            )
+        # Once prefill has built a PruMerge result, later decode forwards
+        # must never replace it with their mask-free fallback state.
+        existing_prumerge_stats = getattr(self.config.text_config, "_prumerge_last_stats", None)
+        prumerge_prefill_recorded = isinstance(existing_prumerge_stats, dict) and bool(
+            existing_prumerge_stats.get("visual_tokens_before", 0)
+        )
         if prumerge_enabled:
             try:
                 from ..qwen3_vl_prumerge.token import (
@@ -3691,8 +3728,44 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
                     "implementation": "Qwen3VL-PruMerge-inspired", "prune_applied": False,
                     "fallback": True, "reason": f"plan_build_failed:{type(exc).__name__}",
                 }
-        self.language_model.config._prumerge_enabled = prumerge_enabled
+                if getattr(prumerge_cfg, "debug", False):
+                    print(f"[PruMergeOuterDebug] plan_build_failed={type(exc).__name__}: {exc}", flush=True)
+        elif bool(getattr(self.config.text_config, "_prumerge_enabled", False)) and not prumerge_prefill_recorded:
+            # Do not silently masquerade as an uncompressed baseline. This
+            # record is collected by inference.py into summary.json.
+            if prumerge_cfg is None:
+                reason = "config_missing"
+            elif visual_pos_masks is None:
+                reason = "visual_mask_missing"
+            elif not prumerge_prefill:
+                reason = "no_visual_tokens_in_forward"
+            elif inputs_embeds.shape[0] != 1:
+                reason = "unsupported_batch_size"
+            else:
+                reason = "prefill_not_eligible"
+            self.config.text_config._prumerge_last_stats = {
+                "implementation": "Qwen3VL-PruMerge-inspired",
+                "prune_applied": False,
+                "fallback": True,
+                "reason": reason,
+                "visual_tokens_before": int(visual_pos_masks.sum().item()) if visual_pos_masks is not None else 0,
+                "visual_tokens_after": int(visual_pos_masks.sum().item()) if visual_pos_masks is not None else 0,
+            }
+        # Keep the configured flag alive for decode calls. The text model also
+        # requires ``prumerge_token_meta`` to compress, so this cannot prune a
+        # decode token; it only preserves the prefill result and configuration.
+        self.language_model.config._prumerge_enabled = bool(
+            getattr(self.config.text_config, "_prumerge_enabled", False) and prumerge_cfg is not None
+        )
         self.language_model.config._prumerge_config = prumerge_cfg
+        self.language_model.config._prumerge_token_meta = prumerge_token_meta
+        if getattr(prumerge_cfg, "debug", False):
+            print(
+                "[PruMergeOuterDebug] "
+                f"plan_present={int(prumerge_token_meta is not None)} "
+                f"decoder_plan_present={int(getattr(self.language_model.config, '_prumerge_token_meta', None) is not None)}",
+                flush=True,
+            )
         histprune_enabled = bool(getattr(self.config.text_config, "_histprune_enabled", False))
         histprune_cfg = getattr(self.config.text_config, "_histprune_config", None)
         if histprune_enabled:

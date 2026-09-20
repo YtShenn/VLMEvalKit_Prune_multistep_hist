@@ -13,8 +13,8 @@ export MIND2WEB_STATE_PACKET_ROI_MIN_SIDE_PX="${MIND2WEB_STATE_PACKET_ROI_MIN_SI
 export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE:-0}"
 
 TAG="${TAG:-hist2_state_packet}"
-PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/qwen3_5/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/conda/envs/qwen3_5/bin/torchrun}"
 
 bash RUN_BASH/run_qwen3vl_mind2web_4B.sh
 

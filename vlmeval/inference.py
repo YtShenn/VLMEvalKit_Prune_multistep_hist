@@ -447,7 +447,10 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         res.update(_load_partial_result(out_file, {}))
 
     telemetry_path = f"{out_file}.telemetry.pkl"
-    telemetry = _load_telemetry(telemetry_path)
+    restore_telemetry = os.getenv('VLM_RESTORE_TELEMETRY', '1') == '1'
+    # Fresh runs must not aggregate timing records emitted by an earlier run
+    # that happened to use the same output directory.
+    telemetry = _load_telemetry(telemetry_path) if restore_telemetry else {'samples': {}}
     telemetry_samples = telemetry.get("samples", {}) if isinstance(telemetry.get("samples", {}), dict) else {}
     restored_timing = [tuple(v["timing"]) for v in telemetry_samples.values() if isinstance(v, dict) and isinstance(v.get("timing"), (list, tuple)) and len(v["timing"]) == 2]
     restored_infer = [tuple(v["infer"]) for v in telemetry_samples.values() if isinstance(v, dict) and isinstance(v.get("infer"), (list, tuple)) and len(v["infer"]) == 2]

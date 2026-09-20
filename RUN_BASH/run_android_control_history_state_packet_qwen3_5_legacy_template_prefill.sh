@@ -64,8 +64,8 @@ MODEL="${MODEL:-Qwen3-VL-4B-Instruct}"
 DATASET_LIST=(
     "AndroidControl_Curated_High_Task_Improved"
 )
-PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/qwen3_5/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/conda/envs/qwen3_5/bin/torchrun}"
 TS="$(date +%Y%m%d_%H%M%S)"
 TAG="${TAG:-hist4_keep_system_prompt_state_packet_legacy_cache_template_prefill_official}"
 WORK_DIR="${WORK_DIR:-OUTPUT/ablation_android_control_${TAG}_node3_0812(only_HTI)}"

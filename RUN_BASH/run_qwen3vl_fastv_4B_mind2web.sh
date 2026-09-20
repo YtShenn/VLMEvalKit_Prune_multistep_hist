@@ -17,7 +17,7 @@ MODEL="${MODEL:-Qwen3-VL-4B-Instruct-FastV}"
 # DATASETS="${DATASETS:-AITW_all}"
 DATASETS="${DATASETS:-Mind2Web_test_task}"
 # DATASETS="${DATASETS:-GUIOdyssey_high_task_split}"
-WORK_DIR="${WORK_DIR:-OUTPUT_FASTV/4B_hist4_k${FASTV_K:-2}_r${FASTV_R:-0.5}}"
+WORK_DIR="${WORK_DIR:-OUTPUT_FASTV/4B_hist4_k${FASTV_K:-2}_r${FASTV_R:-0.5}_flops2}"
 
 # Official FastV controls. R is the discard ratio over all five images.
 export FASTV_ENABLED="${FASTV_ENABLED:-1}"

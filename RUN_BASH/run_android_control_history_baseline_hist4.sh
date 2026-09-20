@@ -82,8 +82,8 @@ DATASET_LIST=(
 if [[ -z "${PYTHON_BIN:-}" ]]; then
   if [[ -x /opt/conda/envs/qwen3_5/bin/python ]]; then
     PYTHON_BIN=/opt/conda/envs/qwen3_5/bin/python
-  elif [[ -x /home/ytshen/anaconda3/envs/qwen3_5/bin/python ]]; then
-    PYTHON_BIN=/home/ytshen/anaconda3/envs/qwen3_5/bin/python
+  elif [[ -x /opt/conda/envs/qwen3_5/bin/python ]]; then
+    PYTHON_BIN=/opt/conda/envs/qwen3_5/bin/python
   elif command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python3)"
   else
@@ -97,8 +97,8 @@ if [[ -z "${TORCHRUN_BIN:-}" ]]; then
     TORCHRUN_BIN="${PYTHON_ENV_BIN_DIR}/torchrun"
   elif [[ -x /opt/conda/envs/qwen3_5/bin/torchrun ]]; then
     TORCHRUN_BIN=/opt/conda/envs/qwen3_5/bin/torchrun
-  elif [[ -x /home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun ]]; then
-    TORCHRUN_BIN=/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun
+  elif [[ -x /opt/conda/envs/qwen3_5/bin/torchrun ]]; then
+    TORCHRUN_BIN=/opt/conda/envs/qwen3_5/bin/torchrun
   elif command -v torchrun >/dev/null 2>&1; then
     TORCHRUN_BIN="$(command -v torchrun)"
   else

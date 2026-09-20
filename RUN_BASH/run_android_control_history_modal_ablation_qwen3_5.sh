@@ -6,10 +6,10 @@
 set -euo pipefail
 
 # ============================ Edit this block ============================
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
 export ANDROID_CONTROL_CURATED_EVAL_MODE=official
-export ANDROID_CONTROL_CURATED_ROOT="/mnt/storage2/users/ytshen_data/AndroidControl_Curated"
-export ANDROID_CONTROL_CURATED_IMAGE_ROOT="/mnt/storage2/users/ytshen_data/AndroidControl_Curated/images"
+export ANDROID_CONTROL_CURATED_ROOT="/public/ytshen/AndroidControl_Curated"
+export ANDROID_CONTROL_CURATED_IMAGE_ROOT="/public/ytshen/AndroidControl_Curated/images"
 export ANDROID_CONTROL_SEQUENTIAL_ORDER=1
 
 # Print the complete prompt for every sample.  The output includes
@@ -52,7 +52,7 @@ export VLM_PRUNE_TIMING=1
 export SEED=42
 
 # Set VLM_EVAL_SAMPLE_MODE=all for a complete evaluation.
-export VLM_EVAL_SAMPLE_MODE=task
+export VLM_EVAL_SAMPLE_MODE=off
 export VLM_EVAL_SAMPLE_TASKS=5
 export VLM_EVAL_SAMPLE_SEED=42
 
@@ -60,18 +60,18 @@ MODEL="Qwen3-VL-4B-Instruct"
 DATASET_LIST=(
   "AndroidControl_Curated_High_Task_Improved"
 )
-# HISTORY_ABLATION_MODES=(none text)
-# HISTORY_ABLATION_MODES=(thumbnail roi legacy)
-HISTORY_ABLATION_MODES=(legacy)
+HISTORY_ABLATION_MODES=(text thumbnail roi none)
+# HISTORY_ABLATION_MODES=(thumbnail roi legacy none)
+# HISTORY_ABLATION_MODES=(legacy)
 # 默认 legacy
 # export ANDROID_CONTROL_HISTORY_ABLATION_MODE=none       # 无历史文本、无历史图像
 # export ANDROID_CONTROL_HISTORY_ABLATION_MODE=text       # 仅历史动作文本
 # export ANDROID_CONTROL_HISTORY_ABLATION_MODE=thumbnail  # 历史动作文本 + 每步仅缩略图
 # export ANDROID_CONTROL_HISTORY_ABLATION_MODE=roi        # 历史动作文本 + 每步仅 ROI
-PYTHON_BIN="/home/ytshen/anaconda3/envs/qwen3_5/bin/python"
-TORCHRUN_BIN="/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun"
+PYTHON_BIN="/opt/conda/envs/qwen3_5/bin/python"
+TORCHRUN_BIN="/opt/conda/envs/qwen3_5/bin/torchrun"
 TAG="hist4_history_modal_ablation"
-WORK_DIR="OUTPUT/ablation_android_control_${TAG}"
+WORK_DIR="OUTPUT_HIST_ABLATION/ablation_android_control_${TAG}_newtime"
 TS="$(date +%Y%m%d_%H%M%S)"
 PORT_BASE=29720
 REUSE=0
@@ -105,7 +105,7 @@ run_one() {
     reuse_args+=(--reuse)
   fi
 
-  "${TORCHRUN_BIN}" --standalone --nproc_per_node=1 --master_port="${port}" run.py \
+  "${TORCHRUN_BIN}" --standalone --nproc_per_node=7 --master_port="${port}" run.py \
     --data "${dataset_name}" \
     --model "${MODEL}" \
     --work-dir "${output_dir}" \

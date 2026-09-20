@@ -70,6 +70,7 @@ export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
 # Dataset locations for multi-step GUI datasets. Ordinary VLMEvalKit datasets
 # use their normal configuration/.env paths and are deliberately not blocked.
+export GUI_ODYSSEY_ROOT="${GUI_ODYSSEY_ROOT:-/public/ljkang/datasets/GUIOdyssey}"
 export AITW_ANN_ROOT="${AITW_ANN_ROOT:-/public/ytshen/aitw_data/aitw_annots}"
 export AITW_IMAGE_ROOT="${AITW_IMAGE_ROOT:-/public/ytshen/aitw_data/aitw_images}"
 export AITW_SPLIT="${AITW_SPLIT:-test}"

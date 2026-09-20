@@ -90,8 +90,8 @@ DATASET_LIST=(
     # "AndroidControl_Curated_High_Point"
     "AndroidControl_Curated_High_Task_Improved"
 )
-PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
-TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
+PYTHON_BIN="${PYTHON_BIN:-/opt/conda/envs/qwen3_5/bin/python}"
+TORCHRUN_BIN="${TORCHRUN_BIN:-/opt/conda/envs/qwen3_5/bin/torchrun}"
 TS="$(date +%Y%m%d_%H%M%S)"
 TAG="${TAG:-hist4_keep_system_prompt_state_packet_current_delta_structured_fast_official}"
 WORK_DIR="${WORK_DIR:-OUTPUT/ablation_android_control_${TAG}_node5_0816(only_HTI)_ratio2}"

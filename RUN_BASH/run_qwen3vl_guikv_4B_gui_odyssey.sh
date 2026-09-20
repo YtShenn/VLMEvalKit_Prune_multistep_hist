@@ -43,7 +43,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-torchrun}"
 
 DATA="GUIOdyssey_high_random_split"
-WORK_DIR="OUTPUT_GUIKV/outputs_guiodyssey_guikv_4B"
+WORK_DIR="OUTPUT_GUIKV/outputs_guiodyssey_guikv_4B_flops2"
 # DATA="Mind2Web_test_task"
 # WORK_DIR="OUTPUT_GUIKV/outputs_mind2web_guikv_4B"
 # DATA="AITW_general"

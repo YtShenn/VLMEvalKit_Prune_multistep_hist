@@ -421,7 +421,25 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         res.update(load(out_file))
 
     rank, world_size = get_rank_and_world_size()
+    live_history_predictions = bool(
+        'AndroidControl_Curated' in str(dataset_name)
+        and str(os.getenv('ANDROID_CONTROL_HISTORY_ACTION_SOURCE', 'gt')).strip().lower()
+        in ('pred', 'prediction', 'actual', 'free_running')
+    )
+    if live_history_predictions and world_size != 1:
+        raise ValueError(
+            'ANDROID_CONTROL_HISTORY_ACTION_SOURCE=prediction requires --nproc 1: '
+            'each trajectory must be generated in chronological order by one process.'
+        )
     base_data = _maybe_apply_eval_sampling(dataset.data, dataset_name, rank=rank)
+    if live_history_predictions and hasattr(dataset, 'record_actual_prediction'):
+        # Resume runs have no opportunity to regenerate completed prefix
+        # steps.  Replay their saved outputs into the same online cache before
+        # building the first unfinished prompt.
+        for _, completed_row in base_data.iterrows():
+            completed_response = res.get(completed_row['index'])
+            if completed_response is not None:
+                dataset.record_actual_prediction(completed_row, completed_response)
     sheet_indices = build_sheet_indices(len(base_data), rank, world_size)
     lt = len(sheet_indices)
     data = base_data.iloc[sheet_indices]
@@ -461,6 +479,11 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
 
     is_api = getattr(model, 'is_api', False)
     if is_api:
+        if live_history_predictions:
+            raise ValueError(
+                'ANDROID_CONTROL_HISTORY_ACTION_SOURCE=prediction is not supported for API batch inference; '
+                'it needs per-step generation and online history updates.'
+            )
         lt, indices = len(data), list(data['index'])
         supp = infer_data_api(
             model=model,
@@ -508,6 +531,7 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         'roi_prune_uniform_keep_every': int(os.getenv('QWEN3VL_ROI_PRUNE_UNIFORM_KEEP_EVERY', '0') or 0),
         'roi_prune_uniform_keep_offset': int(os.getenv('QWEN3VL_ROI_PRUNE_UNIFORM_KEEP_OFFSET', '0') or 0),
         'roi_prune_use_cache': bool(os.getenv('QWEN3VL_ROI_PRUNE_USE_CACHE', '0') == '1'),
+        'android_history_action_source': str(os.getenv('ANDROID_CONTROL_HISTORY_ACTION_SOURCE', 'gt') or 'gt'),
         'eval_sample_mode': str(os.getenv('VLM_EVAL_SAMPLE_MODE', 'off') or 'off'),
         'eval_sample_tasks': int(os.getenv('VLM_EVAL_SAMPLE_TASKS', os.getenv('VLM_EVAL_SAMPLE_COUNT', '200')) or 200),
         'eval_sample_seed': int(os.getenv('VLM_EVAL_SAMPLE_SEED', os.getenv('SEED', '42')) or 42),
@@ -561,6 +585,10 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
                 response = f'{FAIL_MSG}: {type(err)} {str(err)}'
         else:
             response = model.generate(message=struct, dataset=dataset_name, **extra_kwargs) # jingyz1
+        if live_history_predictions and hasattr(dataset, 'record_actual_prediction'):
+            # `response` has already passed Qwen's Android coordinate
+            # de-normalization, so its box is in the source screenshot space.
+            dataset.record_actual_prediction(data.iloc[i], response)
         stlite_stats = getattr(model, "_stlite_last_sample_stats", None)
         if isinstance(stlite_stats, dict):
             stlite_sample_stats.append(dict(stlite_stats))

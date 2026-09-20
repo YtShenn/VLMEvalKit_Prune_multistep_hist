@@ -123,6 +123,20 @@ def _current_delta_debug_enabled() -> bool:
     return _env_flag("ANDROID_CONTROL_CURRENT_DELTA_PACKET_DEBUG", "0")
 
 
+def _history_action_source() -> str:
+    """Choose whether history packets use annotations or the live trajectory.
+
+    ``gt`` is deliberately the default, preserving all existing experiments.
+    ``prediction`` is free-running: only responses already generated in this
+    process may affect a later history ROI; an invalid response gets a neutral
+    crop rather than silently falling back to GT.
+    """
+    value = os.environ.get("ANDROID_CONTROL_HISTORY_ACTION_SOURCE", "gt").strip().lower()
+    aliases = {"gt": "gt", "gold": "gt", "annotation": "gt", "pred": "prediction",
+               "prediction": "prediction", "actual": "prediction", "free_running": "prediction"}
+    return aliases.get(value, "gt")
+
+
 def _current_delta_cache_dir() -> str:
     root = os.environ.get("ANDROID_CONTROL_CURRENT_DELTA_PACKET_CACHE_DIR", "").strip()
     if root:
@@ -388,6 +402,11 @@ class AndroidControlCurated(ImageBaseDataset):
             self.include_history_screenshots = True
             self.use_history_state_packet = True
         self.use_current_delta_packet = _current_delta_packet_enabled()
+        self.history_action_source = _history_action_source()
+        # Absolute history-image path -> parsed response packet.  This is
+        # intentionally instance-local: free-running evaluation must not leak
+        # actions between trajectories or between independent processes.
+        self._actual_prediction_packets = {}
         self._state_packet_records = []
         self._current_delta_packet_records = []
         self.max_history_images = max(
@@ -524,14 +543,16 @@ class AndroidControlCurated(ImageBaseDataset):
         running = []
         for _, row in group.iterrows():
             prev_packets.append([dict(x) for x in running])
-            gt_bbox = row.get("gt_max_bbox", None)
-            if gt_bbox is None:
-                gt_bbox = row.get("gt_min_bbox", None)
+            # State-packet ROIs should focus on the acted-on UI element.  The
+            # dataset's ``gt_max_bbox`` is an evaluation acceptance region and
+            # can span almost the full screen, so it must not drive cropping.
+            gt_bbox = row.get("gt_min_bbox", None)
             packet = {
                 "gt_action": row.get("gt_action", ""),
                 "gt_coordinate": row.get("gt_coordinate", None),
                 "gt_bbox": gt_bbox,
                 "step_instruction": self._format_step_action_text(row),
+                "source_image_path": str(row.get("image_path", "")),
             }
             running.append(packet)
         return prev_packets
@@ -624,6 +645,11 @@ class AndroidControlCurated(ImageBaseDataset):
         return self._infer_history_from_current_image(current_image_path, limit=limit)
 
     def _resolve_history_action_texts(self, line) -> List[str]:
+        if self.history_action_source == "prediction":
+            return [
+                str(packet.get("step_instruction", "") or "").strip()
+                for packet in self._resolve_history_action_packets(line)
+            ]
         texts = line.get("_prev_action_texts", None)
         if isinstance(texts, list):
             return [str(x).strip() for x in texts if str(x).strip()]
@@ -633,7 +659,76 @@ class AndroidControlCurated(ImageBaseDataset):
         packets = line.get("_prev_action_packets", None)
         if not isinstance(packets, list):
             return []
-        return [dict(x) for x in packets if isinstance(x, dict)]
+        resolved = [dict(x) for x in packets if isinstance(x, dict)]
+        if self.history_action_source != "prediction":
+            return resolved
+        # Never use an annotation as a fallback in prediction mode.  A missing
+        # packet remains neutral so the measurement includes error propagation.
+        for packet in resolved:
+            path = str(packet.get("source_image_path", "") or "")
+            predicted = self._actual_prediction_packets.get(path)
+            if predicted is not None:
+                packet.update(predicted)
+            else:
+                packet.update({
+                    "gt_action": "",
+                    "gt_coordinate": None,
+                    "gt_bbox": None,
+                    "step_instruction": "[no generated prediction available]",
+                    "roi_action_source": "prediction_missing",
+                })
+        return resolved
+
+    @staticmethod
+    def _prediction_packet(response) -> dict:
+        """Parse an already post-processed AndroidControl response for ROI use."""
+        raw = str(response or "")
+        blocks = re.findall(r"<(?:answer|action)>(.*?)</(?:answer|action)>", raw, re.DOTALL)
+        candidate = blocks[-1].strip() if blocks else raw.strip()
+        try:
+            payload = _safe_literal_eval(candidate)
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            return {
+                "gt_action": "",
+                "gt_coordinate": None,
+                "gt_bbox": None,
+                "step_instruction": f"[generated response could not be parsed] {raw[:240]}",
+                "roi_action_source": "prediction_invalid",
+                "actual_prediction": raw,
+            }
+        action = payload.get("action_type", payload.get("type", ""))
+        bbox = None
+        for key in ("bbox_2d", "bbox"):
+            if key in payload:
+                bbox = _safe_literal_eval(payload[key]) if isinstance(payload[key], str) else payload[key]
+                break
+        point = None
+        for key in ("point", "coordinate"):
+            if key in payload:
+                point = _safe_literal_eval(payload[key]) if isinstance(payload[key], str) else payload[key]
+                break
+        valid = bool(str(action or "").strip())
+        return {
+            "gt_action": str(action or ""),
+            "gt_coordinate": point,
+            "gt_bbox": bbox,
+            "step_instruction": f"[generated] action_type: {action}; bbox_2d: {bbox}; point: {point}",
+            "roi_action_source": "prediction" if valid else "prediction_invalid",
+            "actual_prediction": raw,
+        }
+
+    def record_actual_prediction(self, line, response) -> None:
+        """Commit one generated action so later steps of its trajectory can use it."""
+        if self.history_action_source != "prediction":
+            return
+        if isinstance(line, int):
+            line = self.data.iloc[line]
+        image_path = str(line.get("image_path", "") or "")
+        if not image_path:
+            return
+        self._actual_prediction_packets[image_path] = self._prediction_packet(response)
 
     def _format_history_actions(self, action_texts: List[str]) -> str:
         if not action_texts:
@@ -695,9 +790,9 @@ class AndroidControlCurated(ImageBaseDataset):
     def _build_current_gt_packet(self, line) -> dict:
         # Visualization-only GT payload; it is not inserted into the model
         # prompt and only helps audit whether selected ROIs cover the target.
-        gt_bbox = line.get("gt_max_bbox", None)
-        if gt_bbox is None:
-            gt_bbox = line.get("gt_min_bbox", None)
+        # Use the tight UI-element annotation for visual diagnostics.  In
+        # contrast, the official evaluator intentionally uses gt_max_bbox.
+        gt_bbox = line.get("gt_min_bbox", None)
         return {
             "gt_action": line.get("gt_action", ""),
             "gt_bbox": gt_bbox,
@@ -802,6 +897,10 @@ class AndroidControlCurated(ImageBaseDataset):
             thumb_s = float(sum(float(r.get("thumbnail_build_s", 0.0) or 0.0) for r in recs))
             roi_s = float(sum(float(r.get("roi_build_s", 0.0) or 0.0) for r in recs))
             total_s = float(sum(float(r.get("state_packet_total_s", 0.0) or 0.0) for r in recs))
+            roi_action_source_counts = {}
+            for record in recs:
+                source = str(record.get("roi_action_source", "gt") or "gt")
+                roi_action_source_counts[source] = roi_action_source_counts.get(source, 0) + 1
             summary.update(
                 {
                     "state_packet_enabled": bool(self.use_history_state_packet),
@@ -821,6 +920,7 @@ class AndroidControlCurated(ImageBaseDataset):
                     "total_state_packet_thumbnail_build_s": float(thumb_s),
                     "total_state_packet_roi_build_s": float(roi_s),
                     "total_state_packet_total_s": float(total_s),
+                    "state_packet_roi_action_source_counts": roi_action_source_counts,
                 }
             )
         current_recs = list(getattr(self, "_current_delta_packet_records", []) or [])

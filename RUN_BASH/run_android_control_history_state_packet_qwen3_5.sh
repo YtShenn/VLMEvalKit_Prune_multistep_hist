@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=3
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
@@ -60,7 +60,7 @@ export ANDROID_CONTROL_STATE_PACKET_ROI_MIN_SIDE_PX="${ANDROID_CONTROL_STATE_PAC
 MODEL="${MODEL:-Qwen3-VL-4B-Instruct}"
 DATASET_LIST=(
     # "AndroidControl_Curated_High_Point"
-    "AndroidControl_Curated_High_Task_Improved"
+    "${DATASET_LIST_OVERRIDE:-AndroidControl_Curated_High_Task_Improved}"
 )
 PYTHON_BIN="${PYTHON_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/python}"
 TORCHRUN_BIN="${TORCHRUN_BIN:-/home/ytshen/anaconda3/envs/qwen3_5/bin/torchrun}"
@@ -91,6 +91,7 @@ run_one() {
     echo "[Run] roi_long_edge=${ANDROID_CONTROL_STATE_PACKET_ROI_LONG_EDGE}"
     echo "[Run] roi_short_side_ratio=${ANDROID_CONTROL_STATE_PACKET_ROI_SHORT_SIDE_RATIO}"
     echo "[Run] roi_min_side_px=${ANDROID_CONTROL_STATE_PACKET_ROI_MIN_SIDE_PX}"
+    echo "[Run] history_action_source=${ANDROID_CONTROL_HISTORY_ACTION_SOURCE:-gt}"
     echo "[Run] flops_profile=${QWEN3VL_PROFILE_FLOPS}"
     echo "[Run] template_prefill=${QWEN3VL_ENABLE_TEMPLATE_PREFILL}"
     echo "[Run] structured_fast_decode=${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE}"

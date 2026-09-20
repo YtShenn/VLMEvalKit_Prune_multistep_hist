@@ -223,4 +223,4 @@ LOGS*/
 *.zip
 OUTPUT*/
 OUTPUT_0*/
-VISUALIZE/
+VISUALIZE/figures/

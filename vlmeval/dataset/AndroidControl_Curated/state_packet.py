@@ -303,6 +303,7 @@ def build_state_packet(
         "source_image_path": str(image_path),
         "action_text": str(action_packet.get("step_instruction", "") or ""),
         "action_type": str(action_packet.get("gt_action", "") or ""),
+        "roi_action_source": str(action_packet.get("roi_action_source", "gt") or "gt"),
         "original_estimated_tokens": int(orig_tokens),
         "packet_estimated_tokens": int(packet_tokens),
         "packet_image_mode": image_mode,
@@ -326,6 +327,7 @@ def build_state_packet(
                 "roi_crop_xyxy": list(roi_img.crop_xyxy) if roi_img.crop_xyxy is not None else None,
                 "gt_coordinate": action_packet.get("gt_coordinate", None),
                 "gt_bbox": action_packet.get("gt_bbox", None),
+                "actual_prediction": action_packet.get("actual_prediction", None),
             }
         )
         print(

@@ -1,5 +1,7 @@
 import json
 import os
+import ast
+import re
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -87,6 +89,10 @@ def _state_packet_debug_enabled() -> bool:
     return _env_flag("AITW_STATE_PACKET_DEBUG", os.getenv("ANDROID_CONTROL_STATE_PACKET_DEBUG", "0"))
 
 
+def _history_prompt_debug_enabled() -> bool:
+    return _env_flag("AITW_DEBUG_HISTORY_PROMPT", "0")
+
+
 def _structured_fast_decode_enabled() -> bool:
     return _env_flag("QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE", "0")
 
@@ -96,6 +102,26 @@ def _semantic_action_prompt_enabled() -> bool:
     if value in {"auto", ""}:
         return _structured_fast_decode_enabled()
     return value in {"1", "true", "yes", "on", "semantic", "text"}
+
+
+def _history_action_source() -> str:
+    return "prediction" if os.getenv("AITW_HISTORY_ACTION_SOURCE", "gt").strip().lower() in {"pred", "prediction", "actual", "free_running"} else "gt"
+
+
+def _history_ablation_mode() -> str:
+    """Return the AITW history modality ablation mode.
+
+    ``legacy`` preserves the pre-existing protocol (full screenshot history or
+    thumbnail + ROI state packets when enabled).  The remaining modes mirror
+    the AndroidControl modal ablation semantics.
+    """
+    mode = os.getenv("AITW_HISTORY_ABLATION_MODE", "legacy").strip().lower()
+    aliases = {
+        "": "legacy", "default": "legacy", "full": "legacy",
+        "none": "none", "text": "text", "thumbnail": "thumbnail",
+        "thumb": "thumbnail", "roi": "roi",
+    }
+    return aliases.get(mode, "legacy")
 
 
 def _sync_android_state_packet_env_from_aitw() -> None:
@@ -117,6 +143,10 @@ def _sync_android_state_packet_env_from_aitw() -> None:
         aitw_name = f"AITW_{suffix}"
         android_name = f"ANDROID_CONTROL_{suffix}"
         os.environ[android_name] = _env_with_fallback(aitw_name, android_name, default)
+    # The shared builder owns the image-mode selection.  Scope its Android
+    # compatibility variable to the AITW mode for this worker process.
+    mode = _history_ablation_mode()
+    os.environ["ANDROID_CONTROL_HISTORY_ABLATION_MODE"] = mode
 
 
 class AndroidInTheWild(ImageBaseDataset):
@@ -138,7 +168,15 @@ class AndroidInTheWild(ImageBaseDataset):
         self.img_root = os.getenv("AITW_IMAGE_ROOT", "/mnt/storage2/Datasets/aitw_data/aitw_images")
         self.his_num = max(0, _env_int("AITW_HIS_NUM", 4))
         self.with_no_history = _env_flag("AITW_WITH_NO_HISTORY", "0")
-        self.use_history_state_packet = _state_packet_enabled()
+        self.history_ablation_mode = _history_ablation_mode()
+        # thumbnail/roi are packet-only visual conditions regardless of the
+        # legacy packet flag; legacy retains its existing opt-in behaviour.
+        self.use_history_state_packet = (
+            _state_packet_enabled()
+            or self.history_ablation_mode in {"thumbnail", "roi"}
+        )
+        self.history_action_source = _history_action_source()
+        self._actual_prediction_packets = {}
         self._state_packet_records = []
         self.prompt_origin = os.getenv("AITW_PROMPT_ORIGIN", DEFAULT_PROMPT_ORIGIN)
         self.skip_noimg = skip_noimg
@@ -246,6 +284,9 @@ class AndroidInTheWild(ImageBaseDataset):
         return [image_path]
 
     def _history_actions(self, line) -> List[str]:
+        if self.history_action_source == "prediction":
+            paths = line.get("_prev_image_paths", [])
+            return [str(self._actual_prediction_packets.get(str(p), {"step_instruction": "[no generated prediction available]"})["step_instruction"]) for p in paths[-self.his_num:]]
         key = "_prev_action_texts_semantic" if _semantic_action_prompt_enabled() else "_prev_action_texts"
         actions = line.get(key, [])
         if not isinstance(actions, list):
@@ -288,6 +329,11 @@ class AndroidInTheWild(ImageBaseDataset):
             return None
 
     def _action_packet_for_row(self, row, image_path: str) -> dict:
+        if self.history_action_source == "prediction":
+            return dict(self._actual_prediction_packets.get(str(image_path), {
+                "gt_action": "", "gt_coordinate": None, "gt_bbox": None,
+                "step_instruction": "[no generated prediction available]", "roi_action_source": "prediction_missing",
+            }))
         row_dict = row.to_dict() if hasattr(row, "to_dict") else dict(row)
         action = action_2_format(row_dict)
         image_size = self._image_size(image_path)
@@ -329,6 +375,22 @@ class AndroidInTheWild(ImageBaseDataset):
             "step_instruction": action2semantic_step(row_dict) if _semantic_action_prompt_enabled() else action2step(row_dict),
             "instruction": row_dict.get("instruction", row_dict.get("goal", "")),
         }
+
+    def record_actual_prediction(self, line, response) -> None:
+        if self.history_action_source != "prediction":
+            return
+        image_path = str(line.get("image_path", ""))
+        raw = str(response or "").strip()
+        try:
+            payload = ast.literal_eval(raw)
+        except Exception:
+            payload = {}
+        point = payload.get("click_point", payload.get("bbox_2d", payload.get("point"))) if isinstance(payload, dict) else None
+        size = self._image_size(image_path)
+        coord = None
+        if isinstance(point, (list, tuple)) and len(point) >= 2 and size:
+            coord = [float(point[0]) * size[0] / 1000.0, float(point[1]) * size[1] / 1000.0]
+        self._actual_prediction_packets[image_path] = {"gt_action": "click" if coord else "", "gt_coordinate": coord, "gt_bbox": None, "step_instruction": raw, "roi_action_source": "prediction", "actual_prediction": raw}
 
     def _previous_rows_for_history(self, line, history_image_paths: List[str]):
         if not history_image_paths:
@@ -396,10 +458,17 @@ class AndroidInTheWild(ImageBaseDataset):
             )
         return entries
 
-    def _build_prompt_text(self, instruction: str, history_images: List[str], history_actions: List[str]) -> str:
+    def _build_prompt_text(
+        self,
+        instruction: str,
+        history_images: List[str],
+        history_actions: List[str],
+        *,
+        include_history_visuals: bool,
+    ) -> str:
         prompt = self.prompt_origin.format(instruction)
         output_instruction = SEMANTIC_OUTPUT_INSTRUCTION if _semantic_action_prompt_enabled() else OUTPUT_INSTRUCTION
-        if self.with_no_history:
+        if not include_history_visuals:
             for i, action_text in enumerate(history_actions):
                 prompt += f"Step_{i}: {action_text} .\n"
             prompt += "Image_0:<image>\n"
@@ -413,6 +482,35 @@ class AndroidInTheWild(ImageBaseDataset):
         prompt += output_instruction
         return prompt
 
+    def _maybe_debug_print_prompt(self, line, msgs, *, history_actions: List[str], history_images: List[str]) -> None:
+        """Print the exact multimodal message order used for one sample."""
+        if not _history_prompt_debug_enabled():
+            return
+        print(
+            "[AITWPrompt] "
+            f"sample_index={line.get('index', '')} "
+            f"history_ablation_mode={self.history_ablation_mode} "
+            f"history_actions={len(history_actions)} "
+            f"history_images={len(history_images)} "
+            f"state_packet={int(self.use_history_state_packet)} "
+            f"message_images={sum(1 for x in msgs if x.get('type') == 'image')}",
+            flush=True,
+        )
+        print("[AITWPrompt] prompt_begin", flush=True)
+        for i, item in enumerate(msgs):
+            item_type = str(item.get("type", ""))
+            if item_type == "image":
+                print(
+                    f"[AITWPrompt] message_{i} image="
+                    f"{item.get('value', '')} "
+                    f"resized_width={item.get('resized_width', None)} "
+                    f"resized_height={item.get('resized_height', None)}",
+                    flush=True,
+                )
+            else:
+                print(f"[AITWPrompt] message_{i} {item_type}: {item.get('value', '')}", flush=True)
+        print("[AITWPrompt] prompt_end", flush=True)
+
     def build_prompt(self, line):
         if isinstance(line, int):
             line = self.data.iloc[line]
@@ -420,20 +518,45 @@ class AndroidInTheWild(ImageBaseDataset):
         instruction = str(line.get("instruction", line.get("goal", "")))
         history_actions = self._history_actions(line)
         history_images = self._history_images(line, image_path)
-        if not self.with_no_history and len(history_images) < len(history_actions):
+        include_history_visuals = (
+            not self.with_no_history
+            and self.history_ablation_mode not in {"none", "text"}
+        )
+        if self.history_ablation_mode == "none":
+            history_actions = []
+            history_images = []
+        elif not include_history_visuals:
+            history_images = []
+        if include_history_visuals and len(history_images) < len(history_actions):
             history_actions = history_actions[-len(history_images):] if history_images else []
-        prompt = self._build_prompt_text(instruction, history_images, history_actions)
+        prompt = self._build_prompt_text(
+            instruction,
+            history_images,
+            history_actions,
+            include_history_visuals=include_history_visuals,
+        )
 
-        if self.with_no_history:
+        if not include_history_visuals:
             msgs = [dict(type="image", value=image_path)]
             msgs.append(dict(type="text", value=prompt))
+            self._maybe_debug_print_prompt(
+                line,
+                msgs,
+                history_actions=history_actions,
+                history_images=history_images,
+            )
             return msgs
 
         history_rows = self._previous_rows_for_history(line, history_images)
         if len(history_rows) < len(history_images):
             history_images = history_images[-len(history_rows):] if history_rows else []
             history_actions = history_actions[-len(history_rows):] if history_rows else []
-            prompt = self._build_prompt_text(instruction, history_images, history_actions)
+            prompt = self._build_prompt_text(
+                instruction,
+                history_images,
+                history_actions,
+                include_history_visuals=True,
+            )
         history_entries = self._build_history_visual_entries(
             sample_index=str(line.get("index", "")),
             history_image_paths=history_images,
@@ -454,10 +577,17 @@ class AndroidInTheWild(ImageBaseDataset):
                 msgs.append(dict(image_item))
         msgs.append(dict(type="image", value=image_path))
         msgs.append(dict(type="text", value=prompt))
+        self._maybe_debug_print_prompt(
+            line,
+            msgs,
+            history_actions=history_actions,
+            history_images=history_images,
+        )
         if _state_packet_debug_enabled() or android_state_packet_debug_enabled():
             print(
                 "[AITWPrompt] "
                 f"sample_index={line.get('index', '')} "
+                f"history_ablation_mode={self.history_ablation_mode} "
                 f"history_images={len(history_images)} "
                 f"state_packet={int(self.use_history_state_packet)} "
                 f"message_images={sum(1 for x in msgs if x.get('type') == 'image')}",
@@ -466,7 +596,7 @@ class AndroidInTheWild(ImageBaseDataset):
         return msgs
 
     def summarize_state_packet_records(self):
-        summary = {}
+        summary = {"history_ablation_mode": self.history_ablation_mode}
         recs = list(getattr(self, "_state_packet_records", []) or [])
         if recs:
             count = float(len(recs))

@@ -16,6 +16,10 @@ SKIP_MISSING_IMAGE_MSG = '__SKIP_MISSING_IMAGE__'
 def _guiodyssey_debug_prompt_enabled():
     return os.environ.get('GUI_ODYSSEY_DEBUG_HISTORY_PROMPT', '0') == '1'
 
+
+def _history_action_source():
+    return 'prediction' if os.environ.get('GUI_ODYSSEY_HISTORY_ACTION_SOURCE', 'gt').strip().lower() in {'pred', 'prediction', 'actual', 'free_running'} else 'gt'
+
 def levenshtein_distance(s1, s2):
     if len(s1) > len(s2):
         s1, s2 = s2, s1
@@ -279,6 +283,8 @@ class GUIOdyssey(ImageBaseDataset):
         self.max_history_images = max(0, int(os.environ.get('GUI_ODYSSEY_MAX_HISTORY_IMAGES', '4')))
         self.history_keep_system_prompt = os.environ.get('GUI_ODYSSEY_HISTORY_KEEP_SYSTEM_PROMPT', '0') == '1'
         self.use_history_state_packet = state_packet_enabled()
+        self.history_action_source = _history_action_source()
+        self._actual_prediction_packets = {}
         self._state_packet_records = []
         if skeleton:
             return
@@ -446,6 +452,11 @@ class GUIOdyssey(ImageBaseDataset):
             return 'None'
         return '\n'.join([f'{i + 1}. {a}' for i, a in enumerate(history_actions)])
 
+    def record_actual_prediction(self, line, response):
+        if self.history_action_source != 'prediction':
+            return
+        self._actual_prediction_packets[self._resolve_image_path(line.get('image_path', line.get('image', '')))] = str(response or '').strip()
+
     def _build_history_visual_entries(self, sample_index, hist_images, history_actions):
         if not self.use_history_state_packet:
             entries = []
@@ -597,8 +608,11 @@ class GUIOdyssey(ImageBaseDataset):
             his_actions = []
         hist_pairs, history_debug = self._resolve_history_pairs(line, image_path, his_actions)
         hist_images = [x['image'] for x in hist_pairs]
+        if self.history_action_source == 'prediction':
+            his_actions = [self._actual_prediction_packets.get(path, '[no generated prediction available]') for path in hist_images]
         if hist_pairs:
-            his_actions = [x['action'] for x in hist_pairs if str(x.get('action', '')).strip()]
+            if self.history_action_source != 'prediction':
+                his_actions = [x['action'] for x in hist_pairs if str(x.get('action', '')).strip()]
         else:
             hist_images, history_debug = self._resolve_history_screenshots(
                 line,

@@ -48,6 +48,21 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _history_action_source() -> str:
+    return "prediction" if os.getenv("MIND2WEB_HISTORY_ACTION_SOURCE", "gt").strip().lower() in {"pred", "prediction", "actual", "free_running"} else "gt"
+
+
+def _history_ablation_mode() -> str:
+    """Return the opt-in Mind2Web history modality ablation mode."""
+    mode = os.getenv("MIND2WEB_HISTORY_ABLATION_MODE", "legacy").strip().lower()
+    aliases = {
+        "": "legacy", "default": "legacy", "full": "legacy",
+        "none": "none", "text": "text", "thumbnail": "thumbnail",
+        "thumb": "thumbnail", "roi": "roi",
+    }
+    return aliases.get(mode, "legacy")
+
+
 def _nonnull(value, default=""):
     if value is None:
         return default
@@ -165,7 +180,13 @@ class Mind2Web(ImageBaseDataset):
         self.top_k = max(0, _env_int("MIND2WEB_TOP_K", 0))
         self.with_no_history = _env_flag("MIND2WEB_WITH_NO_HISTORY", os.getenv("MIND2WEB_WITH_NO_HISTROY", "0"))
         self.strict_output_prompt = _env_flag("MIND2WEB_STRICT_OUTPUT_PROMPT", "1")
-        self.use_history_state_packet = state_packet_enabled()
+        self.history_ablation_mode = _history_ablation_mode()
+        self.use_history_state_packet = (
+            state_packet_enabled()
+            or self.history_ablation_mode in {"thumbnail", "roi"}
+        )
+        self.history_action_source = _history_action_source()
+        self._actual_prediction_packets = {}
         self.prompt_origin = os.getenv("MIND2WEB_PROMPT_ORIGIN", PROMPT_ORIGIN)
         self.skip_noimg = skip_noimg
         self._state_packet_records = []
@@ -300,6 +321,9 @@ class Mind2Web(ImageBaseDataset):
         return [image_path]
 
     def _history_actions(self, line) -> List[str]:
+        if self.history_action_source == "prediction":
+            paths = line.get("_prev_image_paths", [])
+            return [str(self._actual_prediction_packets.get(str(p), {"step_instruction": "[no generated prediction available]"})["step_instruction"]) for p in paths[-self.his_num:]]
         actions = line.get("_prev_action_texts", [])
         if not isinstance(actions, list):
             actions = []
@@ -319,6 +343,11 @@ class Mind2Web(ImageBaseDataset):
         return out
 
     def _action_packet_for_step(self, step: dict, image_path: str, answer: str) -> dict:
+        if self.history_action_source == "prediction":
+            return dict(self._actual_prediction_packets.get(str(image_path), {
+                "gt_action": "", "gt_coordinate": None, "gt_bbox": None,
+                "step_instruction": "[no generated prediction available]", "roi_action_source": "prediction_missing",
+            }))
         image_size = self._image_size(image_path)
         gt_coordinate = None
         gt_bbox = None
@@ -341,6 +370,20 @@ class Mind2Web(ImageBaseDataset):
             "gt_bbox": gt_bbox,
             "step_instruction": answer,
         }
+
+    def record_actual_prediction(self, line, response) -> None:
+        if self.history_action_source != "prediction":
+            return
+        image_path, raw = str(line.get("image_path", "")), str(response or "").strip()
+        try:
+            payload = ast.literal_eval(raw)
+        except Exception:
+            payload = {}
+        point = payload.get("click_point", payload.get("point")) if isinstance(payload, dict) else None
+        size, coord = self._image_size(image_path), None
+        if isinstance(point, (list, tuple)) and len(point) >= 2 and size:
+            coord = [float(point[0]) * size[0] / 1000.0, float(point[1]) * size[1] / 1000.0]
+        self._actual_prediction_packets[image_path] = {"gt_action": "click" if coord else "", "gt_coordinate": coord, "gt_bbox": None, "step_instruction": raw, "roi_action_source": "prediction", "actual_prediction": raw}
 
     def _previous_rows_for_history(self, line, history_image_paths: List[str]):
         if not history_image_paths:
@@ -414,11 +457,20 @@ class Mind2Web(ImageBaseDataset):
         image_path = self.dump_image(line)[0]
         history_actions = self._history_actions(line)
         history_images = self._history_images(line, image_path)
-        if not self.with_no_history and len(history_images) < len(history_actions):
+        include_history_visuals = (
+            not self.with_no_history
+            and self.history_ablation_mode not in {"none", "text"}
+        )
+        if self.history_ablation_mode == "none":
+            history_actions = []
+            history_images = []
+        elif not include_history_visuals:
+            history_images = []
+        if include_history_visuals and len(history_images) < len(history_actions):
             history_actions = history_actions[-len(history_images):] if history_images else []
         prompt = self.prompt_origin.format(str(line.get("instruction", "")))
 
-        if self.with_no_history:
+        if not include_history_visuals:
             msgs = [dict(type="text", value=prompt)]
             for i, action in enumerate(history_actions):
                 msgs.append(dict(type="text", value=f"Step_{i}: {action} .\n"))
@@ -458,7 +510,8 @@ class Mind2Web(ImageBaseDataset):
         if state_packet_debug_enabled():
             print(
                 "[Mind2WebPrompt] "
-                f"sample_index={line.get('index', '')} history_images={len(history_images)} "
+                f"sample_index={line.get('index', '')} history_ablation_mode={self.history_ablation_mode} "
+                f"history_images={len(history_images)} "
                 f"state_packet={int(self.use_history_state_packet)} "
                 f"message_images={sum(1 for x in msgs if x.get('type') == 'image')}",
                 flush=True,
@@ -468,12 +521,13 @@ class Mind2Web(ImageBaseDataset):
     def summarize_state_packet_records(self):
         recs = list(getattr(self, "_state_packet_records", []) or [])
         if not recs:
-            return {}
+            return {"history_ablation_mode": self.history_ablation_mode}
         count = float(len(recs))
         orig_tokens = float(sum(float(r.get("original_estimated_tokens", 0.0) or 0.0) for r in recs))
         packet_tokens = float(sum(float(r.get("packet_estimated_tokens", 0.0) or 0.0) for r in recs))
         total_s = float(sum(float(r.get("state_packet_total_s", 0.0) or 0.0) for r in recs))
         return {
+            "history_ablation_mode": self.history_ablation_mode,
             "state_packet_enabled": bool(self.use_history_state_packet),
             "state_packet_history_image_count": int(count),
             "avg_state_packet_original_estimated_tokens": float(orig_tokens / count),

@@ -47,6 +47,9 @@ export QWEN3VL_RUNTIME_TRACKING="${QWEN3VL_RUNTIME_TRACKING:-1}"
 
 export QWEN3VL_ENABLE_TEMPLATE_PREFILL="${QWEN3VL_ENABLE_TEMPLATE_PREFILL:-0}"
 export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE:-1}"
+# Bounds the normal model.generate() fallback when structured fast decode cannot
+# parse a slot. Without this override, Qwen3-VL-4B-Instruct defaults to 16384.
+export QWEN3VL_MAX_NEW_TOKENS="${QWEN3VL_MAX_NEW_TOKENS:-64}"
 export QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG="${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG:-1}"
 export QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG_POS="${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG_POS:-0}"
 export QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS="${QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS:-16}"
@@ -139,6 +142,7 @@ run_one() {
     echo "[Run] prune_timing=${VLM_PRUNE_TIMING}"
     echo "[Run] template_prefill=${QWEN3VL_ENABLE_TEMPLATE_PREFILL}"
     echo "[Run] structured_fast_decode=${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE}"
+    echo "[Run] max_new_tokens=${QWEN3VL_MAX_NEW_TOKENS}"
     echo "[Run] structured_fast_decode_debug=${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG}"
     echo "[Run] structured_fast_decode_debug_pos=${QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG_POS}"
     echo "[Run] structured_fast_decode_action_max_tokens=${QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS}"

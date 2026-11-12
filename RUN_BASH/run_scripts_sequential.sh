@@ -36,15 +36,15 @@ DEFAULT_SCRIPTS=(
     # "RUN_BASH/run_qwen3_vl_stlite_4B_aitw.sh"
     # "RUN_BASH/run_qwen3_vl_stlite_4B_android.sh"
     # "RUN_BASH/run_qwen3_vl_stlite_4B_mind2web.sh"
-    "RUN_BASH/run_qwen3_vl_stlite_4B_guiodyssey.sh"
+    # "RUN_BASH/run_qwen3_vl_stlite_4B_guiodyssey.sh"
     # "RUN_BASH/run_qwen3vl_histprune_android.sh"
     # "RUN_BASH/run_qwen3vl_histprune_aitw.sh"
     # "RUN_BASH/run_qwen3vl_histprune_mind2web.sh"
     # "RUN_BASH/run_qwen3vl_guipruner_android.sh"
     # "RUN_BASH/run_qwen3vl_guipruner_aitw.sh"
     # "RUN_BASH/run_qwen3vl_guipruner_mind2web.sh"
-    "RUN_BASH/run_qwen3vl_histprune_odyssey.sh"
-    "RUN_BASH/run_qwen3vl_guipruner_odyssey.sh"
+    # "RUN_BASH/run_qwen3vl_histprune_odyssey.sh"
+    # "RUN_BASH/run_qwen3vl_guipruner_odyssey.sh"
     # "RUN_BASH/run_qwen3vl_fastv_4B_android.sh"
     # "RUN_BASH/run_qwen3vl_fastv_4B_aitw.sh"
     # "RUN_BASH/run_qwen3vl_fastv_4B_mind2web.sh"
@@ -82,6 +82,22 @@ DEFAULT_SCRIPTS=(
     # "RUN_BASH/run_qwen3vl_sparsevlm_odyssey_4B.sh"
     # "RUN_BASH/run_qwen3vl_prumerge_odyssey_4B.sh"
     # "RUN_BASH/run_qwen3vl_divprune_odyssey_4B.sh"
+
+    # "RUN_BASH/run_aitw_history_roi_gt_vs_prediction.sh"
+    # "RUN_BASH/run_mind2web_history_roi_gt_vs_prediction.sh"
+
+    # "RUN_BASH/run_android_control_history_modal_ablation_qwen3_5.sh"
+    # "RUN_BASH/run_gui_odyssey_history_roi_gt_vs_prediction.sh"
+    
+    # "RUN_BASH/run_android_control_history_modal_ablation_qwen3_5.sh"
+    # "RUN_BASH/run_qwen3vl_aitw_4B_state_packet_only.sh"
+    # "RUN_BASH/run_aitw_history_modal_ablation_qwen3_5.sh"
+    # RUN_BASH/run_mind2web_history_modal_ablation_qwen3_5.sh
+
+    # "RUN_BASH/run_qwen3vl_aitw_4B_state_packet_only.sh"
+    # "RUN_BASH/run_qwen3vl_aitw_4B_fast_decode_only.sh"
+
+    "RUN_BASH/run_qwen3vl_guikv_4B_android.sh"
 
 )
 

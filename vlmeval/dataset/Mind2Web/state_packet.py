@@ -24,6 +24,16 @@ def state_packet_debug_enabled() -> bool:
     return _env_flag("MIND2WEB_STATE_PACKET_DEBUG", os.getenv("ANDROID_CONTROL_STATE_PACKET_DEBUG", "0"))
 
 
+def _history_ablation_mode() -> str:
+    mode = os.getenv("MIND2WEB_HISTORY_ABLATION_MODE", "legacy").strip().lower()
+    aliases = {
+        "": "legacy", "default": "legacy", "full": "legacy",
+        "none": "none", "text": "text", "thumbnail": "thumbnail",
+        "thumb": "thumbnail", "roi": "roi",
+    }
+    return aliases.get(mode, "legacy")
+
+
 def _sync_android_state_packet_env_from_mind2web() -> None:
     mapping = {
         "STATE_PACKET_ENABLE": "0",
@@ -40,6 +50,9 @@ def _sync_android_state_packet_env_from_mind2web() -> None:
         mind2web_name = f"MIND2WEB_{suffix}"
         android_name = f"ANDROID_CONTROL_{suffix}"
         os.environ[android_name] = _env_with_fallback(mind2web_name, android_name, default)
+    # The shared packet builder owns thumbnail/ROI selection. Keep this
+    # compatibility variable local to the Mind2Web worker process.
+    os.environ["ANDROID_CONTROL_HISTORY_ABLATION_MODE"] = _history_ablation_mode()
 
 
 def build_state_packet(*, image_path: str, action_packet: dict, sample_index: str, history_index: int):

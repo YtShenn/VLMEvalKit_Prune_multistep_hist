@@ -223,7 +223,14 @@ def _model_forward(
 
 def _decode_position_kwargs(model, past_key_values, q_len: int, device: torch.device) -> dict[str, torch.Tensor]:
     past_len = _cache_seq_len(past_key_values, 0)
-    positions = torch.arange(past_len, past_len + int(q_len), dtype=torch.long, device=device)
+    # GUIKV stores a physically shortened cache, but the retained keys have
+    # already been RoPE-rotated at their original prompt positions.  A
+    # continuation must therefore use the *logical* sequence length recorded
+    # on the cache, not the number of retained KV rows.  Using `past_len` here
+    # put SFD template tokens thousands of positions too early and caused the
+    # malformed bbox continuations seen with GUIKV.
+    logical_past_len = int(getattr(past_key_values, "_guikv_original_seq_length", past_len) or past_len)
+    positions = torch.arange(logical_past_len, logical_past_len + int(q_len), dtype=torch.long, device=device)
     kwargs = {"cache_position": positions}
     prune_offset = 0
 
@@ -245,7 +252,8 @@ def _decode_position_kwargs(model, past_key_values, q_len: int, device: torch.de
         kwargs["position_ids"] = base + delta
     if _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG_POS", "0"):
         print(
-            f"[StructuredFastDecodePos] past_len={past_len} q_len={int(q_len)} prune_offset={prune_offset}",
+            f"[StructuredFastDecodePos] physical_past_len={past_len} logical_past_len={logical_past_len} "
+            f"q_len={int(q_len)} prune_offset={prune_offset}",
             flush=True,
         )
     return kwargs
@@ -306,7 +314,13 @@ def _forward_token_ids(
         n_tok = int(ids.shape[1])
         if n_tok == 0:
             continue
-        attention_mask = _align_attention_mask_to_past(attention_mask, past_key_values, device)
+        # GUIKV's cache is physically compacted, whereas its generation
+        # wrapper keeps an attention mask on the original logical sequence.
+        # Preserve that mask here as well: shrinking it to the compressed KV
+        # length changes the causal-mask semantics during SFD continuation.
+        guikv_logical_cache = getattr(past_key_values, "_guikv_original_seq_length", None) is not None
+        if not guikv_logical_cache:
+            attention_mask = _align_attention_mask_to_past(attention_mask, past_key_values, device)
         new_mask = torch.ones((attention_mask.shape[0], n_tok), dtype=attention_mask.dtype, device=device)
         attention_mask = torch.cat([attention_mask, new_mask], dim=1)
         start = time.perf_counter()
@@ -343,7 +357,26 @@ def _append_static(
     else:
         ids = _tokenize(tokenizer, text, device)
     token_ids = [int(x) for x in ids[0].tolist()]
-    tokenwise = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_STATIC_TOKENWISE", "0")
+    # The paper SFD path appends each known template segment directly to the
+    # existing KV cache (rather than rebuilding the multimodal prompt). That
+    # is also the path used here. GUIKV has one extra cache invariant: its
+    # attention patch treats any q_len > 1 cache continuation as a fresh
+    # prefill and compresses the cache again. Feed a static segment token by
+    # token for GUIKV so every token is an ordinary decode continuation. It
+    # preserves the template/KV-cache semantics while avoiding a second GUIKV
+    # compression pass.
+    guikv_cache = getattr(past_key_values, "_guikv_original_seq_length", None) is not None
+    tokenwise = _env_flag(
+        "QWEN3VL_STRUCTURED_FAST_DECODE_STATIC_TOKENWISE",
+        "1" if guikv_cache else "0",
+    )
+    if _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0"):
+        print(
+            "[StructuredFastDecode] "
+            f"static_append mode={'tokenwise' if tokenwise else 'chunk'} "
+            f"guikv_cache={int(guikv_cache)} tokens={len(token_ids)}",
+            flush=True,
+        )
     return _forward_token_ids(
         model,
         token_ids=token_ids,
@@ -353,6 +386,18 @@ def _append_static(
         device=device,
         tokenwise=tokenwise,
     )
+
+
+def _static_forward_count(past_key_values, token_count: int) -> int:
+    """Return the actual number of cache-forward calls used for one segment."""
+    if int(token_count) <= 0:
+        return 0
+    guikv_cache = getattr(past_key_values, "_guikv_original_seq_length", None) is not None
+    tokenwise = _env_flag(
+        "QWEN3VL_STRUCTURED_FAST_DECODE_STATIC_TOKENWISE",
+        "1" if guikv_cache else "0",
+    )
+    return int(token_count) if tokenwise else 1
 
 
 def _decode_until(
@@ -484,6 +529,42 @@ def _tail_after_cached_suffix(suffix: str, default_tail: str) -> str | None:
     return None
 
 
+_ANDROID_CLOSED_ACTIONS = (
+    "click",
+    "long_press",
+    "swipe:up",
+    "swipe:down",
+    "swipe:left",
+    "swipe:right",
+    "wait",
+    "navigate_back",
+    "navigate_home",
+)
+
+
+def _normalize_android_bbox(text: str) -> tuple[str, bool]:
+    """Validate one AndroidControl bbox slot without imposing image-size bounds."""
+    rendered = str(text or "").strip()
+    # Some tokenizers/model variants emit the opening bracket again even when
+    # it was supplied by the static SFD prefix.  It is harmless syntax, not a
+    # fifth coordinate; normalize it before validating the four numbers.
+    if rendered.startswith("["):
+        rendered = rendered[1:].lstrip()
+    values = [part.strip() for part in rendered.split(",")]
+    if len(values) != 4:
+        return rendered, False
+    try:
+        coords = [float(value) for value in values]
+    except Exception:
+        return rendered, False
+    if not all(torch.isfinite(torch.tensor(value)) for value in coords):
+        return rendered, False
+    if coords[2] < coords[0] or coords[3] < coords[1]:
+        return str(text or "").strip(), False
+    rendered = [str(int(value)) if float(value).is_integer() else str(value) for value in coords]
+    return ", ".join(rendered), True
+
+
 def _normalize_gui_closed_set(text: str) -> str:
     return str(text or "").strip().upper()
 
@@ -568,6 +649,70 @@ def _decode_gui_closed_set(
             return "", raw, "", ids, past_key_values, attention_mask, logits, len(ids), False, f"{slot_name}_hit_eos", elapsed
 
     return "", raw, "", ids, past_key_values, attention_mask, logits, len(ids), False, f"{slot_name}_max_tokens", elapsed
+
+
+def _decode_closed_choice(
+    model,
+    tokenizer,
+    *,
+    logits: torch.Tensor,
+    past_key_values,
+    attention_mask: torch.Tensor,
+    device: torch.device,
+    generate_kwargs: dict[str, Any],
+    prefix_text: str,
+    candidates: tuple[str, ...],
+    max_tokens: int,
+    slot_name: str,
+) -> tuple[str, str, list[int], Any, torch.Tensor, torch.Tensor, int, bool, str | None, float]:
+    """Generate exactly one member of a small closed textual action set.
+
+    Unlike post-hoc validation, this masks the next-token distribution to the
+    token trie of the permitted candidates.  It is essential for Android GUI
+    actions because an unconstrained model often starts a natural-language
+    phrase (e.g. ``Click the …``) after the action prefix.
+    """
+    paths: list[tuple[str, list[int]]] = []
+    for candidate in candidates:
+        token_ids, ok = _continuation_token_ids(tokenizer, prefix_text, candidate)
+        if ok and token_ids:
+            paths.append((candidate, token_ids))
+    if not paths:
+        return "", "", [], past_key_values, attention_mask, logits, 0, False, f"{slot_name}_no_token_paths", 0.0
+
+    ids: list[int] = []
+    elapsed = 0.0
+    for _ in range(max_tokens):
+        matching = [(name, path) for name, path in paths if path[: len(ids)] == ids]
+        completed = [name for name, path in matching if len(path) == len(ids)]
+        if completed:
+            choice = completed[0]
+            return choice, choice, ids, past_key_values, attention_mask, logits, len(ids), True, None, elapsed
+        next_ids = {path[len(ids)] for _, path in matching if len(path) > len(ids)}
+        if not next_ids:
+            return "", _decode_ids(tokenizer, ids), ids, past_key_values, attention_mask, logits, len(ids), False, f"{slot_name}_no_prefix", elapsed
+
+        constrained_logits = torch.full_like(logits[:, -1, :], -float("inf"))
+        allowed = torch.tensor(sorted(next_ids), device=logits.device, dtype=torch.long)
+        constrained_logits[:, allowed] = logits[:, -1, allowed]
+        token_id = _select_next_token(constrained_logits.unsqueeze(1), generate_kwargs)
+        ids.append(token_id)
+        past_key_values, attention_mask, logits, _, step_elapsed = _forward_token_ids(
+            model,
+            token_ids=[token_id],
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            logits=logits,
+            device=device,
+            tokenwise=False,
+        )
+        elapsed += step_elapsed
+
+    matching = [(name, path) for name, path in paths if path == ids]
+    if matching:
+        choice = matching[0][0]
+        return choice, choice, ids, past_key_values, attention_mask, logits, len(ids), True, None, elapsed
+    return "", _decode_ids(tokenizer, ids), ids, past_key_values, attention_mask, logits, len(ids), False, f"{slot_name}_max_tokens", elapsed
 
 
 def _gui_static_tail_from_suffix(suffix: str, expected: str) -> str | None:
@@ -715,7 +860,7 @@ def _aitw_structured_fast_decode(
                 device=device,
             )
             static_token_count += n_tok
-            static_steps += int(n_tok > 0)
+            static_steps += _static_forward_count(past, n_tok)
             static_s += elapsed
 
             action_head, raw_action, action_suffix, action_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_gui_closed_set(
@@ -775,7 +920,7 @@ def _aitw_structured_fast_decode(
                     device=device,
                 )
                 static_token_count += n_tok
-                static_steps += int(n_tok > 0)
+                static_steps += _static_forward_count(past, n_tok)
                 static_s += elapsed
 
                 coord_pair, raw_coord, coord_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
@@ -839,7 +984,7 @@ def _aitw_structured_fast_decode(
                     device=device,
                 )
                 static_token_count += n_tok
-                static_steps += int(n_tok > 0)
+                static_steps += _static_forward_count(past, n_tok)
                 static_s += elapsed
 
                 typed_text, raw_text, text_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
@@ -901,7 +1046,7 @@ def _aitw_structured_fast_decode(
                     device=device,
                 )
                 static_token_count += n_tok
-                static_steps += int(n_tok > 0)
+                static_steps += _static_forward_count(past, n_tok)
                 static_s += elapsed
                 final_text = json.dumps({"action_type": semantic_action}, ensure_ascii=False)
 
@@ -1021,7 +1166,7 @@ def _mind2web_structured_fast_decode(
                 device=device,
             )
             static_token_count += n_tok
-            static_steps += int(n_tok > 0)
+            static_steps += _static_forward_count(past, n_tok)
             static_s += elapsed
 
             action_id, raw_action, action_suffix, action_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_gui_closed_set(
@@ -1079,7 +1224,7 @@ def _mind2web_structured_fast_decode(
                 device=device,
             )
             static_token_count += n_tok
-            static_steps += int(n_tok > 0)
+            static_steps += _static_forward_count(past, n_tok)
             static_s += elapsed
 
             coord_raw_pair, raw_coord, coord_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
@@ -1139,7 +1284,7 @@ def _mind2web_structured_fast_decode(
                     device=device,
                 )
                 static_token_count += n_tok
-                static_steps += int(n_tok > 0)
+                static_steps += _static_forward_count(past, n_tok)
                 static_s += elapsed
 
                 value_text, raw_value, value_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
@@ -1243,9 +1388,9 @@ def _android_structured_fast_decode(
 
     static_parts = [
         '<answer>{"action_type": "',
-        ', "bbox_2d": [',
+        '", "bbox_2d": [',
         '}</answer>',
-        "}</answer>",
+        '"}</answer>',
     ]
     template_plan = '<answer>{"action_type": "{ACTION_TYPE}", "bbox_2d": [{BBOX_2D}]}</answer>'
     meta = _empty_meta("not_attempted")
@@ -1295,10 +1440,10 @@ def _android_structured_fast_decode(
                 device=device,
             )
             static_token_count += n_tok
-            static_steps += int(n_tok > 0)
+            static_steps += _static_forward_count(past, n_tok)
             static_s += elapsed
 
-            action, raw_action, action_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
+            action, raw_action, action_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_closed_choice(
                 model,
                 tokenizer,
                 logits=logits,
@@ -1306,7 +1451,8 @@ def _android_structured_fast_decode(
                 attention_mask=attention_mask,
                 device=device,
                 generate_kwargs=generate_kwargs,
-                stop_chars=('"',),
+                prefix_text=static_parts[0],
+                candidates=_ANDROID_CLOSED_ACTIONS,
                 max_tokens=action_max_tokens,
                 slot_name="action",
             )
@@ -1325,24 +1471,15 @@ def _android_structured_fast_decode(
                     "rendered_text": action,
                 }
             )
-            action_suffix = _suffix_after_first_stop(raw_action, ('"',))
-            if not ok or not action or action_suffix is None:
+            if not ok or action_norm not in _ANDROID_CLOSED_ACTIONS:
                 meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": reason or "empty_action"})
                 return None, meta
 
             needs_bbox = action_norm in ("click", "long_press")
             if needs_bbox:
-                if action_suffix.startswith(","):
-                    suffix_after_comma = action_suffix[1:]
-                    if suffix_after_comma.strip():
-                        bbox_prefix = suffix_after_comma
-                    else:
-                        bbox_prefix = " \"bbox_2d\": ["
-                elif action_suffix == "":
-                    bbox_prefix = static_parts[1]
-                else:
-                    meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"action_suffix_unexpected:{action_suffix!r}"})
-                    return None, meta
+                # The closed-set decoder stops exactly after the action text;
+                # the closing quote and the following schema are known syntax.
+                bbox_prefix = '", "bbox_2d": ['
                 past, attention_mask, logits, n_tok, elapsed = _append_static(
                     model,
                     tokenizer,
@@ -1351,9 +1488,14 @@ def _android_structured_fast_decode(
                     attention_mask=attention_mask,
                     logits=logits,
                     device=device,
+                    # Tokenisation at the action/quote boundary is not
+                    # generally compositional. Derive the continuation from
+                    # the complete rendered prefix so the cache represents
+                    # exactly `..."{action}", ...`.
+                    prefix_text=f'{static_parts[0]}{action}',
                 )
                 static_token_count += n_tok
-                static_steps += int(n_tok > 0)
+                static_steps += _static_forward_count(past, n_tok)
                 static_s += elapsed
 
                 bbox, raw_bbox, bbox_ids, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
@@ -1383,10 +1525,13 @@ def _android_structured_fast_decode(
                     }
                 )
                 bbox_suffix = _suffix_after_first_stop(raw_bbox, ("]",))
-                if not ok or not bbox or bbox_suffix is None:
+                bbox, valid_bbox = _normalize_android_bbox(bbox)
+                if not ok or not valid_bbox or bbox_suffix is None:
                     meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": reason or "empty_bbox"})
                     return None, meta
-                tail = _tail_after_cached_suffix(bbox_suffix, static_parts[3])
+                tail = _tail_after_cached_suffix(bbox_suffix, static_parts[2])
+                if tail is None and bbox_suffix.lstrip().startswith(","):
+                    tail = static_parts[2]
                 if tail is None:
                     meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"bbox_suffix_unexpected:{bbox_suffix!r}"})
                     return None, meta
@@ -1394,7 +1539,7 @@ def _android_structured_fast_decode(
             else:
                 bbox = ""
                 raw_bbox = ""
-                tail = _tail_after_cached_suffix(action_suffix, static_parts[2])
+                tail = '"}</answer>'
                 if tail is None:
                     meta.update({"template_slot_stats": slot_stats, "template_prefill_fallback_reason": f"action_suffix_unexpected:{action_suffix!r}"})
                     return None, meta
@@ -1410,7 +1555,7 @@ def _android_structured_fast_decode(
                 device=device,
             )
             static_token_count += n_tok
-            static_steps += int(n_tok > 0)
+            static_steps += _static_forward_count(past, n_tok)
             static_s += elapsed
     except Exception as exc:
         meta["template_prefill_fallback_reason"] = f"structured_fast_decode_exception:{type(exc).__name__}:{exc}"
@@ -1453,6 +1598,100 @@ def _android_structured_fast_decode(
             flush=True,
         )
     return final_text, meta
+
+
+def _android_rebuild_slots_fast_decode(
+    *,
+    dataset: str | None,
+    model,
+    processor,
+    rebuild_context: dict[str, Any],
+    generate_kwargs: dict[str, Any],
+) -> tuple[str | None, dict[str, Any]]:
+    """Android SFD that rebuilds the complete multimodal prefix per slot.
+
+    GUIKV deliberately evicts/reorders entries in a prefill cache.  Appending
+    tokens to that compressed cache is not equivalent to appending tokens to
+    the original prompt, so coordinate decoding can lose its JSON context.
+    The existing template-prefill implementation recreates the complete input
+    for action and bbox slots; reuse it here as an SFD backend rather than
+    silently falling back to ordinary unconstrained generation.
+    """
+    try:
+        from .modeling_qwen3_vl_prune_template import _android_template_prefill
+
+        response, meta = _android_template_prefill(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            base_text=rebuild_context["base_text"],
+            images=rebuild_context.get("images"),
+            videos=rebuild_context.get("videos"),
+            video_metadatas=rebuild_context.get("video_metadatas"),
+            video_kwargs=rebuild_context.get("video_kwargs"),
+            generate_kwargs=generate_kwargs,
+            configure_context_fn=None,
+        )
+    except Exception as exc:
+        return None, _empty_meta(f"rebuild_slots_exception:{type(exc).__name__}:{exc}")
+
+    meta = dict(meta or {})
+    meta.setdefault("template_schema", "android_action_first_json")
+    meta.setdefault(
+        "template_plan",
+        '<answer>{"action_type": "{ACTION_TYPE}", "bbox_2d": [{BBOX_2D}]}</answer>',
+    )
+    meta["template_prefill_impl"] = "structured_fast_decode_rebuild_slots"
+    # These are full prompt re-prefills, not incremental cache forwards.
+    meta["structured_fast_decode_rebuild_slots"] = True
+    meta["structured_fast_decode_static_forward_steps"] = 0
+    meta["structured_fast_decode_dynamic_forward_steps"] = int(meta.get("template_unknown_decode_steps", 0) or 0)
+    return response, meta
+
+
+def _android_single_generate_fast_decode(
+    *,
+    dataset: str | None,
+    model,
+    processor,
+    rebuild_context: dict[str, Any],
+    generate_kwargs: dict[str, Any],
+) -> tuple[str | None, dict[str, Any]]:
+    """One-prefill Android SFD using the model's native generate loop.
+
+    The static template is placed in the initial prompt and subsequent static
+    pieces are forced by a logits processor inside one ``model.generate``
+    invocation.  This lets GUIKV's own generation wrapper manage its compact
+    cache, positions and attention mask rather than duplicating that logic in
+    the manual cache-continuation decoder.
+    """
+    try:
+        from .modeling_qwen3_vl_prune_template_single_generate import _android_single_generate
+
+        response, meta = _android_single_generate(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            base_text=rebuild_context["base_text"],
+            images=rebuild_context.get("images"),
+            videos=rebuild_context.get("videos"),
+            video_metadatas=rebuild_context.get("video_metadatas"),
+            video_kwargs=rebuild_context.get("video_kwargs"),
+            generate_kwargs=generate_kwargs,
+            configure_context_fn=None,
+        )
+    except Exception as exc:
+        return None, _empty_meta(f"single_generate_exception:{type(exc).__name__}:{exc}")
+
+    meta = dict(meta or {})
+    meta.setdefault("template_schema", "android_action_first_json")
+    meta.setdefault(
+        "template_plan",
+        '<answer>{"action_type": "{ACTION_TYPE}", "bbox_2d": [{BBOX_2D}]}</answer>',
+    )
+    meta["template_prefill_impl"] = "structured_fast_decode_single_generate"
+    meta["structured_fast_decode_single_generate"] = True
+    return response, meta
 
 
 
@@ -1570,7 +1809,7 @@ def _gui_structured_fast_decode(
                         prefix_text=action_rendered + head_suffix,
                     )
                     static_token_count += n_tok
-                    static_steps += int(n_tok > 0)
+                    static_steps += _static_forward_count(past, n_tok)
                     static_s += elapsed
                 direction, raw_direction, direction_suffix, _, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_gui_closed_set(
                     model,
@@ -1625,7 +1864,7 @@ def _gui_structured_fast_decode(
                         prefix_text=action_rendered + head_suffix,
                     )
                     static_token_count += n_tok
-                    static_steps += int(n_tok > 0)
+                    static_steps += _static_forward_count(past, n_tok)
                     static_s += elapsed
                 coord_pair, raw_coord_pair, _, past, attention_mask, logits, steps, ok, reason, elapsed = _decode_until(
                     model,
@@ -1724,15 +1963,53 @@ def maybe_generate_with_structured_fast_decode(
     inputs,
     generate_kwargs: dict[str, Any],
     sample_meta: dict | None = None,
+    rebuild_context: dict[str, Any] | None = None,
 ) -> tuple[str | None, dict[str, Any]]:
-    if not _env_flag("QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE", "0"):
-        return None, _empty_meta("disabled")
-    if generate_kwargs.get("use_cache", True) is False:
-        return None, _empty_meta("requires_use_cache")
-
+    debug = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0")
+    requested = _env_flag("QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE", "0")
     family = _dataset_family(dataset)
-    if family == "androidcontrol":
-        return _android_structured_fast_decode(
+    if debug:
+        print(
+            "[StructuredFastDecode] "
+            f"dispatch requested={int(requested)} dataset={dataset!r} family={family or 'unsupported'} "
+            f"use_cache={int(generate_kwargs.get('use_cache', True) is not False)}",
+            flush=True,
+        )
+    if not requested:
+        meta = _empty_meta("disabled")
+        if debug:
+            print("[StructuredFastDecode] result enabled=0 reason=disabled", flush=True)
+        return None, meta
+    if generate_kwargs.get("use_cache", True) is False:
+        meta = _empty_meta("requires_use_cache")
+        if debug:
+            print("[StructuredFastDecode] result enabled=0 reason=requires_use_cache", flush=True)
+        return None, meta
+
+    rebuild_slots = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_REBUILD_SLOTS", "0")
+    single_generate = _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_SINGLE_GENERATE", "0")
+    if family == "androidcontrol" and single_generate and rebuild_context is not None:
+        if debug:
+            print("[StructuredFastDecode] impl=single_generate (one full multimodal prefill)", flush=True)
+        response, meta = _android_single_generate_fast_decode(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            rebuild_context=rebuild_context,
+            generate_kwargs=generate_kwargs,
+        )
+    elif family == "androidcontrol" and rebuild_slots and rebuild_context is not None:
+        if debug:
+            print("[StructuredFastDecode] impl=rebuild_slots (full multimodal prefix per slot)", flush=True)
+        response, meta = _android_rebuild_slots_fast_decode(
+            dataset=dataset,
+            model=model,
+            processor=processor,
+            rebuild_context=rebuild_context,
+            generate_kwargs=generate_kwargs,
+        )
+    elif family == "androidcontrol":
+        response, meta = _android_structured_fast_decode(
             dataset=dataset,
             model=model,
             processor=processor,
@@ -1740,8 +2017,8 @@ def maybe_generate_with_structured_fast_decode(
             generate_kwargs=generate_kwargs,
             sample_meta=sample_meta,
         )
-    if family == "aitw":
-        return _aitw_structured_fast_decode(
+    elif family == "aitw":
+        response, meta = _aitw_structured_fast_decode(
             dataset=dataset,
             model=model,
             processor=processor,
@@ -1749,8 +2026,8 @@ def maybe_generate_with_structured_fast_decode(
             generate_kwargs=generate_kwargs,
             sample_meta=sample_meta,
         )
-    if family == "guiodyssey":
-        return _gui_structured_fast_decode(
+    elif family == "guiodyssey":
+        response, meta = _gui_structured_fast_decode(
             dataset=dataset,
             model=model,
             processor=processor,
@@ -1758,8 +2035,8 @@ def maybe_generate_with_structured_fast_decode(
             generate_kwargs=generate_kwargs,
             sample_meta=sample_meta,
         )
-    if family == "mind2web":
-        return _mind2web_structured_fast_decode(
+    elif family == "mind2web":
+        response, meta = _mind2web_structured_fast_decode(
             dataset=dataset,
             model=model,
             processor=processor,
@@ -1767,4 +2044,37 @@ def maybe_generate_with_structured_fast_decode(
             generate_kwargs=generate_kwargs,
             sample_meta=sample_meta,
         )
-    return None, _empty_meta(f"unsupported_dataset:{dataset}")
+    else:
+        response, meta = None, _empty_meta(f"unsupported_dataset:{dataset}")
+
+    if debug:
+        print(
+            "[StructuredFastDecode] "
+            f"result enabled={int(bool(meta.get('template_prefill_enabled', False)))} "
+            f"schema={meta.get('template_schema')!r} "
+            f"static_steps={meta.get('template_static_decode_steps', 0)} "
+            f"dynamic_steps={meta.get('template_unknown_decode_steps', 0)} "
+            f"static_tokens={meta.get('template_static_token_count', 0)} "
+            f"fallback_reason={meta.get('template_prefill_fallback_reason')!r}",
+            flush=True,
+        )
+        template_plan = meta.get("template_plan")
+        static_parts = meta.get("template_static_parts")
+        if template_plan is not None or static_parts:
+            print(
+                "[StructuredFastDecode] "
+                f"template_plan={template_plan!r} static_parts={static_parts!r}",
+                flush=True,
+            )
+        # On a fallback, expose the completed slot(s) as well.  This makes it
+        # possible to distinguish an SFD dispatch/configuration issue from a
+        # model refusal in a particular free slot without changing outputs.
+        if not meta.get("template_prefill_enabled", False):
+            slot_stats = meta.get("template_slot_stats") or []
+            if slot_stats:
+                print(
+                    "[StructuredFastDecode] "
+                    f"failed_slots={slot_stats!r}",
+                    flush=True,
+                )
+    return response, meta

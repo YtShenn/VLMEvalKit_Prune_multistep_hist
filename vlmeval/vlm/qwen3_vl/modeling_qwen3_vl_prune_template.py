@@ -157,7 +157,10 @@ class ClosedSetSlotParser:
 
 class AndroidBBoxSlotParser:
     _pattern = re.compile(
-        r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)"
+        # The parser is evaluated after every newly generated token.  Require
+        # the closing bracket so a token prefix such as ``12`` is not accepted
+        # as the final coordinate of an intended value like ``1210]``.
+        r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)(?=\s*\])"
     )
 
     def parse(self, raw_text: str) -> SlotParseResult:

@@ -1,3 +1,5 @@
+import ast
+from PIL import Image
 import torch
 import time
 import statistics
@@ -365,6 +367,195 @@ def build_sheet_indices(dataset_len, rank, world_size):
     return all_indices[rank::world_size]
 
 
+def build_androidcontrol_trajectory_indices(data, rank, world_size):
+    """Assign complete AndroidControl trajectories to one rank.
+
+    Prediction-backed history is causal: a prompt at step ``n`` consumes the
+    response generated for step ``n - 1``. Consequently a trajectory cannot
+    be split by the usual row-wise distributed sharding. This helper keeps
+    every trajectory on one rank while assigning trajectory groups greedily by
+    their step counts to keep the ranks reasonably balanced.
+
+    ``data`` is normally already ordered by :func:`_sort_androidcontrol_sequential`.
+    We nevertheless explicitly order the rows within each group by step index,
+    so the causal requirement is local to this scheduler rather than an
+    implicit property of a caller.
+    """
+    if world_size <= 1 or len(data) == 0:
+        return list(range(len(data)))
+
+    trajectories = {}
+    for position, (_, row) in enumerate(data.iterrows()):
+        key = _androidcontrol_trajectory_key(row)
+        # A missing image path cannot provide a reliable trajectory identity.
+        # Keep such rows isolated rather than accidentally sharing history.
+        if not key:
+            key = f'__missing_trajectory__{position}'
+        trajectories.setdefault(key, []).append((
+            _androidcontrol_step_idx(row), position, position,
+        ))
+
+    groups = []
+    for key, rows in trajectories.items():
+        rows.sort(key=lambda item: (item[0], item[1]))
+        groups.append((key, [item[2] for item in rows]))
+
+    # Largest-first greedy bin packing avoids the severe imbalance caused by
+    # assigning an unusually long trajectory to an otherwise full rank. The
+    # key makes the result deterministic when group sizes tie.
+    groups.sort(key=lambda item: (-len(item[1]), item[0]))
+    rank_groups = [[] for _ in range(world_size)]
+    rank_loads = [0 for _ in range(world_size)]
+    for key, positions in groups:
+        owner = min(range(world_size), key=lambda candidate: (rank_loads[candidate], candidate))
+        rank_groups[owner].append((key, positions))
+        rank_loads[owner] += len(positions)
+
+    # Inter-trajectory order is immaterial; retain deterministic trajectory
+    # order while each individual trajectory remains chronologically ordered.
+    rank_groups[rank].sort(key=lambda item: item[0])
+    return [position for _, positions in rank_groups[rank] for position in positions]
+
+
+def build_episode_trajectory_indices(data, rank, world_size, dataset_name):
+    """Keep causal GUI episodes on one rank for prediction-backed history."""
+    if 'GUIOdyssey' in str(dataset_name):
+        return build_guiodyssey_trajectory_indices(data, rank, world_size)
+    key_cols = ['task', 'episode_id'] if str(dataset_name).startswith('AITW') else ['episode_id']
+    groups = {}
+    for pos, (_, row) in enumerate(data.iterrows()):
+        key = tuple(str(row.get(col, '')) for col in key_cols)
+        groups.setdefault(key, []).append((int(row.get('step_order', pos)), pos))
+    bins = [[] for _ in range(world_size)]
+    loads = [0] * world_size
+    for key, rows in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0])):
+        owner = min(range(world_size), key=lambda i: (loads[i], i))
+        bins[owner].append((key, sorted(rows)))
+        loads[owner] += len(rows)
+    return [pos for _, rows in sorted(bins[rank]) for _, pos in rows]
+
+
+def _guiodyssey_trajectory_key_and_step(row, fallback_position):
+    """Return the stable screenshot-prefix trajectory id and its step."""
+    image_value = row.get('image_path', row.get('image', ''))
+    stem = osp.splitext(osp.basename(str(image_value)))[0]
+    trajectory, separator, step_text = stem.rpartition('_')
+    if not separator or not trajectory:
+        return f'__invalid_guiodyssey_trajectory__{fallback_position}', fallback_position
+    try:
+        return trajectory, int(step_text)
+    except (TypeError, ValueError):
+        # Isolate malformed rows so their prediction history cannot leak.
+        return f'__invalid_guiodyssey_trajectory__{fallback_position}', fallback_position
+
+
+def _guiodyssey_resolve_image_path(image_value):
+    path = str(image_value or '').strip()
+    if path and osp.isfile(path):
+        return path
+    root = os.getenv('GUI_ODYSSEY_ROOT', '/public/ljkang/datasets/GUIOdyssey').strip()
+    candidate = osp.join(root, 'screenshots', osp.basename(path))
+    return candidate if osp.isfile(candidate) else ''
+
+
+def _guiodyssey_parse_list(value):
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    try:
+        parsed = ast.literal_eval(str(value or ''))
+    except (SyntaxError, ValueError):
+        return []
+    return list(parsed) if isinstance(parsed, (list, tuple)) else []
+
+
+def _guiodyssey_estimate_image_tokens(image_value, image_token_cache):
+    """Estimate Qwen visual tokens from image dimensions without decoding pixels."""
+    path = _guiodyssey_resolve_image_path(image_value)
+    if path in image_token_cache:
+        return image_token_cache[path]
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+        # Qwen3-VL merges a 2x2 grid of 14px patches into one visual token.
+        # The dataset screenshots are below the processor's usual max-pixel cap,
+        # so this is a close proxy for the processor's dynamic image grid.
+        tokens = max(1, (max(28, round(width / 28) * 28) // 28) *
+                      (max(28, round(height / 28) * 28) // 28))
+    except (OSError, ValueError, TypeError):
+        tokens = 0
+    image_token_cache[path] = int(tokens)
+    return int(tokens)
+
+
+def _guiodyssey_estimate_sample_cost(row, image_token_cache):
+    """Estimate relative prefill/decode work for one GUI-Odyssey step."""
+    history_images = _guiodyssey_parse_list(row.get('history_screenshot', row.get('history', [])))
+    history_actions = _guiodyssey_parse_list(row.get('history_action', row.get('history_actions', [])))
+    max_history = max(0, int(os.getenv('GUI_ODYSSEY_MAX_HISTORY_IMAGES', '4') or 4))
+    history_images = history_images[-max_history:] if max_history else []
+    history_actions = history_actions[-len(history_images):] if history_images else []
+    image_values = history_images + [row.get('image_path', row.get('image', ''))]
+    visual_tokens = sum(_guiodyssey_estimate_image_tokens(value, image_token_cache) for value in image_values)
+    history_chars = sum(len(str(action or '')) for action in history_actions)
+    prompt_chars = len(str(row.get('question', '') or '')) + history_chars
+    # Vision/prefill dominates this workload. The remaining terms account for
+    # history text and the configured structured-action decode budget. This
+    # estimate uses no current-step label or model output.
+    expected_decode_tokens = max(1, int(os.getenv(
+        'QWEN3VL_STRUCTURED_FAST_DECODE_ACTION_MAX_TOKENS', '16'
+    ) or 16))
+    return int(
+        1024
+        + 4 * visual_tokens
+        + 2 * ((prompt_chars + 3) // 4)
+        + 384 * expected_decode_tokens
+    )
+
+
+def build_guiodyssey_trajectory_indices(data, rank, world_size):
+    """Assign complete, chronologically ordered GUI-Odyssey trajectories.
+
+    Work is balanced by estimated vision, context, and decode cost while every
+    trajectory remains on one rank, preserving prediction-history causality.
+    """
+    if world_size <= 1 or len(data) == 0:
+        return list(range(len(data)))
+
+    trajectories = {}
+    image_token_cache = {}
+    for position, (_, row) in enumerate(data.iterrows()):
+        key, step = _guiodyssey_trajectory_key_and_step(row, position)
+        cost = _guiodyssey_estimate_sample_cost(row, image_token_cache)
+        trajectories.setdefault(key, []).append((step, position, cost))
+
+    groups = []
+    for key, rows in trajectories.items():
+        rows.sort(key=lambda item: (item[0], item[1]))
+        positions = [position for _, position, _ in rows]
+        cost = sum(cost for _, _, cost in rows)
+        groups.append((key, positions, cost))
+
+    # Largest-cost-first greedy bin packing, as used for AndroidControl, but
+    # weighted by the actual multimodal work rather than plain row count.
+    groups.sort(key=lambda item: (-item[2], item[0]))
+    rank_groups = [[] for _ in range(world_size)]
+    rank_costs = [0 for _ in range(world_size)]
+    rank_steps = [0 for _ in range(world_size)]
+    for key, positions, cost in groups:
+        owner = min(range(world_size), key=lambda candidate: (rank_costs[candidate], candidate))
+        rank_groups[owner].append((key, positions))
+        rank_costs[owner] += cost
+        rank_steps[owner] += len(positions)
+
+    if rank == 0:
+        print(
+            '[PredictionHistory] GUI-Odyssey cost-weighted trajectory sharding '
+            f'groups={len(groups)} rank_steps={rank_steps} rank_costs={rank_costs}',
+            flush=True,
+        )
+    rank_groups[rank].sort(key=lambda item: item[0])
+    return [position for _, positions in rank_groups[rank] for position in positions]
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, nargs='+', required=True)
@@ -459,16 +650,12 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
     restored_prune = [v["prune"] for v in telemetry_samples.values() if isinstance(v, dict) and isinstance(v.get("prune"), dict)]
 
     rank, world_size = get_rank_and_world_size()
-    live_history_predictions = bool(
-        'AndroidControl_Curated' in str(dataset_name)
-        and str(os.getenv('ANDROID_CONTROL_HISTORY_ACTION_SOURCE', 'gt')).strip().lower()
-        in ('pred', 'prediction', 'actual', 'free_running')
-    )
-    if live_history_predictions and world_size != 1:
-        raise ValueError(
-            'ANDROID_CONTROL_HISTORY_ACTION_SOURCE=prediction requires --nproc 1: '
-            'each trajectory must be generated in chronological order by one process.'
-        )
+    source_env = ('ANDROID_CONTROL_HISTORY_ACTION_SOURCE' if 'AndroidControl_Curated' in str(dataset_name)
+                  else 'AITW_HISTORY_ACTION_SOURCE' if str(dataset_name).startswith('AITW')
+                  else 'MIND2WEB_HISTORY_ACTION_SOURCE' if str(dataset_name).startswith('Mind2Web')
+                  else 'GUI_ODYSSEY_HISTORY_ACTION_SOURCE' if 'GUIOdyssey' in str(dataset_name) else '')
+    live_history_predictions = bool(source_env and str(os.getenv(source_env, 'gt')).strip().lower()
+                                    in ('pred', 'prediction', 'actual', 'free_running'))
     base_data = _maybe_apply_eval_sampling(dataset.data, dataset_name, rank=rank)
     if live_history_predictions and hasattr(dataset, 'record_actual_prediction'):
         # Resume runs have no opportunity to regenerate completed prefix
@@ -478,7 +665,18 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
             completed_response = res.get(completed_row['index'])
             if completed_response is not None:
                 dataset.record_actual_prediction(completed_row, completed_response)
-    sheet_indices = build_sheet_indices(len(base_data), rank, world_size)
+    if live_history_predictions:
+        sheet_indices = (build_androidcontrol_trajectory_indices(base_data, rank, world_size)
+                         if 'AndroidControl_Curated' in str(dataset_name)
+                         else build_episode_trajectory_indices(base_data, rank, world_size, dataset_name))
+        if rank == 0:
+            print(
+                '[PredictionHistory] prediction-history mode uses trajectory-preserving '
+                f'sharding across {world_size} rank(s).',
+                flush=True,
+            )
+    else:
+        sheet_indices = build_sheet_indices(len(base_data), rank, world_size)
     lt = len(sheet_indices)
     data = base_data.iloc[sheet_indices]
     data_indices = [i for i in data['index']]
@@ -578,6 +776,9 @@ def infer_data(model, model_name, work_dir, dataset, out_file, verbose=False, ap
         'roi_prune_uniform_keep_offset': int(os.getenv('QWEN3VL_ROI_PRUNE_UNIFORM_KEEP_OFFSET', '0') or 0),
         'roi_prune_use_cache': bool(os.getenv('QWEN3VL_ROI_PRUNE_USE_CACHE', '0') == '1'),
         'android_history_action_source': str(os.getenv('ANDROID_CONTROL_HISTORY_ACTION_SOURCE', 'gt') or 'gt'),
+        'aitw_history_action_source': str(os.getenv('AITW_HISTORY_ACTION_SOURCE', 'gt') or 'gt'),
+        'mind2web_history_action_source': str(os.getenv('MIND2WEB_HISTORY_ACTION_SOURCE', 'gt') or 'gt'),
+        'gui_odyssey_history_action_source': str(os.getenv('GUI_ODYSSEY_HISTORY_ACTION_SOURCE', 'gt') or 'gt'),
         'eval_sample_mode': str(os.getenv('VLM_EVAL_SAMPLE_MODE', 'off') or 'off'),
         'eval_sample_tasks': int(os.getenv('VLM_EVAL_SAMPLE_TASKS', os.getenv('VLM_EVAL_SAMPLE_COUNT', '200')) or 200),
         'eval_sample_seed': int(os.getenv('VLM_EVAL_SAMPLE_SEED', os.getenv('SEED', '42')) or 42),

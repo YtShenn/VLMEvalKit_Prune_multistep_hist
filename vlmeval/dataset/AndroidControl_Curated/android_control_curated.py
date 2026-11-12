@@ -76,6 +76,29 @@ NOTES:
 """.strip()
 
 
+def _android_output_protocol() -> str:
+    """Return the output field order used by both prompt and SFD.
+
+    ``auto`` (the default) is action-first only when structured fast decoding
+    is enabled; ordinary decoding retains the historical bbox-first prompt.
+    This prevents the model from being asked for one schema while SFD injects
+    a different static prefix.
+    """
+    value = os.getenv("ANDROID_CONTROL_OUTPUT_PROTOCOL", "auto").strip().lower()
+    if value == "auto":
+        value = "action_first_json" if _env_flag("QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE", "0") else "bbox_first_json"
+    return value if value in {"action_first_json", "bbox_first_json"} else "bbox_first_json"
+
+
+def _with_output_protocol(template: str, protocol: str) -> str:
+    if protocol != "action_first_json":
+        return template
+    return template.replace(
+        '<answer>{{"bbox_2d": [x1, y1, x2, y2], "action_type": ACTION_TYPE}}</answer>',
+        '<answer>{{"action_type": ACTION_TYPE, "bbox_2d": [x1, y1, x2, y2]}}</answer>',
+    )
+
+
 def _safe_literal_eval(val):
     if isinstance(val, (list, tuple, dict)):
         return val
@@ -135,6 +158,14 @@ def _history_action_source() -> str:
     aliases = {"gt": "gt", "gold": "gt", "annotation": "gt", "pred": "prediction",
                "prediction": "prediction", "actual": "prediction", "free_running": "prediction"}
     return aliases.get(value, "gt")
+
+
+def _history_text_source() -> str:
+    """Choose the source for history text independently of ROI crop actions."""
+    value = os.environ.get("ANDROID_CONTROL_HISTORY_TEXT_SOURCE", "instructions").strip().lower()
+    aliases = {"instruction": "instructions", "instructions": "instructions", "gt": "instructions",
+               "prediction": "prediction", "pred": "prediction", "actual": "prediction"}
+    return aliases.get(value, "instructions")
 
 
 def _current_delta_cache_dir() -> str:
@@ -393,6 +424,7 @@ class AndroidControlCurated(ImageBaseDataset):
             else bool(include_history_screenshots)
         )
         self.sequential_order = _sequential_order_enabled()
+        self.output_protocol = _android_output_protocol()
         self.history_keep_prompt_template = _keep_prompt_template_enabled()
         self.use_history_state_packet = state_packet_enabled()
         if self.history_ablation_mode in {"none", "text"}:
@@ -403,6 +435,7 @@ class AndroidControlCurated(ImageBaseDataset):
             self.use_history_state_packet = True
         self.use_current_delta_packet = _current_delta_packet_enabled()
         self.history_action_source = _history_action_source()
+        self.history_text_source = _history_text_source()
         # Absolute history-image path -> parsed response packet.  This is
         # intentionally instance-local: free-running evaluation must not leak
         # actions between trajectories or between independent processes.
@@ -645,7 +678,9 @@ class AndroidControlCurated(ImageBaseDataset):
         return self._infer_history_from_current_image(current_image_path, limit=limit)
 
     def _resolve_history_action_texts(self, line) -> List[str]:
-        if self.history_action_source == "prediction":
+        # ROI packets may follow predictions while prompt text remains the
+        # original dataset step instructions.
+        if self.history_text_source == "prediction":
             return [
                 str(packet.get("step_instruction", "") or "").strip()
                 for packet in self._resolve_history_action_packets(line)
@@ -735,14 +770,27 @@ class AndroidControlCurated(ImageBaseDataset):
             return "None"
         return "".join([f"Step{i + 1}: {text};" for i, text in enumerate(action_texts)])
 
-    def _build_history_visual_entries(self, sample_index: str, history_image_paths: List[str], history_action_packets: List[dict]):
+    def _build_history_visual_entries(
+        self,
+        sample_index: str,
+        history_image_paths: List[str],
+        history_action_packets: List[dict],
+        history_action_texts: List[str] = None,
+    ):
+        # Packets choose the visual crop; display text is intentionally
+        # independent so prediction-centred ROIs can retain instruction text.
+        history_action_texts = list(history_action_texts or [])
         if not self.use_history_state_packet:
             entries = []
             for i, (hist_image_path, action_packet) in enumerate(zip(history_image_paths, history_action_packets)):
+                display_action_text = (
+                    history_action_texts[i] if i < len(history_action_texts)
+                    else str(action_packet.get("step_instruction", "") or "")
+                )
                 entries.append(
                     dict(
                         history_index=i,
-                        action_text=str(action_packet.get("step_instruction", "") or ""),
+                        action_text=display_action_text,
                         images=[dict(type="image", value=hist_image_path)],
                         debug_items=[
                             dict(
@@ -758,6 +806,10 @@ class AndroidControlCurated(ImageBaseDataset):
 
         entries = []
         for i, (hist_image_path, action_packet) in enumerate(zip(history_image_paths, history_action_packets)):
+            display_action_text = (
+                history_action_texts[i] if i < len(history_action_texts)
+                else str(action_packet.get("step_instruction", "") or "")
+            )
             packet_images, packet_meta = build_state_packet(
                 image_path=hist_image_path,
                 action_packet=action_packet,
@@ -779,7 +831,7 @@ class AndroidControlCurated(ImageBaseDataset):
             entries.append(
                 dict(
                     history_index=i,
-                    action_text=str(action_packet.get("step_instruction", "") or ""),
+                    action_text=display_action_text,
                     images=[item.to_message_item() for item in packet_images],
                     debug_items=debug_items,
                     packet_meta=packet_meta,
@@ -1116,10 +1168,19 @@ class AndroidControlCurated(ImageBaseDataset):
             # serialized ``history`` field: that field contains past actions.
             if self.history_ablation_mode == "none":
                 past_actions = ""
-                prompt = PROMPT_TEMPLATE_NO_HISTORY.format(Question=instruction)
+                prompt = _with_output_protocol(PROMPT_TEMPLATE_NO_HISTORY, self.output_protocol).format(Question=instruction)
             else:
-                past_actions = str(line.get("history", ""))
-                prompt = PROMPT_TEMPLATE.format(Question=instruction, past_actions=past_actions)
+                # Preserve the original text-only protocol by default: it uses
+                # dataset-provided step instructions.  Action-history text is
+                # opt-in so ROI prediction experiments cannot change text mode.
+                use_step_instructions = _env_flag("ANDROID_CONTROL_TEXT_USE_STEP_INSTRUCTIONS", "1")
+                if self.history_ablation_mode == "text" and not use_step_instructions:
+                    past_actions = self._format_history_actions(history_action_texts)
+                else:
+                    past_actions = str(line.get("history", ""))
+                prompt = _with_output_protocol(PROMPT_TEMPLATE, self.output_protocol).format(
+                    Question=instruction, past_actions=past_actions
+                )
             self._maybe_debug_print_prompt(
                 line=line,
                 current_image_path=current_image_path,
@@ -1134,6 +1195,7 @@ class AndroidControlCurated(ImageBaseDataset):
             sample_index=str(line.get("index", "")),
             history_image_paths=history_image_paths,
             history_action_packets=hist_action_packets_kept,
+            history_action_texts=hist_actions_kept,
         )
         current_entries = self._build_current_visual_entries(
             sample_index=str(line.get("index", "")),
@@ -1145,8 +1207,9 @@ class AndroidControlCurated(ImageBaseDataset):
         if self.history_keep_prompt_template:
             intro = self._build_keep_prompt_intro(instruction, history)
             outro = self._build_keep_prompt_outro()
-            debug_parts = [SYSTEM_PROMPT, intro]
-            msgs = [dict(type="text", value=SYSTEM_PROMPT), dict(type="text", value=intro)]
+            system_prompt = _with_output_protocol(SYSTEM_PROMPT, self.output_protocol)
+            debug_parts = [system_prompt, intro]
+            msgs = [dict(type="text", value=system_prompt), dict(type="text", value=intro)]
             if not self.use_history_state_packet:
                 for i, (hist_image_path, action_text) in enumerate(zip(history_image_paths, hist_actions_kept)):
                     debug_parts.append(f"Image_{i}: [HISTORY_IMAGE] {hist_image_path}")

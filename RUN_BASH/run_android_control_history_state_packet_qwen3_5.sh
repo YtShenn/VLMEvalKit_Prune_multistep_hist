@@ -49,7 +49,7 @@ export QWEN3VL_ENABLE_ROI_PRUNE=0
 export QWEN3VL_ROI_PRUNE_USE_CACHE="${QWEN3VL_ROI_PRUNE_USE_CACHE:-1}"
 export QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE="${QWEN3VL_ROI_PRUNE_PRINT_PER_SAMPLE:-1}"
 
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-all}"
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-off}"
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-10}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
 
@@ -152,7 +152,7 @@ run_one() {
     reuse_args+=(--reuse)
   fi
 
-  "${TORCHRUN_CMD[@]}" --standalone --nproc_per_node=3 --master_port="${port}" run.py \
+  "${TORCHRUN_CMD[@]}" --standalone --nproc_per_node=7 --master_port="${port}" run.py \
     --data "${dataset_name}" \
     --model "${MODEL}" \
     --work-dir "${WORK_DIR}/${dataset_name}" \

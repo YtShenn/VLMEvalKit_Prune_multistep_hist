@@ -60,18 +60,38 @@ MODEL="Qwen3-VL-4B-Instruct"
 DATASET_LIST=(
   "AndroidControl_Curated_High_Task_Improved"
 )
-HISTORY_ABLATION_MODES=(text thumbnail roi none)
+# HISTORY_ABLATION_MODES=(text thumbnail roi none)
 # HISTORY_ABLATION_MODES=(thumbnail roi legacy none)
-# HISTORY_ABLATION_MODES=(legacy)
+# `legacy_no_fast_decode` keeps both thumbnail and ROI for each history step,
+# while forcing structured fast decode off for that condition.
+HISTORY_ABLATION_MODES=(legacy_no_fast_decode)
 # 默认 legacy
 # export ANDROID_CONTROL_HISTORY_ABLATION_MODE=none       # 无历史文本、无历史图像
 # export ANDROID_CONTROL_HISTORY_ABLATION_MODE=text       # 仅历史动作文本
 # export ANDROID_CONTROL_HISTORY_ABLATION_MODE=thumbnail  # 历史动作文本 + 每步仅缩略图
 # export ANDROID_CONTROL_HISTORY_ABLATION_MODE=roi        # 历史动作文本 + 每步仅 ROI
+# Only for the `roi` condition: choose the action used to centre each
+# historical ROI. `gt` keeps the teacher-forced annotation; `prediction`
+# uses the model's actual prediction from the preceding trajectory step.
+# Prediction-backed ROI history requires trajectory-preserving sequential
+# inference and is handled automatically by the evaluator.
+export ANDROID_CONTROL_ROI_ONLY_HISTORY_ACTION_SOURCE=prediction  # gt | prediction
+# Only for the `text` condition: choose whether historical action text uses
+# dataset-provided historical step instructions (`gt`) or actual responses generated on prior steps
+# of the same trajectory (`prediction`).
+export ANDROID_CONTROL_TEXT_HISTORY_ACTION_SOURCE=gt  # gt | prediction
+# Keep `text` mode byte-for-byte compatible with its original prompt: use
+# the dataset-provided step-instruction history. Set to 0 only when comparing
+# causal action-history text (controlled by ANDROID_CONTROL_TEXT_HISTORY_ACTION_SOURCE).
+export ANDROID_CONTROL_TEXT_USE_STEP_INSTRUCTIONS=1  # 1: original instructions; 0: action history
+# Prompt history text is independent of the ROI crop source. Keep instructions
+# for ROI/thumbnail/legacy by default; `prediction` is used only for an
+# explicit causal text-history ablation.
+export ANDROID_CONTROL_HISTORY_TEXT_SOURCE=instructions  # instructions | prediction
 PYTHON_BIN="/opt/conda/envs/qwen3_5/bin/python"
 TORCHRUN_BIN="/opt/conda/envs/qwen3_5/bin/torchrun"
 TAG="hist4_history_modal_ablation"
-WORK_DIR="OUTPUT_HIST_ABLATION/ablation_android_control_${TAG}_newtime"
+WORK_DIR="OUTPUT_HIST_ABLATION/ablation_android_control_${TAG}_newtime_prediction_oritext"
 TS="$(date +%Y%m%d_%H%M%S)"
 PORT_BASE=29720
 REUSE=0
@@ -83,12 +103,48 @@ run_one() {
   local port="$3"
   local output_dir="${WORK_DIR}/${mode}/${dataset_name}"
   local log_file="${WORK_DIR}/run_${TS}_${dataset_name}_${mode}.log"
+  local history_action_source="gt"
+  local history_text_source="instructions"
+  local packet_mode="${mode}"
+  local structured_fast_decode="${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE:-0}"
 
-  export ANDROID_CONTROL_HISTORY_ABLATION_MODE="${mode}"
+  if [[ "${mode}" == "legacy_no_fast_decode" ]]; then
+    packet_mode="legacy"
+    structured_fast_decode=0
+  fi
+  export ANDROID_CONTROL_HISTORY_ABLATION_MODE="${packet_mode}"
+  export QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE="${structured_fast_decode}"
+  case "${mode}" in
+    roi)
+      history_action_source="${ANDROID_CONTROL_ROI_ONLY_HISTORY_ACTION_SOURCE,,}"
+      ;;
+    text)
+      history_action_source="${ANDROID_CONTROL_TEXT_HISTORY_ACTION_SOURCE,,}"
+      ;;
+  esac
+  if [[ "${mode}" == "text" && "${ANDROID_CONTROL_TEXT_USE_STEP_INSTRUCTIONS}" != "1" ]]; then
+    history_text_source="${history_action_source}"
+  fi
+  case "${history_action_source}" in
+    gt|prediction) ;;
+    *)
+      echo "Unsupported history action source for ${mode}: ${history_action_source} (use gt or prediction)" >&2
+      exit 2
+      ;;
+  esac
+  # Keep the source switch scoped to ROI-only and text-only ablations.  The dataset reads
+  # this existing evaluator-facing variable when constructing history packets.
+  # In text + prediction mode, it also makes historical action text use
+  # responses generated on earlier steps of the same trajectory.
+  export ANDROID_CONTROL_HISTORY_ACTION_SOURCE="${history_action_source}"
+  export ANDROID_CONTROL_HISTORY_TEXT_SOURCE="${history_text_source}"
   mkdir -p "${output_dir}"
   {
     echo "[HistoryAblation] tag=${TAG}"
-    echo "[HistoryAblation] mode=${ANDROID_CONTROL_HISTORY_ABLATION_MODE}"
+    echo "[HistoryAblation] mode=${mode} packet_mode=${ANDROID_CONTROL_HISTORY_ABLATION_MODE}"
+    echo "[HistoryAblation] structured_fast_decode=${QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE}"
+    echo "[HistoryAblation] history_action_source=${ANDROID_CONTROL_HISTORY_ACTION_SOURCE}"
+    echo "[HistoryAblation] history_text_source=${ANDROID_CONTROL_HISTORY_TEXT_SOURCE}"
     echo "[HistoryAblation] model=${MODEL} dataset=${dataset_name}"
     echo "[HistoryAblation] output_dir=${output_dir}"
     echo "[HistoryAblation] max_history=${ANDROID_CONTROL_MAX_HISTORY_IMAGES}"
@@ -117,7 +173,7 @@ port="${PORT_BASE}"
 for dataset_name in "${DATASET_LIST[@]}"; do
   for mode in "${HISTORY_ABLATION_MODES[@]}"; do
     case "${mode}" in
-      legacy|none|text|thumbnail|roi) ;;
+      legacy|none|text|thumbnail|roi|legacy_no_fast_decode) ;;
       *)
         echo "Unsupported HISTORY_ABLATION_MODES entry: ${mode}" >&2
         exit 2

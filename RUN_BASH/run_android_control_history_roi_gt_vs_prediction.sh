@@ -15,9 +15,10 @@ if [[ ! -f "${RUNNER}" ]]; then
   exit 1
 fi
 
-for source in gt prediction; do
+for source in prediction gt; do
   echo "[ROI comparison] source=${source}"
   ANDROID_CONTROL_HISTORY_ACTION_SOURCE="${source}" \
+  QWEN3VL_ENABLE_STRUCTURED_FAST_DECODE=1 \
   TAG="${TAG_BASE}_${source}" \
   WORK_DIR="${COMPARISON_ROOT}/${source}" \
   DATASET_LIST_OVERRIDE="${DATASET}" \

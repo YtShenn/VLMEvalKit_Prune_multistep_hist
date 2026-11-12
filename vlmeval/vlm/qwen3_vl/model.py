@@ -2050,6 +2050,13 @@ class Qwen3VLChat(Qwen3VLPromptMixin, BaseModel):
                 inputs=inputs,
                 generate_kwargs=generate_kwargs,
                 sample_meta=sample_meta,
+                rebuild_context={
+                    "base_text": text,
+                    "images": images,
+                    "videos": videos,
+                    "video_metadatas": video_metadatas,
+                    "video_kwargs": video_kwargs,
+                },
             )
             try:
                 if template_response is not None:

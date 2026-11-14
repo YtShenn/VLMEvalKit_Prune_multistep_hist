@@ -250,7 +250,33 @@ def _make_guikv_attention_forward(attn_module):
         if "cache_position" in kwargs:
             cache_kwargs["cache_position"] = kwargs["cache_position"]
 
-        if q_len > 1:
+        # A multi-token input is a true prefill only when this cache has not
+        # already been populated by GUIKV.  SFD appends a known static template
+        # *segment* after the multimodal prefill; treating that segment as a
+        # second prefill would recompress the KV cache and corrupt its context.
+        # ``_guikv_original_seq_length`` is shared by the whole cache and is
+        # set as soon as layer 0 completes its prefill compression.  It must
+        # not, by itself, make layers 1..N look like continuations during that
+        # *same* prefill.  Check the current layer's physical cache as well:
+        # it is empty on a new prefill and non-empty for a real SFD segment
+        # continuation.
+        layer_cache_len = 0
+        if cache is not None:
+            try:
+                layer_cache_len = int(cache.get_seq_length(self.layer_idx))
+            except Exception:
+                try:
+                    layer_cache_len = int(cache.key_cache[self.layer_idx].shape[-2])
+                except Exception:
+                    layer_cache_len = 0
+        cached_guikv_continuation = (
+            cache is not None
+            and getattr(cache, "_guikv_original_seq_length", None) is not None
+            and layer_cache_len > 0
+        )
+        is_guikv_prefill = q_len > 1 and not cached_guikv_continuation
+
+        if is_guikv_prefill:
             self._guikv_original_prompt_len = q_len
             self._guikv_seen_tokens = q_len
 
@@ -258,7 +284,7 @@ def _make_guikv_attention_forward(attn_module):
         guikv_prefill_seen = None
         if cache is not None:
             original_seen = int(getattr(self, "_guikv_seen_tokens", getattr(self, "_guikv_original_prompt_len", q_len)))
-            if q_len > 1:
+            if is_guikv_prefill:
                 original_seen = q_len
                 guikv_prefill_cache = cache
                 guikv_prefill_seen = original_seen
@@ -286,6 +312,7 @@ def _make_guikv_attention_forward(attn_module):
             print(
                 "[GUIKVShape] "
                 f"layer={getattr(self, 'layer_idx', None)} q_len={q_len} "
+                f"cached_continuation={int(cached_guikv_continuation)} "
                 f"hidden={tuple(hidden_states.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)} "
                 f"q={tuple(query_states.shape)} k={tuple(key_states.shape)} v={tuple(value_states.shape)} "
                 f"mask={mask_shape} cache_len={cache_len}",
@@ -360,6 +387,16 @@ def _patch_outer_forward(model: torch.nn.Module) -> None:
     orig_forward = model.forward
 
     def patched_forward(self, *args, **kwargs):
+        past_key_values = kwargs.get("past_key_values", kwargs.get("past_key_value", None))
+        # Image-token ranges belong to the original multimodal prefill.  On a
+        # cache continuation ``input_ids`` contains only the newly appended
+        # text segment while ``attention_mask`` still spans the full logical
+        # context, so recomputing ranges would mix incompatible lengths.
+        if (
+            past_key_values is not None
+            and getattr(past_key_values, "_guikv_original_seq_length", None) is not None
+        ):
+            return orig_forward(*args, **kwargs)
         input_ids = kwargs.get("input_ids", None)
         if input_ids is None and args:
             input_ids = args[0]
@@ -410,6 +447,10 @@ def _patch_prepare_inputs_for_guikv(model: torch.nn.Module) -> None:
         is_first_iteration=False,
         **kwargs,
     ):
+        # Used by structured fast decoding when it appends a complete known
+        # template segment to an existing GUIKV cache.  Normal generate still
+        # follows its one-token continuation path.
+        guikv_allow_multi_token_continuation = bool(kwargs.pop("guikv_allow_multi_token_continuation", False))
         model_inputs = orig_prepare(
             input_ids,
             past_key_values=past_key_values,
@@ -430,21 +471,22 @@ def _patch_prepare_inputs_for_guikv(model: torch.nn.Module) -> None:
         original_seen = getattr(past_key_values, "_guikv_original_seq_length", None)
         if original_seen is None:
             return model_inputs
-        cur_input_ids = model_inputs.get("input_ids", None)
-        if cur_input_ids is not None and getattr(cur_input_ids, "ndim", 0) == 2 and cur_input_ids.shape[1] > 1:
-            model_inputs["input_ids"] = cur_input_ids[:, -1:]
-        cur_inputs_embeds = model_inputs.get("inputs_embeds", None)
-        if cur_inputs_embeds is not None and getattr(cur_inputs_embeds, "ndim", 0) == 3 and cur_inputs_embeds.shape[1] > 1:
-            model_inputs["inputs_embeds"] = cur_inputs_embeds[:, -1:, :]
-        cur_pos = model_inputs.get("position_ids", None)
-        if cur_pos is not None and getattr(cur_pos, "ndim", 0) >= 2 and cur_pos.shape[-1] > 1:
-            model_inputs["position_ids"] = cur_pos[..., -1:]
-        cur_cache_position = model_inputs.get("cache_position", None)
-        if cur_cache_position is not None and getattr(cur_cache_position, "ndim", 0) >= 1 and cur_cache_position.shape[-1] > 1:
-            model_inputs["cache_position"] = cur_cache_position[-1:]
-        cur_mm = model_inputs.get("mm_token_type_ids", None)
-        if cur_mm is not None and getattr(cur_mm, "ndim", 0) == 2 and cur_mm.shape[1] > 1:
-            model_inputs["mm_token_type_ids"] = cur_mm[:, -1:]
+        if not guikv_allow_multi_token_continuation:
+            cur_input_ids = model_inputs.get("input_ids", None)
+            if cur_input_ids is not None and getattr(cur_input_ids, "ndim", 0) == 2 and cur_input_ids.shape[1] > 1:
+                model_inputs["input_ids"] = cur_input_ids[:, -1:]
+            cur_inputs_embeds = model_inputs.get("inputs_embeds", None)
+            if cur_inputs_embeds is not None and getattr(cur_inputs_embeds, "ndim", 0) == 3 and cur_inputs_embeds.shape[1] > 1:
+                model_inputs["inputs_embeds"] = cur_inputs_embeds[:, -1:, :]
+            cur_pos = model_inputs.get("position_ids", None)
+            if cur_pos is not None and getattr(cur_pos, "ndim", 0) >= 2 and cur_pos.shape[-1] > 1:
+                model_inputs["position_ids"] = cur_pos[..., -1:]
+            cur_cache_position = model_inputs.get("cache_position", None)
+            if cur_cache_position is not None and getattr(cur_cache_position, "ndim", 0) >= 1 and cur_cache_position.shape[-1] > 1:
+                model_inputs["cache_position"] = cur_cache_position[-1:]
+            cur_mm = model_inputs.get("mm_token_type_ids", None)
+            if cur_mm is not None and getattr(cur_mm, "ndim", 0) == 2 and cur_mm.shape[1] > 1:
+                model_inputs["mm_token_type_ids"] = cur_mm[:, -1:]
         if os.getenv("GUIKV_DEBUG_SHAPES", "0") == "1":
             def _shape(name):
                 value = model_inputs.get(name, None)

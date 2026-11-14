@@ -4,6 +4,7 @@ import json
 import os
 import re
 import time
+import traceback
 from typing import Any
 
 import torch
@@ -139,6 +140,22 @@ def _decode_ids(tokenizer, ids: list[int]) -> str:
 def _cache_seq_len(past_key_values, fallback: int) -> int:
     if past_key_values is None:
         return int(fallback)
+    # GUIKV deliberately reports a logical seen-token count through its cache
+    # API, while the attention kernels consume the physically retained KV
+    # rows. For mask sizing, inspect the actual first-layer storage.
+    if getattr(past_key_values, "_guikv_original_seq_length", None) is not None:
+        try:
+            key_cache = getattr(past_key_values, "key_cache", None)
+            if key_cache and key_cache[0] is not None:
+                return int(key_cache[0].shape[-2])
+        except Exception:
+            pass
+        try:
+            layers = getattr(past_key_values, "layers", None)
+            if layers and getattr(layers[0], "keys", None) is not None:
+                return int(layers[0].keys.shape[-2])
+        except Exception:
+            pass
     try:
         return int(past_key_values.get_seq_length())
     except Exception:
@@ -268,6 +285,76 @@ def _continuation_forward(
     device: torch.device,
 ):
     pos_kwargs = _decode_position_kwargs(model, past_key_values, int(input_ids.shape[1]), device)
+    # ``prepare_inputs_for_generation`` rebuilds a logical full-length mask
+    # from GUIKV's cache metadata. For an SFD static segment that conflicts
+    # with the compact physical KV storage. Call the model directly with the
+    # already aligned physical mask instead.
+    if int(input_ids.shape[1]) > 1:
+        # Cache indices address GUIKV's compact physical storage; RoPE
+        # ``position_ids`` above remain at the original logical positions.
+        # Keeping these two coordinate systems separate prevents the HF
+        # causal-mask builder from allocating a logical-length mask.
+        physical_past_len = _cache_seq_len(past_key_values, 0)
+        pos_kwargs["cache_position"] = torch.arange(
+            physical_past_len,
+            physical_past_len + int(input_ids.shape[1]),
+            dtype=torch.long,
+            device=device,
+        )
+        # Bypass HF's cache-length inference completely for the third GUIKV
+        # state (compressed cache + multi-token continuation). Transformers
+        # returns an already-prepared 4-D mask unchanged. Its key dimension is
+        # the physical retained KV length, while RoPE position_ids above still
+        # use logical prompt coordinates.
+        q_len = int(input_ids.shape[1])
+        kv_len = int(physical_past_len) + q_len
+        # The fused attention backend requires the additive bias to have the
+        # same dtype as Q/K.  Qwen3-VL normally runs in bfloat16, so using a
+        # hard-coded float32 mask makes an otherwise valid 4-D mask fail.
+        mask_dtype = getattr(model, "dtype", torch.float32)
+        if not isinstance(mask_dtype, torch.dtype) or not mask_dtype.is_floating_point:
+            mask_dtype = torch.float32
+        mask_value = torch.finfo(mask_dtype).min
+        segment_mask = torch.full(
+            (int(input_ids.shape[0]), 1, q_len, kv_len),
+            mask_value,
+            dtype=mask_dtype,
+            device=device,
+        )
+        for row in range(q_len):
+            segment_mask[:, :, row, : int(physical_past_len) + row + 1] = 0
+        logical_seen = getattr(past_key_values, "_guikv_original_seq_length", None)
+        old_seen = getattr(past_key_values, "_seen_tokens", None)
+        # DynamicCache exposes ``_seen_tokens`` to the HF causal-mask builder.
+        # GUIKV normally stores its logical length there, but this segment
+        # forward must build a mask over physically retained keys. Restore the
+        # logical value afterwards; RoPE positions stay logical throughout.
+        if logical_seen is not None and old_seen is not None:
+            try:
+                past_key_values._seen_tokens = int(physical_past_len)
+            except Exception:
+                pass
+        try:
+            out = _model_forward(
+                model,
+                input_ids=input_ids,
+                attention_mask=segment_mask,
+                past_key_values=past_key_values,
+                logits_to_keep=1,
+                **pos_kwargs,
+            )
+        finally:
+            if logical_seen is not None:
+                logical_after = int(logical_seen) + int(input_ids.shape[1])
+                try:
+                    past_key_values._seen_tokens = logical_after
+                except Exception:
+                    pass
+                try:
+                    past_key_values._guikv_original_seq_length = logical_after
+                except Exception:
+                    pass
+        return out
     if hasattr(model, "prepare_inputs_for_generation"):
         try:
             prepared = model.prepare_inputs_for_generation(
@@ -276,6 +363,11 @@ def _continuation_forward(
                 attention_mask=attention_mask,
                 use_cache=True,
                 is_first_iteration=False,
+                # Preserve a complete fixed SFD template segment. GUIKV's
+                # normal generation adapter intentionally narrows ordinary
+                # continuations to one token, but SFD needs segment-level
+                # cache forwards just like PACT-GUI.
+                guikv_allow_multi_token_continuation=bool(input_ids.shape[1] > 1),
                 **pos_kwargs,
             )
             prepared["use_cache"] = True
@@ -283,7 +375,8 @@ def _continuation_forward(
             prepared["logits_to_keep"] = 1
             return model(**prepared)
         except Exception:
-            pass
+            if _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0"):
+                print("[StructuredFastDecode] prepared_segment_forward_failed:\n" + traceback.format_exc(), flush=True)
     return _model_forward(
         model,
         input_ids=input_ids,
@@ -314,12 +407,20 @@ def _forward_token_ids(
         n_tok = int(ids.shape[1])
         if n_tok == 0:
             continue
-        # GUIKV's cache is physically compacted, whereas its generation
-        # wrapper keeps an attention mask on the original logical sequence.
-        # Preserve that mask here as well: shrinking it to the compressed KV
-        # length changes the causal-mask semantics during SFD continuation.
+        # GUIKV's cache is physically compacted. A one-token continuation can
+        # retain its logical generation mask, but a q_len > 1 template segment
+        # is processed by the model's 4-D causal-mask builder against the
+        # physical KV length. Align that mask for segment-level SFD forwards;
+        # RoPE/cache positions remain logical in _decode_position_kwargs.
         guikv_logical_cache = getattr(past_key_values, "_guikv_original_seq_length", None) is not None
-        if not guikv_logical_cache:
+        if not guikv_logical_cache or n_tok > 1:
+            if _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0") and guikv_logical_cache and n_tok > 1:
+                print(
+                    "[StructuredFastDecode] "
+                    f"segment_mask_before={attention_mask.shape[1]} physical_cache={_cache_seq_len(past_key_values, -1)} "
+                    f"logical_cache={getattr(past_key_values, '_guikv_original_seq_length', None)}",
+                    flush=True,
+                )
             attention_mask = _align_attention_mask_to_past(attention_mask, past_key_values, device)
         new_mask = torch.ones((attention_mask.shape[0], n_tok), dtype=attention_mask.dtype, device=device)
         attention_mask = torch.cat([attention_mask, new_mask], dim=1)
@@ -358,17 +459,15 @@ def _append_static(
         ids = _tokenize(tokenizer, text, device)
     token_ids = [int(x) for x in ids[0].tolist()]
     # The paper SFD path appends each known template segment directly to the
-    # existing KV cache (rather than rebuilding the multimodal prompt). That
-    # is also the path used here. GUIKV has one extra cache invariant: its
-    # attention patch treats any q_len > 1 cache continuation as a fresh
-    # prefill and compresses the cache again. Feed a static segment token by
-    # token for GUIKV so every token is an ordinary decode continuation. It
-    # preserves the template/KV-cache semantics while avoiding a second GUIKV
-    # compression pass.
+    # existing KV cache (rather than rebuilding the multimodal prompt).
+    # GUIKV uses a physical compact-KV mask for a multi-token continuation,
+    # while retaining logical RoPE positions.  This is the segment-level SFD
+    # path used by PACT-GUI; tokenwise mode remains an explicit diagnostic
+    # fallback.
     guikv_cache = getattr(past_key_values, "_guikv_original_seq_length", None) is not None
     tokenwise = _env_flag(
         "QWEN3VL_STRUCTURED_FAST_DECODE_STATIC_TOKENWISE",
-        "1" if guikv_cache else "0",
+        "0",
     )
     if _env_flag("QWEN3VL_STRUCTURED_FAST_DECODE_DEBUG", "0"):
         print(
@@ -395,7 +494,7 @@ def _static_forward_count(past_key_values, token_count: int) -> int:
     guikv_cache = getattr(past_key_values, "_guikv_original_seq_length", None) is not None
     tokenwise = _env_flag(
         "QWEN3VL_STRUCTURED_FAST_DECODE_STATIC_TOKENWISE",
-        "1" if guikv_cache else "0",
+        "0",
     )
     return int(token_count) if tokenwise else 1
 

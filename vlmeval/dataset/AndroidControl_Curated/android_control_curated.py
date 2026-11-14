@@ -776,6 +776,7 @@ class AndroidControlCurated(ImageBaseDataset):
         history_image_paths: List[str],
         history_action_packets: List[dict],
         history_action_texts: List[str] = None,
+        current_image_path: str = "",
     ):
         # Packets choose the visual crop; display text is intentionally
         # independent so prediction-centred ROIs can retain instruction text.
@@ -815,6 +816,14 @@ class AndroidControlCurated(ImageBaseDataset):
                 action_packet=action_packet,
                 sample_index=str(sample_index),
                 history_index=i,
+                # Every successor is already visible at this decision point:
+                # use the next retained history frame, or the current frame
+                # for the most recent history image.
+                next_image_path=(
+                    history_image_paths[i + 1]
+                    if i + 1 < len(history_image_paths)
+                    else current_image_path
+                ),
             )
             packet_meta["dataset_name"] = str(self.dataset_name)
             self._state_packet_records.append(packet_meta)
@@ -1196,6 +1205,7 @@ class AndroidControlCurated(ImageBaseDataset):
             history_image_paths=history_image_paths,
             history_action_packets=hist_action_packets_kept,
             history_action_texts=hist_actions_kept,
+            current_image_path=current_image_path,
         )
         current_entries = self._build_current_visual_entries(
             sample_index=str(line.get("index", "")),

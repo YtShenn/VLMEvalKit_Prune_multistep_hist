@@ -1602,6 +1602,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         attn_prune_token_meta: dict | None = None,
         histprune_token_meta: dict | None = None,
+        utility_token_prune_meta: dict | None = None,
         fastv_token_meta: dict | None = None,
         divprune_token_meta: dict | None = None,
         sparsevlm_token_meta: dict | None = None,
@@ -1840,6 +1841,31 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             except Exception as exc:
                 raise RuntimeError(f"HistPrune setup failed; refusing unsafe pruning: {exc}") from exc
 
+        # Offline redundancy--utility control.  Unlike pixel occlusion, this
+        # receives exact post-merge visual sequence positions and physically
+        # removes them from the decoder sequence. It is deliberately inert for
+        # all normal inference unless the analysis explicitly passes metadata.
+        utility_keep_mask = None
+        utility_stats = None
+        utility_drop_layer = -1
+        if utility_token_prune_meta is not None and hidden_states.shape[0] == 1 and hidden_states.shape[1] > 1:
+            raw_positions = utility_token_prune_meta.get("drop_positions", [])
+            positions = sorted({int(x) for x in raw_positions})
+            if not positions or positions[0] < 0 or positions[-1] >= int(hidden_states.shape[1]):
+                raise RuntimeError("redundancy-utility token prune positions are empty or out of range")
+            if visual_pos_masks is None or not bool(visual_pos_masks[0, positions].all().item()):
+                raise RuntimeError("redundancy-utility token prune may remove only visual positions")
+            utility_keep_mask = torch.ones((1, hidden_states.shape[1]), dtype=torch.bool, device=hidden_states.device)
+            utility_keep_mask[0, torch.tensor(positions, device=hidden_states.device)] = False
+            utility_drop_layer = max(0, int(utility_token_prune_meta.get("drop_layer", 0)))
+            utility_stats = {
+                "prune_applied": False,
+                "drop_layer": utility_drop_layer,
+                "dropped_visual_tokens": len(positions),
+                "sequence_length_before": int(hidden_states.shape[1]),
+                "sequence_length_after": int(hidden_states.shape[1]),
+            }
+
         # FastV is intentionally independent from AttnPrune. It scores every
         # visual token from the previous layer with the *last sequence query*,
         # averaged across heads, exactly as the official implementation does.
@@ -2025,6 +2051,32 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
                     position_embeddings = self.rotary_emb(hidden_states, position_ids)
                     histprune_stats.update({"sequence_length_before": original_seq_len,
                                             "sequence_length_after": int(hidden_states.shape[1]), "prune_applied": True})
+            if utility_keep_mask is not None and layer_idx == utility_drop_layer:
+                original_seq_len = int(hidden_states.shape[1])
+                keep_indices = torch.where(utility_keep_mask[0].to(hidden_states.device))[0]
+                if int(keep_indices.numel()) != original_seq_len:
+                    visual_positions = torch.where(visual_pos_masks[0].bool())[0] if visual_pos_masks is not None else None
+                    if visual_positions is None:
+                        raise RuntimeError("redundancy-utility token prune requires visual_pos_masks")
+                    keep_visual_rel_idx = torch.where(utility_keep_mask[0].index_select(0, visual_positions))[0]
+                    _attn_prune_past_key_values(past_key_values, keep_indices, layer_idx - 1, original_seq_len)
+                    hidden_states = hidden_states.index_select(1, keep_indices)
+                    dropped_tokens = original_seq_len - int(hidden_states.shape[1])
+                    if text_position_ids is not None:
+                        text_position_ids = text_position_ids.index_select(1, keep_indices)
+                    position_ids = position_ids.index_select(2, keep_indices)
+                    visual_pos_masks = visual_pos_masks.index_select(1, keep_indices)
+                    if deepstack_visual_embeds is not None:
+                        deepstack_visual_embeds = [emb.index_select(0, keep_visual_rel_idx.to(emb.device)) for emb in deepstack_visual_embeds]
+                    raw_attention_mask = torch.ones((1, hidden_states.shape[1]), dtype=torch.bool, device=hidden_states.device)
+                    attention_mask = create_causal_mask(config=self.config, inputs_embeds=hidden_states,
+                                                        attention_mask=raw_attention_mask, past_key_values=None,
+                                                        position_ids=text_position_ids)
+                    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+                    utility_stats.update({"prune_applied": True,
+                                          "sequence_length_before": original_seq_len,
+                                          "sequence_length_after": int(hidden_states.shape[1]),
+                                          "dropped_visual_tokens": dropped_tokens})
             attn_meta = None
             query_indices = None
             # At layer K-1 request exactly the official FastV attention row:
@@ -2347,6 +2399,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
             setattr(self.config, "_histprune_last_stats", histprune_stats)
             if histprune_stats.get("prune_applied") and os.getenv("HISTPRUNE_LOG_STATS", "0").strip().lower() in {"1", "true", "yes"}:
                 print("[HistPrune] " + json.dumps(histprune_stats, sort_keys=True), flush=True)
+        if utility_stats is not None:
+            setattr(self.config, "_redundancy_utility_last_stats", utility_stats)
         setattr(self.config, "_fastv_last_stats", fastv_stats)
         if bool(getattr(fastv_cfg, "debug", False)):
             print("[FastV] " + json.dumps(fastv_stats, sort_keys=True), flush=True)
@@ -3783,6 +3837,18 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
         # built metadata at the outer model and silently executed full length.
         self.language_model.config._histprune_enabled = bool(histprune_enabled and histprune_token_meta is not None)
         self.language_model.config._histprune_config = histprune_cfg
+        # The utility script supplies exact visual placeholder positions for a
+        # single region. Keep this request-local metadata separate from all
+        # normal pruning configurations.
+        utility_drop_positions = getattr(self.config.text_config, "_redundancy_utility_token_drop_positions", None)
+        utility_token_prune_meta = None
+        if utility_drop_positions is not None:
+            if not isinstance(utility_drop_positions, (list, tuple)):
+                raise RuntimeError("redundancy-utility token positions must be a list")
+            utility_token_prune_meta = {
+                "drop_positions": [int(x) for x in utility_drop_positions],
+                "drop_layer": int(getattr(self.config.text_config, "_redundancy_utility_token_prune_layer", 0)),
+            }
 
         if position_ids is None:
             position_ids = self.compute_3d_position_ids(
@@ -3805,6 +3871,7 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             deepstack_visual_embeds=deepstack_visual_embeds,
             attn_prune_token_meta=attn_prune_token_meta,
             histprune_token_meta=histprune_token_meta,
+            utility_token_prune_meta=utility_token_prune_meta,
             fastv_token_meta=fastv_token_meta,
             divprune_token_meta=divprune_token_meta,
             sparsevlm_token_meta=sparsevlm_token_meta,
@@ -3816,6 +3883,9 @@ class Qwen3VLModel(Qwen3VLPreTrainedModel):
             inner_stats = getattr(self.language_model.config, "_prumerge_last_stats", None)
             if isinstance(inner_stats, dict):
                 self.config.text_config._prumerge_last_stats = dict(inner_stats)
+        utility_stats = getattr(self.language_model.config, "_redundancy_utility_last_stats", None)
+        if isinstance(utility_stats, dict):
+            self.config.text_config._redundancy_utility_last_stats = dict(utility_stats)
         if divprune_cfg is not None:
             inner_stats = getattr(self.language_model.config, "_divprune_last_stats", None)
             if isinstance(inner_stats, dict):

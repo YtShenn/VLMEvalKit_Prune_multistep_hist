@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
+export CUDA_VISIBLE_DEVICES=0 #0,1,2,3,4,5,6
 export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 export TORCH_USE_CUDA_DSA="${TORCH_USE_CUDA_DSA:-1}"
 
@@ -52,7 +52,7 @@ export QWEN3VL_ATTN_PRUNE_PRINT_QUERY_TOKENS="${QWEN3VL_ATTN_PRUNE_PRINT_QUERY_T
 export QWEN3VL_ATTN_PRUNE_SIDE_COMPUTE="${QWEN3VL_ATTN_PRUNE_SIDE_COMPUTE:-1}" #置1是额外再算attn，置0是直接抓取，用eager attn，会慢一些
 export QWEN3VL_ATTN_PRUNE_PRUNE_VIS="${QWEN3VL_ATTN_PRUNE_PRUNE_VIS:-0}" #剪枝后可视化，保留token显示attn，剪掉token标黑
 
-export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-off}"
+export VLM_EVAL_SAMPLE_MODE="${VLM_EVAL_SAMPLE_MODE:-task}"
 export VLM_EVAL_SAMPLE_INDEX_FILE="${VLM_EVAL_SAMPLE_INDEX_FILE:-OUTPUT_0/attn_prune_debug/android_control_history_state_packet_step_instruct/selected_indices.txt}"
 export VLM_EVAL_SAMPLE_TASKS="${VLM_EVAL_SAMPLE_TASKS:-10}"
 export VLM_EVAL_SAMPLE_SEED="${VLM_EVAL_SAMPLE_SEED:-42}"
@@ -174,7 +174,7 @@ run_one() {
     reuse_args+=(--reuse)
   fi
 
-  "${TORCHRUN_CMD[@]}" --standalone --nproc_per_node=7 --master_port="${port}" run.py \
+  "${TORCHRUN_CMD[@]}" --standalone --nproc_per_node=1 --master_port="${port}" run.py \
     --data "${dataset_name}" \
     --model "${MODEL}" \
     --work-dir "${WORK_DIR}/${dataset_name}" \

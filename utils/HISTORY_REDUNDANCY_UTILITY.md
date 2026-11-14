@@ -37,8 +37,8 @@ supply evaluator trajectory keys and use `SUCCESS_SCOPE=trajectory`.
 
 ## Full-data, multi-GPU run
 
-The launcher now defaults to 500 task-balanced complete-history decision points
-(`RUN_ALL=0`, `NUM_TASKS=500`, `OUTCOME_SCOPE=all`, `SEED=42`) and uses one
+The launcher defaults to 100 task-balanced complete-history decision points
+(`RUN_ALL=0`, `NUM_TASKS=100`, `OUTCOME_SCOPE=all`, `SEED=42`) and uses one
 process per comma-separated GPU id. Each worker gets
 a deterministic task/trajectory shard and writes only below
 `WORK_DIR/workers/worker_XX`, so it is safe to resume diagnosis after a failed
@@ -72,8 +72,9 @@ Outputs are in `WORK_DIR`:
 
 - `regions.jsonl` / `regions.csv`: one masked-history region per row, including
   normalized-coordinate region, pixel box, scale/type, redundancy, and utility.
-- `figures/redundancy_utility_density.png`: log-density hexbin with colored
-  overlays for scale/type.
+- `figures/redundancy_utility_density.png`: six-group summary of masking
+  impact (mean with bootstrap 95% CI), stratified by region type and its
+  within-type visual-redundancy tertile.
 - `metadata.json` and `summary.json`: exact configuration and coverage.
 
 Redundancy is cosine similarity between the mean Qwen3-VL post-merge visual
@@ -82,3 +83,52 @@ history image.  Utility is the baseline teacher-forced log likelihood of the
 entire gold action minus its likelihood after only that source-image rectangle
 is replaced with mean RGB.  The first historical image has no predecessor and
 is recorded with null redundancy rather than fabricating a comparison.
+
+## Intervention modes: legacy diagnostic versus deployment-faithful control
+
+`INTERVENTION_MODE` selects the counterfactual input operation. The default is
+kept for backwards compatibility:
+
+- `pixel_mask` (default): replaces the selected source-image rectangle with
+  mean RGB (or `MASK_MODE=gray`). This preserves prompt length and is an
+  **occlusion diagnostic**, not a faithful simulation of visual-token pruning.
+- `token_prune`: preserves the original pixels and prompt construction, but
+  physically removes exactly the selected region's Qwen post-merge visual
+  tokens from the decoder sequence. It supports both local tiles and `global`
+  full frames, and uses the repository's KV-cache/M-RoPE/DeepStack-safe
+  sequence-surgery path at `TOKEN_PRUNE_LAYER=0` by default, before the first
+  LLM decoder layer. This is the
+  deployment-faithful primary redundancy--utility intervention.
+- `drop_frame`: removes a selected *full history image* from the multimodal
+  message, so its visual tokens are actually absent. It only uses `global`
+  regions; a local tile is deliberately not reinterpreted as a frame deletion.
+- `thumbnail_frame`: replaces a selected *full history image* in place with
+  the AndroidControl state-packet thumbnail built by the same
+  `build_state_packet` implementation used at inference. Its visual-token
+  count is reduced through the real resize/processor path. It also only uses
+  `global` regions.
+
+Use `drop_frame` and `thumbnail_frame` for the main causal claim about hard
+deletion and thumbnail recovery. The output records the baseline and
+intervened prompt-token counts; thumbnail rows additionally record the
+thumbnail path, dimensions, estimated image-token count, and compression ratio.
+Each non-legacy mode receives a separate output-directory suffix, preventing
+accidental merging with old masking rows.
+
+```bash
+# Legacy pixel-occlusion heterogeneity diagnostic (unchanged default).
+INTERVENTION_MODE=pixel_mask REGION_SCALES=4,global \
+bash RUN_BASH/run_history_redundancy_utility.sh
+
+# Primary local/full-frame analysis: true post-merge visual-token pruning.
+INTERVENTION_MODE=token_prune TOKEN_PRUNE_LAYER=0 REGION_SCALES=4,global \
+bash RUN_BASH/run_history_redundancy_utility.sh
+
+# Real hard deletion: remove a full history image and its visual tokens.
+INTERVENTION_MODE=drop_frame REGION_SCALES=global \
+bash RUN_BASH/run_history_redundancy_utility.sh
+
+# Real recovery control: use the production state-packet thumbnail.
+INTERVENTION_MODE=thumbnail_frame THUMBNAIL_LONG_EDGE=192 REGION_SCALES=global \
+bash RUN_BASH/run_history_redundancy_utility.sh
+```

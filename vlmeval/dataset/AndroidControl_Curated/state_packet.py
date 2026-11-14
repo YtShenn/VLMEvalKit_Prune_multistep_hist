@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter, ImageStat
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -60,6 +60,31 @@ def state_packet_image_mode() -> str:
 
 def state_packet_debug_enabled() -> bool:
     return _env_flag("ANDROID_CONTROL_STATE_PACKET_DEBUG", "0")
+
+
+def state_packet_crop_policy() -> str:
+    """Return the opt-in local-ROI selection policy.
+
+    ``action`` is deliberately the default and preserves the original State
+    Packet implementation exactly.  The other policies are crop-location
+    controls for ablations; thumbnail construction and resize/token settings
+    are shared by every policy.
+    """
+    policy = os.environ.get("ANDROID_CONTROL_STATE_PACKET_CROP_POLICY", "action").strip().lower()
+    aliases = {
+        "": "action",
+        "default": "action",
+        "action": "action",
+        "action_anchor": "action",
+        "action_anchored": "action",
+        "center": "center",
+        "central": "center",
+        "random": "random",
+        "interface_change": "interface_change",
+        "change": "interface_change",
+        "delta": "interface_change",
+    }
+    return aliases.get(policy, "action")
 
 
 def _packet_cache_dir() -> str:
@@ -217,6 +242,101 @@ def _roi_box_for_action(action_packet: dict, image_size: tuple[int, int]) -> tup
     return _centered_box(w, h, side)
 
 
+def _box_size(box: tuple[int, int, int, int]) -> tuple[int, int]:
+    return max(1, int(box[2]) - int(box[0])), max(1, int(box[3]) - int(box[1]))
+
+
+def _box_at_center(w: int, h: int, box_w: int, box_h: int) -> tuple[int, int, int, int]:
+    x1 = int(round((w - box_w) / 2.0))
+    y1 = int(round((h - box_h) / 2.0))
+    return _clip_box(x1, y1, x1 + box_w, y1 + box_h, w, h)
+
+
+def _box_at_random_location(
+    w: int, h: int, box_w: int, box_h: int, *, sample_index: str, history_index: int
+) -> tuple[int, int, int, int]:
+    # Hashing avoids dependence on worker order and makes distributed reruns
+    # produce exactly the same random control boxes.
+    seed_text = f"{os.environ.get('SEED', '42')}|{sample_index}|{history_index}|random_roi"
+    digest = hashlib.sha256(seed_text.encode("utf-8")).digest()
+    max_x = max(0, w - box_w)
+    max_y = max(0, h - box_h)
+    x1 = int.from_bytes(digest[:8], "big") % (max_x + 1)
+    y1 = int.from_bytes(digest[8:16], "big") % (max_y + 1)
+    return _clip_box(x1, y1, x1 + box_w, y1 + box_h, w, h)
+
+
+def _interface_change_box(
+    img: Image.Image,
+    next_image_path: Optional[str],
+    box_w: int,
+    box_h: int,
+) -> tuple[tuple[int, int, int, int], float, str]:
+    """Locate the highest-change same-geometry window in a historical frame."""
+    w, h = img.size
+    fallback = _box_at_center(w, h, box_w, box_h)
+    if not next_image_path or not osp.exists(next_image_path):
+        return fallback, 0.0, "missing_successor"
+    try:
+        # A compact working image makes this policy cheap and keeps the score
+        # independent of the VLM's image processor.
+        max_side = 256
+        scale = min(1.0, float(max_side) / float(max(w, h)))
+        dw, dh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+        before = img.resize((dw, dh), Image.BILINEAR)
+        after = Image.open(next_image_path).convert("RGB").resize((dw, dh), Image.BILINEAR)
+        diff = ImageChops.difference(before, after).convert("L").filter(ImageFilter.GaussianBlur(radius=1))
+    except (OSError, ValueError):
+        return fallback, 0.0, "unreadable_successor"
+
+    win_w = max(1, min(dw, int(round(box_w * scale))))
+    win_h = max(1, min(dh, int(round(box_h * scale))))
+    step = max(1, min(win_w, win_h) // 8)
+    best_score, best_xy = -1.0, (0, 0)
+    for y in range(0, max(1, dh - win_h + 1), step):
+        for x in range(0, max(1, dw - win_w + 1), step):
+            score = float(ImageStat.Stat(diff.crop((x, y, x + win_w, y + win_h))).mean[0])
+            if score > best_score:
+                best_score, best_xy = score, (x, y)
+    # Include the right/bottom edge, which range(..., step) may skip.
+    edge_x, edge_y = max(0, dw - win_w), max(0, dh - win_h)
+    edge_score = float(ImageStat.Stat(diff.crop((edge_x, edge_y, edge_x + win_w, edge_y + win_h))).mean[0])
+    if edge_score > best_score:
+        best_score, best_xy = edge_score, (edge_x, edge_y)
+    if best_score <= 0.0:
+        return fallback, 0.0, "no_observed_change"
+    x1 = int(round(best_xy[0] / scale))
+    y1 = int(round(best_xy[1] / scale))
+    return _clip_box(x1, y1, x1 + box_w, y1 + box_h, w, h), best_score, "successor_difference"
+
+
+def _select_roi_box(
+    *,
+    img: Image.Image,
+    action_packet: dict,
+    sample_index: str,
+    history_index: int,
+    next_image_path: Optional[str],
+) -> tuple[tuple[int, int, int, int], str, float, str]:
+    policy = state_packet_crop_policy()
+    action_box = _roi_box_for_action(action_packet, img.size)
+    if policy == "action":
+        return action_box, policy, 0.0, "action_anchor"
+    box_w, box_h = _box_size(action_box)
+    w, h = img.size
+    if policy == "center":
+        return _box_at_center(w, h, box_w, box_h), policy, 0.0, "image_center"
+    if policy == "random":
+        return (
+            _box_at_random_location(w, h, box_w, box_h, sample_index=sample_index, history_index=history_index),
+            policy,
+            0.0,
+            "deterministic_uniform",
+        )
+    box, score, source = _interface_change_box(img, next_image_path, box_w, box_h)
+    return box, policy, score, source
+
+
 def _save_packet_image(img: Image.Image, source_path: str, suffix: str) -> str:
     os.makedirs(_packet_cache_dir(), exist_ok=True)
     key = hashlib.md5(
@@ -252,6 +372,7 @@ def build_state_packet(
     action_packet: dict,
     sample_index: str,
     history_index: int,
+    next_image_path: Optional[str] = None,
 ) -> tuple[list[PacketImage], dict]:
     t0 = time.perf_counter()
     img = Image.open(image_path).convert("RGB")
@@ -273,10 +394,21 @@ def build_state_packet(
     )
 
     t2 = time.perf_counter()
-    crop_xyxy = _roi_box_for_action(action_packet, img.size)
+    crop_xyxy, crop_policy, change_score, crop_source = _select_roi_box(
+        img=img,
+        action_packet=action_packet,
+        sample_index=sample_index,
+        history_index=history_index,
+        next_image_path=next_image_path,
+    )
     roi = img.crop(crop_xyxy)
     roi = _resize_with_long_edge(roi, _roi_long_edge(), align_base)
-    roi_path = _save_packet_image(roi, image_path, f"s{sample_index}_h{history_index}_roi")
+    # Keep the legacy action cache key byte-for-byte identical.  Ablations use
+    # a policy-qualified key so they can never accidentally reuse action ROIs.
+    roi_suffix = f"s{sample_index}_h{history_index}_roi"
+    if crop_policy != "action":
+        roi_suffix = f"{roi_suffix}_{crop_policy}"
+    roi_path = _save_packet_image(roi, image_path, roi_suffix)
     roi_s = time.perf_counter() - t2
     roi_img = PacketImage(
         kind="action_roi",
@@ -315,6 +447,17 @@ def build_state_packet(
         "state_packet_total_s": float(total_s),
         "compression_ratio_vs_original": float(packet_tokens / max(1, orig_tokens)),
     }
+    # Keep the action/default packet metadata schema unchanged for existing
+    # consumers.  Only opt-in crop-policy runs emit the extra audit fields.
+    if crop_policy != "action":
+        meta.update(
+            {
+                "crop_policy": crop_policy,
+                "crop_selection_source": crop_source,
+                "crop_change_score": float(change_score),
+                "successor_image_path": str(next_image_path or ""),
+            }
+        )
     if debug_enabled:
         meta.update(
             {
@@ -330,10 +473,14 @@ def build_state_packet(
                 "actual_prediction": action_packet.get("actual_prediction", None),
             }
         )
+        policy_debug = ""
+        if crop_policy != "action":
+            policy_debug = f"crop_policy={crop_policy} crop_source={crop_source} "
         print(
             "[AndroidControlStatePacket] "
             f"sample_index={sample_index} hist_index={history_index} "
             f"action_type={meta['action_type']} "
+            f"{policy_debug}"
             f"orig_size=({orig_w},{orig_h}) orig_tokens_est={orig_tokens} "
             f"thumb_size=({thumb_img.width},{thumb_img.height}) thumb_tokens_est={thumb_img.estimated_tokens} "
             f"roi_crop_xyxy={meta['roi_crop_xyxy']} "

@@ -13,6 +13,14 @@ DATASET="${DATASET:-AndroidControl_Curated_High_Task_Improved}"
 # Full eligible-data study. Each selected region costs one multimodal forward;
 # the conservative default region cap can be raised after a pilot.
 WORK_DIR="${WORK_DIR:-OUTPUT_history_redundancy_utility/${DATASET}}"
+# Keep one run-level transcript in addition to each worker's worker.log.  The
+# timestamp prevents a re-run from overwriting an earlier diagnosis record.
+LOG_DIR="${LOG_DIR:-${WORK_DIR}/logs}"
+RUN_TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+RUN_LOG="${RUN_LOG:-${LOG_DIR}/run_${RUN_TIMESTAMP}.log}"
+mkdir -p "$LOG_DIR"
+exec > >(tee -a "$RUN_LOG") 2>&1
+echo "[redundancy-utility] run log: $RUN_LOG"
 # In `all` mode the manifest is optional and never filters samples; when given,
 # it only adds outcome labels where the free-run report contains that step.
 SUCCESS_MANIFEST="${SUCCESS_MANIFEST:-${SUCCESS_JSONL:-}}"
@@ -37,7 +45,14 @@ export ANDROID_CONTROL_CURATED_IMAGE_ROOT="${ANDROID_CONTROL_CURATED_IMAGE_ROOT:
 # Comma-separated physical GPU ids, e.g. GPU_IDS=0,1,2,3.  A single id remains
 # fully supported.  Do not set both a remapped CUDA_VISIBLE_DEVICES list and
 # unrelated physical GPU_IDS values.
-GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-1,2,3,7}}"
+GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,5}}"
+INTERVENTION_MODE="${INTERVENTION_MODE:-pixel_mask}"
+THUMBNAIL_LONG_EDGE="${THUMBNAIL_LONG_EDGE:-192}"
+TOKEN_PRUNE_LAYER="${TOKEN_PRUNE_LAYER:-0}"
+case "$INTERVENTION_MODE" in
+  pixel_mask|token_prune|drop_frame|thumbnail_frame) ;;
+  *) echo "INTERVENTION_MODE must be pixel_mask, token_prune, drop_frame, or thumbnail_frame; got: $INTERVENTION_MODE" >&2; exit 2 ;;
+esac
 IFS=',' read -r -a GPUS <<< "$GPU_IDS"
 if [[ ${#GPUS[@]} -eq 0 || -z "${GPUS[0]}" ]]; then echo 'GPU_IDS is empty.' >&2; exit 2; fi
 # This is intentionally not torchrun/DDP: every process owns one GPU and one
@@ -49,12 +64,21 @@ if ! [[ "$NPROC_NUM" =~ ^[1-9][0-9]*$ ]] || (( NPROC_NUM > ${#GPUS[@]} )); then
 fi
 COMMON=(--data "$DATASET" --model "$MODEL_PATH" --success-scope "$SUCCESS_SCOPE" --outcome-scope "$OUTCOME_SCOPE"
   --sample-by task --samples-per-task 1 --history-steps "${HISTORY_STEPS:-4}" --region-scales "${REGION_SCALES:-4,global}"
-  --max-regions-per-frame "${MAX_REGIONS_PER_FRAME:-4}" --mask-mode "${MASK_MODE:-mean_rgb}" --action-score "${ACTION_SCORE:-mean_logprob}" --seed "${SEED:-42}" --progress 1)
+  --max-regions-per-frame "${MAX_REGIONS_PER_FRAME:-4}" --mask-mode "${MASK_MODE:-mean_rgb}"
+  --intervention-mode "$INTERVENTION_MODE" --thumbnail-long-edge "$THUMBNAIL_LONG_EDGE"
+  --token-prune-layer "$TOKEN_PRUNE_LAYER"
+  --action-score "${ACTION_SCORE:-mean_logprob}" --seed "${SEED:-42}" --progress 1)
 if [[ -n "$SUCCESS_MANIFEST" ]]; then COMMON+=(--success-manifest "$SUCCESS_MANIFEST"); fi
-if [[ "$RUN_ALL" == "1" ]]; then COMMON+=(--all-eligible); else COMMON+=(--num-samples "${NUM_TASKS:-100}"); fi
-
+if [[ "$RUN_ALL" == "1" ]]; then COMMON+=(--all-eligible); else COMMON+=(--num-samples "${NUM_TASKS:-500}"); fi
+NUM_TASKS="${NUM_TASKS:-500}"
+if [[ "$INTERVENTION_MODE" == "pixel_mask" ]]; then
+  WORK_DIR="${WORK_DIR}_${NUM_TASKS}"
+else
+  # Never merge deployment-faithful rows into a legacy pixel-masking run.
+  WORK_DIR="${WORK_DIR}_${NUM_TASKS}_${INTERVENTION_MODE}"
+fi
 mkdir -p "$WORK_DIR/workers"
-echo "[redundancy-utility] GPUs=$GPU_IDS workers=$NPROC_NUM outcome_scope=$OUTCOME_SCOPE run_all=$RUN_ALL work_dir=$WORK_DIR" >&2
+echo "[redundancy-utility] GPUs=$GPU_IDS workers=$NPROC_NUM outcome_scope=$OUTCOME_SCOPE run_all=$RUN_ALL intervention=$INTERVENTION_MODE work_dir=$WORK_DIR" >&2
 pids=()
 cleanup_workers() {
   local exit_status=$?
